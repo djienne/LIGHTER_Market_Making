@@ -4,6 +4,7 @@ import lighter
 import os
 import time
 import json
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -544,6 +545,25 @@ async def market_making_loop(client, api_client):
             raise
 
 
+async def track_balance(api_client):
+    """Periodically tracks and logs the account balance."""
+    log_path = "logs/balance_log.txt"
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    while True:
+        try:
+            if current_position_size == 0:
+                balance = await get_account_balances(api_client)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(log_path, "a") as f:
+                    f.write(f"[{timestamp}] Available Capital: ${balance:,.2f}\n")
+                logger.info(f"Balance of ${balance:,.2f} logged to {log_path}")
+            else:
+                logger.info(f"Skipping balance logging because a position is open (size: {current_position_size})")
+        except Exception as e:
+            logger.error(f"Error in track_balance: {e}", exc_info=True)
+        await asyncio.sleep(300)  # 5 minutes
+
+
 async def main():
     """Main function."""
     global latest_order_book, current_order_id, position_detected_at_startup
@@ -640,12 +660,16 @@ async def main():
                                     if current_mid_price:
                                         logger.info(f"🔄 Closing existing long position of size {position_size} at startup")
                                         if await close_long_position(client, position_size, current_mid_price):
-                                            global order_side, last_mid_price
+                                            # Synchronize internal state with the action taken.
+                                            global order_side, last_mid_price, current_position_size
+                                            current_position_size = position_size #<-- THE FIX
                                             order_side = "sell"
                                             last_mid_price = current_mid_price
-                                            logger.info("✅ Position closing order placed, loop will manage it.")
+                                            logger.info(f"✅ Position closing order placed. Inventory state updated to {current_position_size}.")
             except Exception as e:
                 logger.warning(f"Error during startup position closing: {e}")
+
+        balance_task = asyncio.create_task(track_balance(api_client))
 
         await market_making_loop(client, api_client)
     except asyncio.TimeoutError:
@@ -654,6 +678,12 @@ async def main():
         logger.info("=== KeyboardInterrupt received - Stopping... ===")
     finally:
         logger.info("=== Market Maker Cleanup Starting ===")
+        if 'balance_task' in locals() and not balance_task.done():
+            balance_task.cancel()
+            try:
+                await balance_task
+            except asyncio.CancelledError:
+                pass
         if current_order_id is not None:
             logger.info(f"Cancelling open order {current_order_id} before exit...")
             await cancel_order(client, current_order_id)
