@@ -1,0 +1,80 @@
+version: '3.8'
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.32.44.0/22
+services:
+  lighter-data-collector:
+    build: .
+    container_name: lighter-collector
+    restart: unless-stopped
+    volumes:
+      - ./lighter_data:/app/lighter_data
+      - ./logs:/app/logs
+      - ./params:/app/params
+      - ./gather_lighter_data.py:/app/gather_lighter_data.py:ro
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_DIR=/app/logs
+    command: python gather_lighter_data.py
+
+  spread-calculator:
+    build: .
+    container_name: spread-calculator
+    restart: unless-stopped
+    volumes:
+      - ./lighter_data:/app/lighter_data:ro
+      - ./logs:/app/logs
+      - ./params:/app/params
+      - ./spread_calculator.py:/app/spread_calculator.py:ro
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HL_DATA_LOC=/app/lighter_data
+      - PARAMS_DIR=/app/params
+      - LOG_DIR=/app/logs
+      - INTERVAL_SECONDS=600
+    command: >
+      sh -c "
+        while true; do
+          echo 'Calculating spread parameters...';
+          python spread_calculator.py --symbol $$MARKET_SYMBOL --window-hours 1;
+          echo 'Sleeping before next run...';
+          sleep $$INTERVAL_SECONDS;
+        done
+      "
+    depends_on:
+      - lighter-data-collector
+
+  market-maker:
+    build: .
+    container_name: market-maker
+    restart: unless-stopped
+    stop_signal: SIGINT
+    working_dir: /app
+    volumes:
+      - ./params:/app/params
+      - ./logs:/app/logs
+      - ./market_maker_v2.py:/app/market_maker_v2.py:ro
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PARAMS_DIR=/app/params
+      - LOG_DIR=/app/logs
+      - RESTART_SECONDS=5
+    command: >
+      sh -c "
+        while true; do
+          echo 'Starting market maker v2...';
+          timeout 600 python market_maker_v2.py --symbol $$MARKET_SYMBOL;
+          sleep $$RESTART_SECONDS;
+        done
+      "
+    depends_on:
+      - spread-calculator

@@ -1,0 +1,13 @@
+git+https://github.com/elliottech/lighter-python.git
+python-dotenv
+numpy
+pandas
+scipy
+numba
+websockets
+requests
+eth-account
+arch
+matplotlib
+argparse
+arch
