@@ -1,6 +1,6 @@
 # Lighter DEX Market Maker
 
-This project is a complete market making solution for the Lighter DEX, built in Python. It consists of four main components that work together to collect data, calculate optimal trading parameters, determine the market trend, and execute a market making strategy.
+This project is a complete market making solution for the Lighter DEX, built in Python. It consists of three main components that work together to collect data, calculate optimal trading parameters, and execute a market making strategy.
 
 By default, it uses 12% of available capital per order (configurable via `CAPITAL_USAGE_PERCENT`). It can use leverage (1 by default = no leverage; for example, if your account has 100$ and you set leverage to 2, it will apply 2x leverage and use 12% of the leveraged amount ($200 * 0.12 = $24) per order.
 
@@ -12,7 +12,7 @@ The three core components are:
 The entire system is orchestrated using Docker Compose, making it easy to run and manage.
 
 Important Tips:
-- Use on a dedicated account or sub-account. The bot uses 25% of available capital per order by default, and reinvests profits (compound interest).
+- Use on a dedicated account or sub-account. The bot uses 12% of available capital per order by default, and reinvests profits (compound interest).
 - You don't need to have the `.env` file to run the data collector service
 - Run first the data collector service only for some time, by edtiting the `docker-compose.yml`  (comment out the market maker service)
 - To get your `ACCOUNT_INDEX`, you can go to\
