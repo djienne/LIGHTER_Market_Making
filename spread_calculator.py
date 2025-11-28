@@ -26,7 +26,7 @@ MAKER_FEE_BPS = 2.0  # Maker fee in basis points (0.015%)
 # Backtesting configuration
 
 BACKTEST_TRAIN_FRACTION = 0.7  # Fraction of window for training (rest for testing)
-BASE_QUOTE_SIZE = 1.0  # Quote size in base currency
+BASE_QUOTE_SIZE = 0.05  # Quote size in base currency (e.g. 0.05 PAXG)
 MAX_INVENTORY = 10.0  # Maximum inventory limit
 
 # Mean-reversion horizon (tau) - baseline for calibration
@@ -45,7 +45,8 @@ FILL_A_DEFAULT = 10.0  # Base fill rate (fills per second at zero spread)
 
 # Parameter optimization grid search (Phase 5)
 # Grid will test combinations of: gamma × tau × beta_alpha
-GAMMA_GRID_MULTIPLIERS = np.linspace(0.1, 2.0, 16)  # Multipliers of baseline gamma 
+# Use logspace for Gamma to cover orders of magnitude (0.01x to 100x baseline)
+GAMMA_GRID_MULTIPLIERS = np.logspace(-2, 2, 20)
 TAU_GRID_SECONDS = np.linspace(1.0, 10.0, 16)  # Mean-reversion horizons to test in seconds
 BETA_ALPHA_GRID_MULTIPLIERS = np.linspace(0.0, 1.0, 16)  # Multipliers of initial beta_alpha
 # Total grid size = len(GAMMA) × len(TAU) × len(BETA_ALPHA) combinations
@@ -81,8 +82,7 @@ def _run_backtest_numba(
     maker_fee_bps,
     tick_size,
     base_quote_size,
-    max_inventory,
-    sigma_p95
+    max_inventory
 ):
     inventory = 0.0
     cash = 0.0
@@ -109,9 +109,6 @@ def _run_backtest_numba(
         phi_term3 = (c_AS_bid + c_AS_ask) / 2
         phi_term4 = maker_fee_bps / 10000 * mid_i
         phi = max(phi_term1 + phi_term2 + phi_term3 + phi_term4, tick_size)
-
-        if sigma_i > sigma_p95:
-            phi *= 2.0
 
         bid = r - phi - Delta_bid_as
         ask = r + phi - Delta_ask_as
@@ -601,8 +598,6 @@ class SpreadCalculator:
             sigma = self.sigma_t.iloc[data_slice]
             micro_dev = self.micro_deviation.iloc[data_slice]
 
-        sigma_p95 = sigma.quantile(0.95)
-
         pnl_series, inventory_series, num_fills = _run_backtest_numba(
             mid.values, sigma.values, micro_dev.values,
             ob['timestamp'].astype(np.int64).values,
@@ -611,8 +606,7 @@ class SpreadCalculator:
             self.config.A_bid, self.config.A_ask,
             self.c_AS_bid, self.c_AS_ask,
             self.config.maker_fee_bps, self.config.tick_size,
-            self.config.base_quote_size, self.config.max_inventory,
-            sigma_p95
+            self.config.base_quote_size, self.config.max_inventory
         )
 
         pnl_array = np.array(pnl_series)
