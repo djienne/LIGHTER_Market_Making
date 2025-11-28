@@ -58,7 +58,6 @@ output/
 
 # Application specific
 params/
-screen.png
 
 # Claude Code settings
 .claude/settings.local.json
