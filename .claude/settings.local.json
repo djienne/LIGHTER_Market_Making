@@ -5,7 +5,8 @@
       "Bash(dir:*)",
       "Bash(docker-compose:*)",
       "Bash(echo \"   Command: python -c \"\"import os; exit(0 if os.path.exists(''/app/logs/debug.log'') else 1)\"\"\")",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []
