@@ -88,7 +88,7 @@ def optimize_horizon(list_of_periods, sigma_list, Alist, klist, window_minutes, 
     return best_horizons
 
 @jit(nopython=True)
-def jit_backtest_loop(s_values, buy_min_values, sell_max_values, gamma, k, sigma, fee, time_remaining):
+def jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k, sigma, fee, time_remaining):
     """
     Core JIT-compiled backtest loop.
     Assumes gamma and sigma are DIMENSIONLESS.
@@ -127,10 +127,16 @@ def jit_backtest_loop(s_values, buy_min_values, sell_max_values, gamma, k, sigma
             
         r_a[i], r_b[i] = r[i] + delta_a, r[i] - delta_b
         
-        # Execution logic (same as before)
-        sell = 1 if not np.isnan(sell_max_values[i]) and sell_max_values[i] >= r_a[i] else 0
-        buy = 1 if not np.isnan(buy_min_values[i]) and buy_min_values[i] <= r_b[i] else 0
-        q[i+1] = q[i] + (sell - buy)
+        # Execution logic
+        # WE SELL (at Ask r_a) if an Aggressor BUY matches or exceeds our price
+        # buy_max_values[i] is the highest price a BUYER paid in this interval
+        sell = 1 if not np.isnan(buy_max_values[i]) and buy_max_values[i] >= r_a[i] else 0
+        
+        # WE BUY (at Bid r_b) if an Aggressor SELL matches or drops below our price
+        # sell_min_values[i] is the lowest price a SELLER accepted in this interval
+        buy = 1 if not np.isnan(sell_min_values[i]) and sell_min_values[i] <= r_b[i] else 0
+        
+        q[i+1] = q[i] + (buy - sell)
         sell_net = (r_a[i] * (1 - fee)) if sell else 0
         buy_total = (r_b[i] * (1 + fee)) if buy else 0
         x[i+1] = x[i] + sell_net - buy_total
@@ -143,8 +149,13 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_mi
     time_index = mid_prices.index
     buy_trades_clean = buy_trades.groupby(level=0).min()
     sell_trades_clean = sell_trades.groupby(level=0).max()
-    buy_min = buy_trades_clean['price'].resample('5s').min().reindex(time_index)
-    sell_max = sell_trades_clean['price'].resample('5s').max().reindex(time_index)
+    
+    # We need the MAX price buyers paid to see if they hit our ASK
+    buy_max = buy_trades_clean['price'].resample('5s').max().reindex(time_index)
+    
+    # We need the MIN price sellers accepted to see if they hit our BID
+    sell_min = sell_trades_clean['price'].resample('5s').min().reindex(time_index)
+    
     mid_prices = mid_prices.resample('5s').first().reindex(time_index, method='ffill')
     N = len(time_index)
     
@@ -156,8 +167,8 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_mi
     T_horizon = horizon_minutes / 1440.0
     
     s_values = mid_prices.values
-    buy_min_values = buy_min.values
-    sell_max_values = sell_max.values
+    buy_max_values = buy_max.values
+    sell_min_values = sell_min.values
     
     # Time remaining array: Starts at T_horizon, decreases by dt each step
     time_remaining = T_horizon - np.arange(len(s_values)) * dt
@@ -165,7 +176,7 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_mi
     time_remaining = np.maximum(time_remaining, 0.0)
     
     # Pass raw params to JIT loop, which handles the unit conversions dynamic to price
-    pnl, x, q, spr, r, r_a, r_b = jit_backtest_loop(s_values, buy_min_values, sell_max_values, gamma, k, sigma, fee, time_remaining)
+    pnl, x, q, spr, r, r_a, r_b = jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k, sigma, fee, time_remaining)
     return {'pnl': pnl, 'x': x, 'q': q, 'spread': spr, 'r': r, 'r_a': r_a, 'r_b': r_b}
 
 def calculate_final_quotes(gamma, sigma, A, k, window_minutes, mid_price_df, ma_window, period_start, period_end, ticker, time_horizon_days):

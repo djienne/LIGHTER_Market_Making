@@ -307,48 +307,115 @@ async def get_market_details(order_api, symbol: str) -> Optional[Tuple[int, Deci
         logger.error(f"❌ An error occurred while fetching market details: {e}")
         return None
 
-def on_order_book_update(market_id, order_book):
-    global latest_order_book, ws_connection_healthy, last_order_book_update, current_mid_price_cached
+
+# Local Order Book State
+local_order_book = {'bids': {}, 'asks': {}, 'initialized': False}
+
+def on_order_book_update(market_id, payload):
+    global latest_order_book, ws_connection_healthy, last_order_book_update, current_mid_price_cached, local_order_book
     try:
         if int(market_id) == MARKET_ID:
-            bids = order_book.get('bids', [])
-            asks = order_book.get('asks', [])
-            if bids and asks:
-                best_bid = float(bids[0]['price'])
-                best_ask = float(asks[0]['price'])
+            bids_in = payload.get('bids', [])
+            asks_in = payload.get('asks', [])
+            
+            # Heuristic for snapshot vs delta
+            is_snapshot = False
+            if not local_order_book['initialized']:
+                is_snapshot = True
+                logger.info(f"📚 Initializing local orderbook for market {market_id}")
+            elif len(bids_in) > 100 or len(asks_in) > 100:
+                is_snapshot = True
+                logger.info(f"📚 Received snapshot for market {market_id}")
+
+            if is_snapshot:
+                local_order_book['bids'] = {}
+                local_order_book['asks'] = {}
+                local_order_book['initialized'] = True
+                for item in bids_in:
+                    price, size = float(item['price']), float(item['size'])
+                    if size > 0: local_order_book['bids'][price] = size
+                for item in asks_in:
+                    price, size = float(item['price']), float(item['size'])
+                    if size > 0: local_order_book['asks'][price] = size
+            else:
+                # Delta update
+                for item in bids_in:
+                    price, size = float(item['price']), float(item['size'])
+                    if size == 0:
+                        local_order_book['bids'].pop(price, None)
+                    else:
+                        local_order_book['bids'][price] = size
+                
+                for item in asks_in:
+                    price, size = float(item['price']), float(item['size'])
+                    if size == 0:
+                        local_order_book['asks'].pop(price, None)
+                    else:
+                        local_order_book['asks'][price] = size
+
+            # Reconstruct sorted lists for compatibility and mid-price calc
+            sorted_bids = sorted(local_order_book['bids'].items(), key=lambda x: x[0], reverse=True)
+            sorted_asks = sorted(local_order_book['asks'].items(), key=lambda x: x[0])
+
+            # Update latest_order_book to match the expected format: {'bids': [{'price':.., 'size':..}], ...}
+            latest_order_book = {
+                'bids': [{'price': str(p), 'size': str(s)} for p, s in sorted_bids],
+                'asks': [{'price': str(p), 'size': str(s)} for p, s in sorted_asks]
+            }
+
+            if sorted_bids and sorted_asks:
+                best_bid = sorted_bids[0][0]
+                best_ask = sorted_asks[0][0]
                 current_mid_price_cached = (best_bid + best_ask) / 2
-            latest_order_book = order_book
+            
             ws_connection_healthy = True
             last_order_book_update = time.time()
             order_book_received.set()
+            
     except Exception as e:
         logger.error(f"❌ Error in order book callback: {e}", exc_info=True)
         ws_connection_healthy = False
 
-async def subscribe_to_orderbook(market_id):
-    """Connects to the websocket, subscribes to orderbook, and updates global state."""
-    global latest_order_book, ws_connection_healthy, last_order_book_update, current_mid_price_cached, order_book_received
+def on_trade_update(market_id, trades):
+    try:
+        if int(market_id) == MARKET_ID:
+            for trade in trades:
+                # Log significant trades or update internal metrics if needed
+                # For now, just log to show it's working
+                price = trade.get('price')
+                size = trade.get('size')
+                side = "SELL" if trade.get('is_maker_ask') else "BUY" # Simplified inference
+                logger.info(f"📈 Market Trade: {side} {size} @ {price}")
+    except Exception as e:
+        logger.error(f"❌ Error in trade callback: {e}", exc_info=True)
+
+async def subscribe_to_market_data(market_id):
+    """Connects to the websocket, subscribes to orderbook AND trades."""
+    global ws_connection_healthy
     
-    subscription_msg = {
+    ob_sub_msg = {
         "type": "subscribe",
         "channel": f"order_book/{market_id}"
+    }
+    trade_sub_msg = {
+        "type": "subscribe",
+        "channel": f"trade/{market_id}"
     }
     
     while True:
         try:
             ws_connection_healthy = False
-            # ping_interval=20: automatically sends a ping every 20s
-            # ping_timeout=20: waits 20s for a pong, else closes connection
             async with websockets.connect(WEBSOCKET_URL, ping_interval=20, ping_timeout=20) as ws:
-                logger.info(f"🔌 Connected to {WEBSOCKET_URL} for orderbook")
-                await ws.send(json.dumps(subscription_msg))
-                logger.info(f"📡 Subscribed to order_book/{market_id}")
+                logger.info(f"🔌 Connected to {WEBSOCKET_URL} for market data")
+                
+                await ws.send(json.dumps(ob_sub_msg))
+                await ws.send(json.dumps(trade_sub_msg))
+                logger.info(f"📡 Subscribed to order_book/{market_id} and trade/{market_id}")
                 
                 ws_connection_healthy = True
                 
                 while True:
                     try:
-                        # Watchdog: wait for message with timeout
                         message = await asyncio.wait_for(ws.recv(), timeout=30.0)
                         
                         try:
@@ -358,27 +425,30 @@ async def subscribe_to_orderbook(market_id):
                             if msg_type == "update/order_book":
                                 if 'order_book' in data:
                                     on_order_book_update(market_id, data['order_book'])
+                            elif msg_type == "update/trade":
+                                if 'trades' in data:
+                                    on_trade_update(market_id, data['trades'])
                             elif msg_type == "ping":
                                 logger.debug("Received application-level ping, sending pong.")
                                 await ws.send(json.dumps({"type": "pong"}))
                             elif msg_type == "subscribed":
                                 logger.info(f"✅ Successfully subscribed to channel: {data.get('channel')}")
                             else:
-                                logger.debug(f"Received unhandled message on orderbook socket: {msg_type}")
+                                logger.debug(f"Received unhandled message on market data socket: {msg_type}")
                                 
                         except json.JSONDecodeError:
-                            logger.warning(f"❌ Failed to decode JSON from orderbook: {message}")
+                            logger.warning(f"❌ Failed to decode JSON from market data: {message}")
                             
                     except asyncio.TimeoutError:
-                        logger.warning("⚠️ Orderbook WebSocket watchdog triggered (no data for 30s). Reconnecting...")
-                        break # Break inner loop to trigger reconnection
+                        logger.warning("⚠️ Market data WebSocket watchdog triggered (no data for 30s). Reconnecting...")
+                        break 
                         
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
-            logger.info(f"🔌 Orderbook WebSocket disconnected ({e}), reconnecting in 5 seconds...")
+            logger.info(f"🔌 Market data WebSocket disconnected ({e}), reconnecting in 5 seconds...")
             ws_connection_healthy = False
             await asyncio.sleep(5)
         except Exception as e:
-            logger.error(f"❌ An unexpected error occurred in orderbook socket: {e}. Reconnecting in 5 seconds...")
+            logger.error(f"❌ An unexpected error occurred in market data socket: {e}. Reconnecting in 5 seconds...")
             ws_connection_healthy = False
             await asyncio.sleep(5)
 
@@ -535,7 +605,7 @@ async def subscribe_to_account_all(account_id):
             await asyncio.sleep(5)
 
 async def restart_websocket():
-    global ws_task
+    global ws_task, local_order_book, order_book_received
     logger.info("🔄 Restarting websocket connection...")
     if ws_task and not ws_task.done():
         ws_task.cancel()
@@ -546,9 +616,12 @@ async def restart_websocket():
     
     # Reset state
     order_book_received.clear()
+    local_order_book['initialized'] = False
+    local_order_book['bids'] = {}
+    local_order_book['asks'] = {}
     
     # Start new task
-    ws_task = asyncio.create_task(subscribe_to_orderbook(MARKET_ID))
+    ws_task = asyncio.create_task(subscribe_to_market_data(MARKET_ID))
     
     try:
         logger.info("⏳ Waiting for websocket reconnection...")
@@ -692,8 +765,10 @@ async def main():
 
 
     last_order_book_update = time.time()
-    ws_client = RobustWsClient(order_book_ids=[MARKET_ID], account_ids=[], on_order_book_update=on_order_book_update)
-    ws_task = asyncio.create_task(ws_client.run_async())
+    last_order_book_update = time.time()
+    # Start WebSocket Tasks
+    # We now use a single task for market data (orderbook + trades)
+    ws_task = asyncio.create_task(subscribe_to_market_data(MARKET_ID))
 
     user_stats_task = asyncio.create_task(subscribe_to_user_stats(ACCOUNT_INDEX))
     account_all_task = asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX))
