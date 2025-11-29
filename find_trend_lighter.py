@@ -275,7 +275,8 @@ async def perform_grid_search(symbol, interval):
                         high_price = getattr(c, 'high', getattr(c, 'h', None))
                         low_price = getattr(c, 'low', getattr(c, 'l', None))
                         close_price = getattr(c, 'close', getattr(c, 'c', None))
-                        volume = getattr(c, 'volume', getattr(c, 'v', None))
+                        # Lighter docs specify volume0 (base) and volume1 (quote). Use volume0 as default Volume.
+                        volume = getattr(c, 'volume0', getattr(c, 'volume', getattr(c, 'v', 0)))
 
                         if timestamp and open_price and high_price and low_price and close_price:
                             all_klines.append([timestamp, float(open_price), float(high_price), float(low_price), float(close_price), float(volume) if volume else 0, 0, 0, 0, 0, 0, 0])
@@ -321,7 +322,8 @@ async def perform_grid_search(symbol, interval):
                     high_price = getattr(c, 'high', getattr(c, 'h', None))
                     low_price = getattr(c, 'low', getattr(c, 'l', None))
                     close_price = getattr(c, 'close', getattr(c, 'c', None))
-                    volume = getattr(c, 'volume', getattr(c, 'v', None))
+                    # Lighter docs specify volume0 (base) and volume1 (quote). Use volume0 as default Volume.
+                    volume = getattr(c, 'volume0', getattr(c, 'volume', getattr(c, 'v', 0)))
 
                     if timestamp and open_price and high_price and low_price and close_price:
                         older_processed.append([timestamp, float(open_price), float(high_price), float(low_price), float(close_price), float(volume) if volume else 0, 0, 0, 0, 0, 0, 0])
