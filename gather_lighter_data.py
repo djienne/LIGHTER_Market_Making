@@ -1,5 +1,4 @@
 import asyncio
-import csv
 import os
 import time
 import logging
@@ -7,6 +6,8 @@ import traceback
 from datetime import datetime
 from collections import defaultdict
 from decimal import Decimal
+import json
+import pandas as pd
 
 # It is recommended to install the lighter sdk using pip
 # pip install git+https://github.com/elliottech/lighter-python.git
@@ -41,6 +42,8 @@ def setup_logging():
     logging.getLogger('websockets').setLevel(logging.ERROR)
     logging.getLogger('asyncio').setLevel(logging.ERROR)
     logging.getLogger('urllib3').setLevel(logging.ERROR)
+    logging.getLogger('parso').setLevel(logging.ERROR)
+    logging.getLogger('fsspec').setLevel(logging.ERROR)
 
     # Configure main logger for summaries
     main_logger = logging.getLogger(__name__)
@@ -71,16 +74,46 @@ def setup_logging():
 logger, summary_logger = setup_logging()
 
 
+
 # --- Configuration ---
-CRYPTO_TICKERS = ['PAXG']  # Symbols to track
+CONFIG_FILE = 'config.json'
+
+def load_config():
+    """Loads configuration from config.json."""
+    if not os.path.exists(CONFIG_FILE):
+        logger.error(f"Configuration file '{CONFIG_FILE}' not found. Using default symbols.")
+        return ['ETH', 'BTC', 'SOL', 'PAXG'] # Default if config file is missing
+
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            tickers = config.get('CRYPTO_TICKERS')
+            if not tickers or not isinstance(tickers, list):
+                logger.error(f"'CRYPTO_TICKERS' not found or invalid in '{CONFIG_FILE}'. Using default symbols.")
+                return ['ETH', 'BTC', 'SOL', 'PAXG'] # Default if key is missing or invalid
+            logger.info(f"Loaded CRYPTO_TICKERS from {CONFIG_FILE}: {tickers}")
+            return tickers
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from '{CONFIG_FILE}': {e}. Using default symbols.")
+        return ['ETH', 'BTC', 'SOL', 'PAXG'] # Default on JSON decode error
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while loading '{CONFIG_FILE}': {e}. Using default symbols.")
+        return ['ETH', 'BTC', 'SOL', 'PAXG'] # Default on any other error
+
+CRYPTO_TICKERS = load_config() # Symbols to track
 DATA_FOLDER = 'lighter_data'             # Directory for CSV output
 BUFFER_SECONDS = 5                       # Interval to write buffered data to disk
 
+import websockets
+
 # --- Global State ---
 # In-memory buffers to store data points before writing them to files in batches.
-# This reduces the frequency of disk I/O operations.
 price_buffers = defaultdict(list)
 trade_buffers = defaultdict(list)
+last_offsets = {} # Track the last offset per symbol to detect gaps
+
+# Local Order Book State: {symbol: {'bids': {price: size}, 'asks': {price: size}, 'initialized': False}}
+local_order_books = defaultdict(lambda: {'bids': {}, 'asks': {}, 'initialized': False})
 
 # Global mapping from the API's numerical market_id to the human-readable symbol (e.g., 1 -> 'ETH').
 market_info = {}
@@ -89,12 +122,14 @@ market_info = {}
 stats = {
     'orderbook_updates': 0,
     'trade_fetches': 0,
-    'csv_writes': 0,
+    'parquet_writes': 0,
     'errors': 0,
     'start_time': None,
     'last_orderbook_time': {},
     'last_trade_time': {},
-    'buffer_flushes': 0
+    'buffer_flushes': 0,
+    'gaps_detected': 0,
+    'ws_trades': 0
 }
 
 # Ensure the data directory exists on startup.
@@ -113,7 +148,7 @@ async def print_summary():
 
             # Calculate data rates
             orderbook_rate = stats['orderbook_updates'] / uptime if uptime > 0 else 0
-            trade_rate = stats['trade_fetches'] / uptime if uptime > 0 else 0
+            trade_rate = (stats['trade_fetches'] + stats['ws_trades']) / uptime if uptime > 0 else 0
 
             # Format last data times and check for stale data
             last_data_info = []
@@ -131,8 +166,9 @@ async def print_summary():
 
             summary_msg = (f"SUMMARY - Uptime: {uptime:.0f}s | "
                           f"OrderBook: {stats['orderbook_updates']} ({orderbook_rate:.1f}/s) | "
-                          f"Trades: {stats['trade_fetches']} ({trade_rate:.1f}/s) | "
+                          f"Trades: {stats['trade_fetches'] + stats['ws_trades']} ({trade_rate:.1f}/s) | "
                           f"Flushes: {stats['buffer_flushes']} | "
+                          f"Gaps: {stats['gaps_detected']} | "
                           f"Errors: {stats['errors']}")
 
             if last_data_info:
@@ -164,10 +200,32 @@ async def get_market_id(order_api: lighter.OrderApi, symbol: str) -> int | None:
         return None
 
 
-async def fetch_recent_trades_periodically(order_api: lighter.OrderApi):
-    """Periodically polls the API for recent trades for all tracked markets."""
-    logger.info("Starting periodic trade fetching...")
-    last_trade_ids = {}  # Track the last seen trade ID per symbol to avoid duplicates.
+def get_last_recorded_trade_ids():
+    """Reads existing Parquet files to find the last recorded trade ID for each symbol."""
+    ids = {}
+    logger.info("Checking for existing trade data...")
+    for symbol in CRYPTO_TICKERS:
+        file_path = os.path.join(DATA_FOLDER, f'trades_{symbol}.parquet')
+        if os.path.exists(file_path):
+            try:
+                # Read only trade_id column to minimize I/O
+                df = pd.read_parquet(file_path, engine='fastparquet', columns=['trade_id'])
+                if not df.empty and 'trade_id' in df.columns:
+                    max_id = df['trade_id'].max()
+                    ids[symbol] = int(max_id)
+                    logger.info(f"Resuming {symbol} from trade_id {max_id}")
+            except Exception as e:
+                logger.error(f"Error reading last trade ID for {symbol}: {e}")
+    return ids
+
+
+async def fetch_recent_trades_periodically(order_api: lighter.OrderApi, last_trade_ids=None):
+    """Periodically polls the API for recent trades (fallback/redundancy)."""
+    logger.info("Starting periodic trade fetching (backup)...")
+    if last_trade_ids is None:
+        last_trade_ids = {}  # Track the last seen trade ID per symbol to avoid duplicates.
+    else:
+        logger.info(f"Initialized with last trade IDs: {last_trade_ids}")
 
     while True:
         for market_id, symbol in market_info.items():
@@ -182,59 +240,80 @@ async def fetch_recent_trades_periodically(order_api: lighter.OrderApi):
 
                         trade_data = {
                             'timestamp': datetime.fromtimestamp(int(trade.timestamp) / 1000).isoformat(),
-                            'price': Decimal(trade.price),
-                            'size': Decimal(trade.size),
+                            'price': float(trade.price),
+                            'size': float(trade.size),
                             'side': 'buy' if hasattr(trade, 'is_maker_ask') and trade.is_maker_ask else 'sell',
-                            'trade_id': trade.trade_id,
-                            'usd_amount': Decimal(trade.usd_amount) if hasattr(trade, 'usd_amount') else None,
+                            'trade_id': int(trade.trade_id),
+                            'usd_amount': float(trade.usd_amount) if hasattr(trade, 'usd_amount') else None,
                         }
                         trade_buffers[symbol].append(trade_data)
                         new_trades_count += 1
                         last_trade_ids[symbol] = max(last_trade_ids.get(symbol, 0), trade.trade_id)
 
                     if new_trades_count > 0:
-                        logger.info(f"Added {new_trades_count} new trades for {symbol}")
+                        logger.info(f"REST: Added {new_trades_count} trades for {symbol}")
                         stats['trade_fetches'] += new_trades_count
                         stats['last_trade_time'][symbol] = time.time()
             except Exception as e:
                 logger.error(f"Error fetching trades for {symbol}: {e}")
                 stats['errors'] += 1
-        # Wait before the next polling cycle
-        await asyncio.sleep(2)
+        # Poll less frequently since we have WS
+        await asyncio.sleep(60)
 
 
-async def write_buffers_to_csv():
-    """Periodically writes the content of in-memory buffers to their respective CSV files."""
-    logger.info(f"Starting CSV writer with {BUFFER_SECONDS}s intervals...")
+async def write_buffers_to_parquet():
+    """Periodically writes the content of in-memory buffers to their respective Parquet files."""
+    logger.info(f"Starting Parquet writer with {BUFFER_SECONDS}s intervals...")
     while True:
         await asyncio.sleep(BUFFER_SECONDS)
-        logger.debug("Starting CSV write cycle...")
+        # logger.debug("Starting Parquet write cycle...")
 
         try:
             if any(price_buffers.values()) or any(trade_buffers.values()):
                 stats['buffer_flushes'] += 1
-                summary_logger.info(f"FLUSH #{stats['buffer_flushes']} - Writing buffers to CSV...")
+                summary_logger.info(f"FLUSH #{stats['buffer_flushes']} - Writing buffers to Parquet...")
 
             # --- Write Price Data ---
-            # Iterate over a copy of items, allowing us to safely remove keys from the original dict.
             for symbol, data_points in list(price_buffers.items()):
                 if not data_points: continue
 
-                # Atomically copy and clear the data to avoid race conditions with the websocket callback.
                 price_data = price_buffers[symbol].copy()
                 price_buffers[symbol].clear()
                 if not price_data: continue
+                
+                # Deduplication logic (simple consecutive)
+                deduplicated_data = []
+                if price_data:
+                    deduplicated_data.append(price_data[0])
+                    for i in range(1, len(price_data)):
+                        curr = price_data[i]
+                        prev = price_data[i-1]
+                        is_duplicate = True
+                        for k in curr:
+                            if k == 'timestamp': continue
+                            if curr[k] != prev.get(k):
+                                is_duplicate = False
+                                break
+                        if not is_duplicate:
+                            deduplicated_data.append(curr)
 
-                prices_file = os.path.join(DATA_FOLDER, f'prices_{symbol}.csv')
-                file_exists = os.path.isfile(prices_file)
+                if not deduplicated_data: continue
+
+                prices_file = os.path.join(DATA_FOLDER, f'prices_{symbol}.parquet')
                 try:
-                    with open(prices_file, 'a', newline='', encoding='utf-8') as f:
-                        writer = csv.DictWriter(f, fieldnames=price_data[0].keys())
-                        if not file_exists:
-                            writer.writeheader()
-                        writer.writerows(price_data)
-                        logger.info(f"Saved {len(price_data)} price data points for {symbol}")
-                        stats['csv_writes'] += len(price_data)
+                    df = pd.DataFrame(deduplicated_data)
+                    # Convert float columns explicitly to avoid object types
+                    for col in df.columns:
+                        if 'price' in col or 'size' in col:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                    df.sort_values(by='timestamp', inplace=True)
+                    if os.path.exists(prices_file):
+                         df.to_parquet(prices_file, engine='fastparquet', append=True, index=False, compression='zstd')
+                    else:
+                        df.to_parquet(prices_file, engine='fastparquet', index=False, compression='zstd')
+                    logger.info(f"Saved {len(df)} price points for {symbol}")
+                    stats['parquet_writes'] += len(df)
                 except Exception as e:
                     logger.error(f"Error writing price data for {symbol}: {e}", exc_info=True)
                     stats['errors'] += 1
@@ -243,101 +322,238 @@ async def write_buffers_to_csv():
             for symbol, data_points in list(trade_buffers.items()):
                 if not data_points: continue
 
-                # Atomically copy and clear the data to avoid race conditions
                 trade_data = trade_buffers[symbol].copy()
                 trade_buffers[symbol].clear()
                 if not trade_data: continue
 
-                trades_file = os.path.join(DATA_FOLDER, f'trades_{symbol}.csv')
-                file_exists = os.path.isfile(trades_file)
+                trades_file = os.path.join(DATA_FOLDER, f'trades_{symbol}.parquet')
                 try:
-                    with open(trades_file, 'a', newline='', encoding='utf-8') as f:
-                        writer = csv.DictWriter(f, fieldnames=trade_data[0].keys())
-                        if not file_exists:
-                            writer.writeheader()
-                        writer.writerows(trade_data)
-                        logger.info(f"Saved {len(trade_data)} trades for {symbol}")
-                        stats['csv_writes'] += len(trade_data)
+                    df = pd.DataFrame(trade_data)
+                    df.drop_duplicates(subset=['trade_id'], keep='last', inplace=True)
+                    df.sort_values(by='timestamp', inplace=True)
+                    
+                    # Convert types
+                    if 'price' in df.columns: df['price'] = pd.to_numeric(df['price'])
+                    if 'size' in df.columns: df['size'] = pd.to_numeric(df['size'])
+
+                    if os.path.exists(trades_file):
+                        df.to_parquet(trades_file, engine='fastparquet', append=True, index=False, compression='zstd')
+                    else:
+                        df.to_parquet(trades_file, engine='fastparquet', index=False, compression='zstd')
+                    logger.info(f"Saved {len(df)} trades for {symbol}")
+                    stats['parquet_writes'] += len(df)
                 except Exception as e:
                     logger.error(f"Error writing trade data for {symbol}: {e}", exc_info=True)
                     stats['errors'] += 1
 
-            # Log performance stats after each write cycle
             perf_logger = logging.getLogger('performance')
             uptime = time.time() - stats['start_time'] if stats['start_time'] else 0
             perf_logger.info(f"Stats - Uptime: {uptime:.1f}s, OrderBook: {stats['orderbook_updates']}, "
-                           f"Trades: {stats['trade_fetches']}, CSV: {stats['csv_writes']}, Errors: {stats['errors']}")
+                           f"Trades: {stats['ws_trades']}, Parquet: {stats['parquet_writes']}, Errors: {stats['errors']}")
         except Exception as e:
-            logger.error(f"Error in CSV write cycle: {e}", exc_info=True)
+            logger.error(f"Error in Parquet write cycle: {e}", exc_info=True)
             stats['errors'] += 1
 
 
-def on_order_book_update(market_id, order_book):
-    """Callback function executed on each order book update from the WebSocket."""
-    try:
-        symbol = market_info.get(int(market_id))
-        if not symbol:
-            logger.warning(f"No symbol found for market_id: {market_id}")
-            return
+def handle_orderbook_message(market_id, payload):
+    """Processes an orderbook message (snapshot or delta) and updates local state."""
+    symbol = market_info.get(int(market_id))
+    if not symbol: return
 
-        bids = order_book.get('bids', [])
-        asks = order_book.get('asks', [])
+    lb = local_order_books[symbol]
+    
+    bids_in = payload.get('bids', [])
+    asks_in = payload.get('asks', [])
+    offset = payload.get('offset', 0)
 
-        if bids and asks:
-            best_bid = bids[0]
-            best_ask = asks[0]
-            
-            price_data = {
-                'timestamp': datetime.now().isoformat(),
-                'bid_price': Decimal(best_bid['price']),
-                'bid_size': Decimal(best_bid['size']),
-                'ask_price': Decimal(best_ask['price']),
-                'ask_size': Decimal(best_ask['size']),
-            }
-            price_buffers[symbol].append(price_data)
-            stats['orderbook_updates'] += 1
-            stats['last_orderbook_time'][symbol] = time.time()
-            logger.info(f"Order book update for {symbol}: bid={best_bid['price']}, ask={best_ask['price']}")
+    # Heuristic: If we receive a massive list, treat it as a snapshot/re-init
+    # OR if we haven't initialized yet.
+    is_snapshot = False
+    if not lb['initialized']:
+        is_snapshot = True
+        logger.info(f"Initializing local orderbook for {symbol} (Offset: {offset})")
+    elif len(bids_in) > 100 or len(asks_in) > 100:
+        is_snapshot = True
+        logger.info(f"Received snapshot for {symbol} (Offset: {offset})")
+
+    if is_snapshot:
+        lb['bids'] = {}
+        lb['asks'] = {}
+        lb['initialized'] = True
+        # For snapshot, we just set values
+        for item in bids_in:
+            price, size = float(item['price']), float(item['size'])
+            if size > 0: lb['bids'][price] = size
+        for item in asks_in:
+            price, size = float(item['price']), float(item['size'])
+            if size > 0: lb['asks'][price] = size
+    else:
+        # Delta update
+        for item in bids_in:
+            price, size = float(item['price']), float(item['size'])
+            if size == 0:
+                lb['bids'].pop(price, None)
+            else:
+                lb['bids'][price] = size
+        
+        for item in asks_in:
+            price, size = float(item['price']), float(item['size'])
+            if size == 0:
+                lb['asks'].pop(price, None)
+            else:
+                lb['asks'][price] = size
+
+    # Update offset
+    if symbol in last_offsets:
+        if offset > last_offsets[symbol] + 1:
+             # Gap detected
+             stats['gaps_detected'] += 1
+             # If gap is huge, maybe we should re-fetch snapshot?
+             # For now just log.
+    last_offsets[symbol] = offset
+
+    # --- Construct Top 10 for Buffer ---
+    # Sort Bids (Desc) and Asks (Asc)
+    sorted_bids = sorted(lb['bids'].items(), key=lambda x: x[0], reverse=True)
+    sorted_asks = sorted(lb['asks'].items(), key=lambda x: x[0])
+
+    price_data = {
+        'timestamp': datetime.now().isoformat(),
+        'offset': int(offset),
+        'gap_detected': False # Logic simplified
+    }
+
+    for i in range(10):
+        if i < len(sorted_bids):
+            price_data[f'bid_price_{i}'] = sorted_bids[i][0]
+            price_data[f'bid_size_{i}'] = sorted_bids[i][1]
         else:
-            logger.warning(f"Empty bids or asks for {symbol}")
-    except Exception as e:
-        logger.error(f"Error handling order book update: {e}", exc_info=True)
-        logger.error(f"Market ID: {market_id}, Order book: {order_book}")
-        stats['errors'] += 1
+            price_data[f'bid_price_{i}'] = None
+            price_data[f'bid_size_{i}'] = None
+        
+        if i < len(sorted_asks):
+            price_data[f'ask_price_{i}'] = sorted_asks[i][0]
+            price_data[f'ask_size_{i}'] = sorted_asks[i][1]
+        else:
+            price_data[f'ask_price_{i}'] = None
+            price_data[f'ask_size_{i}'] = None
+
+    price_buffers[symbol].append(price_data)
+    stats['orderbook_updates'] += 1
+    stats['last_orderbook_time'][symbol] = time.time()
 
 
-def on_account_update(account_id, account):
-    """Callback for account updates (not used in this script)."""
-    logger.debug(f"Account update received for account_id: {account_id} (ignored)")
-    pass
+def handle_trade_message(market_id, payload):
+    """Processes real-time trades from WebSocket."""
+    symbol = market_info.get(int(market_id))
+    if not symbol: return
 
+    trades = payload.get('trades', [])
+    for t in trades:
+        try:
+            raw_ts = int(t.get('timestamp', 0))
+            # Heuristic: If timestamp > 30,000,000,000 (year 2920), it's likely milliseconds.
+            # Current time (2025) in ms is approx 1.7e12
+            # Current time (2025) in s is approx 1.7e9
+            if raw_ts > 30000000000: 
+                ts_val = raw_ts / 1000.0
+            else:
+                ts_val = float(raw_ts)
 
-async def websocket_manager(market_ids, on_order_book_update, on_account_update):
-    """Manages the websocket connection and restarts it if it fails."""
-    reconnect_count = 0
+            trade_data = {
+                'timestamp': datetime.fromtimestamp(ts_val).isoformat(),
+                'price': float(t.get('price', 0)),
+                'size': float(t.get('size', 0)),
+                'side': 'buy' if t.get('is_maker_ask') else 'sell', 
+                'trade_id': int(t.get('trade_id', 0)),
+                'usd_amount': float(t.get('usd_amount', 0)) if t.get('usd_amount') else None,
+            }
+            # Fallback for side if 'type' is explicit
+            if 'type' in t and t['type'] in ['buy', 'sell']:
+                 trade_data['side'] = t['type']
+            
+            trade_buffers[symbol].append(trade_data)
+            stats['ws_trades'] += 1
+            stats['last_trade_time'][symbol] = time.time()
+        except Exception as e:
+            logger.error(f"Error parsing trade msg: {e} | Raw TS: {t.get('timestamp')}")
+
+async def custom_websocket_manager(market_ids):
+    """Custom WebSocket implementation using 'websockets' library."""
+    uri = "wss://mainnet.zklighter.elliot.ai/stream"
+    
     while True:
         try:
-            if reconnect_count > 0:
-                summary_logger.info(f"Reconnection attempt #{reconnect_count}")
-            summary_logger.info(f"Creating WebSocket client for {len(market_ids)} markets...")
-            ws_client = lighter.WsClient(
-                order_book_ids=market_ids,
-                account_ids=[],
-                on_order_book_update=on_order_book_update,
-                on_account_update=on_account_update,
-            )
-            summary_logger.info("✓ WebSocket client created, running...")
-            reconnect_count = 0  # Reset counter on successful connection
-            await ws_client.run_async()
+            summary_logger.info(f"Connecting to WebSocket: {uri}")
+            # ping_interval=20: automatically sends a ping every 20s (protocol level)
+            # ping_timeout=20: waits 20s for a pong, else closes connection
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
+                summary_logger.info("✓ WebSocket connected. Subscribing...")
+                
+                # Subscribe to all markets
+                for mid in market_ids:
+                    # Order Book
+                    await ws.send(json.dumps({
+                        "type": "subscribe",
+                        "channel": f"order_book/{mid}"
+                    }))
+                    # Trades
+                    await ws.send(json.dumps({
+                        "type": "subscribe",
+                        "channel": f"trade/{mid}"
+                    }))
+                
+                summary_logger.info(f"Subscribed to {len(market_ids)} markets (OB + Trade). Listening...")
+
+                last_message_time = time.time()
+
+                while True:
+                    try:
+                        # Wait for message with a timeout to implement watchdog
+                        msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                        last_message_time = time.time()
+                        
+                        data = json.loads(msg)
+                        
+                        # Handle application-level ping
+                        if data.get('type') == 'ping':
+                            logger.debug("Received application-level ping, sending pong.")
+                            await ws.send(json.dumps({"type": "pong"}))
+                            continue
+
+                        if 'channel' not in data: continue
+                        
+                        channel = data['channel']
+                        
+                        # Channel format: "order_book:0" or "trade:0"
+                        if ':' in channel:
+                            ctype, mid_str = channel.split(':')
+                            try:
+                                mid = int(mid_str)
+                                if ctype == 'order_book':
+                                    if 'order_book' in data:
+                                        handle_orderbook_message(mid, data['order_book'])
+                                elif ctype == 'trade':
+                                    handle_trade_message(mid, data)
+                            except ValueError:
+                                pass
+                                
+                    except asyncio.TimeoutError:
+                        # Watchdog triggered
+                        time_since_last = time.time() - last_message_time
+                        if time_since_last > 30:
+                            summary_logger.warning(f"⚠️ No messages received for {time_since_last:.1f}s. Reconnecting...")
+                            break # Break inner loop to trigger reconnection
+                    
         except asyncio.CancelledError:
-            summary_logger.info("WebSocket manager task cancelled.")
             break
         except Exception as e:
+            summary_logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
             stats['errors'] += 1
-            reconnect_count += 1
-            summary_logger.error(f"WebSocket client failed (attempt #{reconnect_count}): {e}. Reconnecting in 10s.")
-            logger.error(f"Full websocket error details:", exc_info=True)
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
+
+# (End of custom replacement)
+
 
 
 async def main():
@@ -345,7 +561,7 @@ async def main():
     global market_info
     stats['start_time'] = time.time()
 
-    summary_logger.info("=== Starting Lighter DEX Data Collector ===")
+    summary_logger.info("=== Starting Lighter DEX Data Collector (Parquet) ===")
     summary_logger.info(f"Tracking symbols: {CRYPTO_TICKERS}")
 
     try:
@@ -373,15 +589,16 @@ async def main():
         # 3. Get market IDs for WebSocket
         market_ids = list(market_info.keys())
 
+        # Initialize last trade IDs from disk to prevent duplicates
+        initial_trade_ids = get_last_recorded_trade_ids()
+
         # 4. Start all background tasks concurrently
         summary_logger.info("Starting background tasks...")
         tasks = {
-            'writer': asyncio.create_task(write_buffers_to_csv()),
-            'trades': asyncio.create_task(fetch_recent_trades_periodically(order_api)),
+            'writer': asyncio.create_task(write_buffers_to_parquet()),
+            'trades': asyncio.create_task(fetch_recent_trades_periodically(order_api, initial_trade_ids)),
             'summary': asyncio.create_task(print_summary()),
-            'websocket': asyncio.create_task(websocket_manager(
-                market_ids, on_order_book_update, on_account_update
-            ))
+            'websocket': asyncio.create_task(custom_websocket_manager(market_ids))
         }
         summary_logger.info("✓ All tasks started")
         summary_logger.info("=== Data collector is running (Press Ctrl+C to stop) ===")
@@ -414,7 +631,8 @@ async def main():
             summary_logger.info(f"Total uptime: {uptime:.1f} seconds")
             summary_logger.info(f"Order book updates: {stats['orderbook_updates']}")
             summary_logger.info(f"Trade fetches: {stats['trade_fetches']}")
-            summary_logger.info(f"CSV writes: {stats['csv_writes']}")
+            summary_logger.info(f"Parquet writes: {stats['parquet_writes']}")
+            summary_logger.info(f"Gaps detected: {stats['gaps_detected']}")
             summary_logger.info(f"Errors: {stats['errors']}")
         
         summary_logger.info("=== Cleanup complete ===")

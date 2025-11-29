@@ -10,4 +10,6 @@ eth-account
 arch
 matplotlib
 argparse
-arch
+fastparquet
+pyarrow
+zstandard
