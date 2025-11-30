@@ -57,14 +57,14 @@ pip install -r requirements.txt
     }
     ```
     *   `CRYPTO_TICKERS`: List of symbols to collect data for.
-    *   `GAMMA`: Fixed dimensionless risk aversion parameter (e.g., 0.5). If omitted, the calculator will attempt to optimize it via backtesting.
+    *   `GAMMA`: Fixed dimensionless risk aversion parameter. Defaults to 0.05 if omitted. Higher values (e.g., 0.5) make the bot more risk-averse with wider spreads
 
 3.  **Environment Variables:**
     *   `API_KEY_PRIVATE_KEY`, `ACCOUNT_INDEX`, `API_KEY_INDEX`: Your Lighter exchange credentials.
     *   `MARKET_SYMBOL`: The market to trade on (e.g., PAXG, BTC, ETH). Defaults to `PAXG`.
     *   `CLOSE_LONG_ON_STARTUP`: (true/false) If true, the bot will attempt to close any existing long position in the specified market on startup. Defaults to `false`.
-    *   `REQUIRE_PARAMS`: (true/false) If true, the market maker will *not* place any orders until valid Avellaneda parameters are calculated. If false, it will use a static fallback spread. Defaults to `false`.
-    *   `RESTART_INTERVAL_MINUTES`: The market maker service will automatically restart after this many minutes. This helps in reloading parameters and preventing potential memory leaks. Defaults to `5`.
+    *   `REQUIRE_PARAMS`: (true/false) If true, the market maker will *not* place any orders until valid Avellaneda parameters are calculated. If false, it will use a fallback spread of 0.1% (mid_price × 0.001). Defaults to `false`.
+    *   `RESTART_INTERVAL_MINUTES`: The market maker service automatically restarts after a timeout. In docker-compose, this is set via `timeout 600` (10 minutes) with `RESTART_SECONDS=5` controlling the delay between restarts. This helps reload parameters and prevent memory leaks
     *   `LEVERAGE`: The amount of leverage to use (e.g., 1, 2, 5, 8). This value multiplies your available capital, allowing for larger position sizes. Defaults to `1` (no leverage). Set to `2` for 2x leverage, `5` for 5x leverage, etc.
     *   `MARGIN_MODE`: The margin mode to use, either `cross` or `isolated`. This is also configured in `docker-compose.yml`. Defaults to `cross`.
     *   `FLIP`: (true/false) If true, the bot will adopt a short-biased strategy, selling first and then buying back. If false, it will follow a long-biased strategy, buying first and then selling. Defaults to `false`.
@@ -82,8 +82,8 @@ docker-compose up -d
 
 By default, only the data collector service runs. The parameter calculator and market maker services are commented out for safety:
 *   `lighter-data-collector`: Gathers real-time market data (active by default).
-*   `parameter-calculator`: Calculates optimal spreads and reservation prices (commented out - requires data collection first).
-*   `market-maker`: Executes the trading strategy (commented out - requires parameters and user configuration).
+*   `parameter-calculator`: Calculates optimal spreads and reservation prices (commented out - requires data collection first). When enabled, runs every 60 seconds (`INTERVAL_SECONDS=60`) analyzing the last 15 minutes of data (`--minutes 15`).
+*   `market-maker`: Executes the trading strategy (commented out - requires parameters and user configuration). When enabled, runs with a 10-minute timeout (`timeout 600`) and restarts with 5-second delay between attempts.
 
 ### Stopping the Bot
 
@@ -131,10 +131,10 @@ The `gather_lighter_data.py` script connects to the Lighter DEX websocket and su
 
 ### 2. Parameter Calculation
 
-The `calculate_avellaneda_parameters.py` script runs periodically (e.g., every minute or 10 minutes). It loads the recent high-frequency data from the Parquet files to calculate:
-*   **Volatility ($\sigma$)**: Uses a **GARCH(1,1)** model on 1-second resampled mid-prices to estimate daily volatility.
-*   **Order Intensity ($A, k$)**: Fits an exponential decay function to order arrival times across different spread depths.
-*   **Risk Aversion ($\gamma$)**: Uses a fixed configuration value (default 0.05) or performs a grid-search backtest over multiple time horizons to find the optimal parameter.
+The `calculate_avellaneda_parameters.py` script runs periodically (default: every 60 seconds, analyzing the last 15 minutes of data, configurable via `INTERVAL_SECONDS` and `--minutes` parameters). It loads the recent high-frequency data from the Parquet files to calculate:
+*   **Volatility ($\sigma$)**: Uses a **GARCH(1,1)** model on 1-second resampled mid-prices to estimate daily volatility, with fallback to rolling standard deviation if GARCH fails.
+*   **Order Intensity ($A, k$)**: Fits an exponential decay function to order arrival times across different spread depths. Calculates separate values for bid and ask sides (`A_bid`, `k_bid`, `A_ask`, `k_ask`).
+*   **Risk Aversion ($\gamma$)**: Uses a fixed configuration value from `config.json` (default 0.05 if not specified). The value determines spread width - higher values create wider spreads for more conservative trading
 
 The calculated parameters are saved to `params/avellaneda_parameters_{TICKER}.json`.
 
@@ -142,11 +142,18 @@ The calculated parameters are saved to `params/avellaneda_parameters_{TICKER}.js
 
 The `market_maker_v2.py` script reads the parameters from the JSON files. It connects to the Lighter exchange and places limit orders:
 *   **Reservation Price ($r$)**: Adjusted from the mid-price based on current inventory, volatility, and risk aversion ($r = s - q \gamma \sigma^2 T$).
-*   **Optimal Spread**: Centered around $r$ to maximize probability of profitable round-trip trades.
+*   **Optimal Spread**: Calculated using the Avellaneda-Stoikov model with separate bid/ask parameters. When parameters are unavailable and `REQUIRE_PARAMS=false`, uses a fallback spread of 0.1% of mid-price.
+*   **Static Fallback Values**: If parameters aren't available, the code defines `SPREAD = 0.035%` and `BASE_AMOUNT = 0.047`, but these are only used when dynamic sizing is disabled.
 
-**Capital Management**: The bot uses a conservative approach to capital allocation. It applies the following formula for each order:
-- Available Capital × (1 - Safety Margin) × Leverage × Capital Usage Percent
-- Example with default settings: $100 × 0.99 × 1 × 0.12 = $11.88 per order
+**Capital Management**: The bot uses a conservative approach to capital allocation with the following formula for each order:
+```
+Order Size = Available Capital × (1 - Safety Margin) × Leverage × Capital Usage Percent
+           = Available Capital × 0.99 × Leverage × 0.12
+```
+- `SAFETY_MARGIN_PERCENT = 0.01` (retains 1% buffer)
+- `CAPITAL_USAGE_PERCENT = 0.12` (uses 12% per order)
+- Example with defaults: $100 × 0.99 × 1 × 0.12 = $11.88 per order
+- With 2x leverage: $100 × 0.99 × 2 × 0.12 = $23.76 per order
 
 ---
 
