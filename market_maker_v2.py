@@ -632,6 +632,73 @@ async def restart_websocket():
         logger.error("❌ Websocket reconnection failed - timeout.")
         return False
 
+def get_current_mid_price():
+    global current_mid_price_cached
+    return current_mid_price_cached
+
+async def check_websocket_health():
+    global ws_connection_healthy, last_order_book_update
+    if not ws_connection_healthy:
+        return False
+    if time.time() - last_order_book_update > 30:
+        return False
+    return True
+
+async def calculate_dynamic_base_amount(mid_price):
+    global available_capital
+    if not mid_price or mid_price <= 0:
+        return None
+    
+    if not available_capital:
+        # Fallback to static
+        return Decimal(str(BASE_AMOUNT))
+        
+    # Use portion of capital
+    # size = (capital * percent) / price
+    try:
+        usd_amount = available_capital * CAPITAL_USAGE_PERCENT
+        size = usd_amount / mid_price
+        
+        # Round to tick size
+        if AMOUNT_TICK_SIZE:
+             size = round(size / float(AMOUNT_TICK_SIZE)) * float(AMOUNT_TICK_SIZE)
+             
+        return Decimal(str(size))
+    except:
+        return Decimal(str(BASE_AMOUNT))
+
+async def place_order(client, side, price, order_id, size):
+    try:
+        is_ask = (side == 'sell')
+        
+        tx, tx_hash, err = await client.create_order(
+            market_index=MARKET_ID,
+            client_order_index=order_id,
+            base_amount=float(size),
+            price=float(price),
+            is_ask=is_ask,
+            order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
+            time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+        )
+        
+        if err:
+             logger.error(f"❌ Failed to place {side} order: {err}")
+        else:
+             logger.info(f"✅ Placed {side} order: {size} @ {price}")
+             
+    except Exception as e:
+        logger.error(f"❌ Failed to place {side} order: {e}", exc_info=True)
+
+async def cancel_all_orders(client):
+    try:
+        await client.cancel_all_orders(
+            time_in_force=lighter.SignerClient.CANCEL_ALL_TIF_IMMEDIATE, 
+            time=0
+        )
+        logger.info("🗑️ Cancelled all orders")
+    except Exception as e:
+        logger.error(f"❌ Failed to cancel orders: {e}", exc_info=True)
+
 def calculate_order_price(mid_price, side, inventory_factor):
     """
     Calculates the optimal bid or ask price using Avellaneda-Stoikov formula.
