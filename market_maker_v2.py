@@ -632,6 +632,62 @@ async def restart_websocket():
         logger.error("❌ Websocket reconnection failed - timeout.")
         return False
 
+def calculate_order_price(mid_price, side, inventory_factor):
+    """
+    Calculates the optimal bid or ask price using Avellaneda-Stoikov formula.
+    """
+    global avellaneda_params
+    
+    if not avellaneda_params:
+        # Fallback: simple fixed percentage spread
+        spread = mid_price * 0.001 # 0.1% spread
+        if side == 'buy':
+            return mid_price - (spread / 2)
+        else:
+            return mid_price + (spread / 2)
+
+    try:
+        # Extract parameters
+        gamma = float(avellaneda_params['optimal_parameters']['gamma'])
+        sigma = float(avellaneda_params['market_data']['sigma'])
+        
+        # Use separate k for bid and ask if available, otherwise fallback to 'k' or defaults
+        market_data = avellaneda_params.get('market_data', {})
+        k_bid = float(market_data.get('k_bid', market_data.get('k', 0.5)))
+        k_ask = float(market_data.get('k_ask', market_data.get('k', 0.5)))
+        
+        time_horizon = float(avellaneda_params['current_state']['time_remaining']) # in days
+        
+        # 1. Calculate Reservation Price (r)
+        # r = s - q * gamma * sigma^2 * (T - t)
+        # inventory_factor is q (current inventory)
+        reservation_price = mid_price - (inventory_factor * gamma * (sigma**2) * time_horizon)
+        
+        # 2. Calculate Spread (delta)
+        # delta = (2 / gamma) * ln(1 + gamma / k)
+        # We use k_bid for bid spread and k_ask for ask spread
+        
+        if side == 'buy':
+            # Bid Spread
+            val_inside_log = 1.0 + gamma / (mid_price * k_bid + 1e-9)
+            spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
+            final_price = reservation_price - (spread / 2.0)
+        else:
+            # Ask Spread
+            val_inside_log = 1.0 + gamma / (mid_price * k_ask + 1e-9)
+            spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
+            final_price = reservation_price + (spread / 2.0)
+
+        # Ensure price is valid tick size
+        if PRICE_TICK_SIZE:
+            final_price = round(final_price / float(PRICE_TICK_SIZE)) * float(PRICE_TICK_SIZE)
+        
+        return final_price
+
+    except Exception as e:
+        logger.error(f"❌ Error calculating order price: {e}", exc_info=True)
+        return None
+
 async def market_making_loop(client, account_api, order_api):
     logger.info("🚀 Starting 2-sided market making loop...")
 

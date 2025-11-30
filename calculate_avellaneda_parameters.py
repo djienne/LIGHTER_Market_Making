@@ -89,7 +89,7 @@ def main():
 
     # Calculate parameters
     sigma_list = volatility.calculate_volatility(calc_mid_price_df, window_minutes, freq_str)
-    Alist, klist = intensity.calculate_intensity_params(list_of_periods, window_minutes, buy_trades, sell_trades, delta_list, calc_mid_price_df)
+    A_bid_list, k_bid_list, A_ask_list, k_ask_list = intensity.calculate_intensity_params(list_of_periods, window_minutes, buy_trades, sell_trades, delta_list, calc_mid_price_df)
 
     if len(list_of_periods) <= 1:
         utils.print_summary({}, list_of_periods)
@@ -102,7 +102,7 @@ def main():
 
     # Optimize Time Horizon (T)
     # We pass the fixed gamma and search for the best horizon
-    best_horizons_list = backtest.optimize_horizon(list_of_periods, sigma_list, Alist, klist, window_minutes, ma_window, calc_mid_price_df, buy_trades, sell_trades, fixed_gamma)
+    best_horizons_list = backtest.optimize_horizon(list_of_periods, sigma_list, A_bid_list, k_bid_list, A_ask_list, k_ask_list, window_minutes, ma_window, calc_mid_price_df, buy_trades, sell_trades, fixed_gamma)
     
     # Determine final horizon from optimization results
     if len(best_horizons_list) > 0:
@@ -121,19 +121,23 @@ def main():
         final_horizon_days = 0.5 # Fallback 12h
 
     if ma_window > 1:
-        start_index = max(0, len(Alist) - ma_window)
-        a_slice = Alist[start_index:]
-        k_slice = klist[start_index:]
-        A = pd.Series(a_slice).mean()
-        k = pd.Series(k_slice).mean()
+        start_index = max(0, len(A_bid_list) - ma_window)
+        
+        A_bid = pd.Series(A_bid_list[start_index:]).mean()
+        k_bid = pd.Series(k_bid_list[start_index:]).mean()
+        A_ask = pd.Series(A_ask_list[start_index:]).mean()
+        k_ask = pd.Series(k_ask_list[start_index:]).mean()
     else:
-        A = Alist[-1]
-        k = klist[-1]
+        A_bid = A_bid_list[-1]
+        k_bid = k_bid_list[-1]
+        A_ask = A_ask_list[-1]
+        k_ask = k_ask_list[-1]
 
-    if pd.isna(A):
-        A = Alist[-1]
-    if pd.isna(k):
-        k = klist[-1]
+    # Fallbacks
+    if pd.isna(A_bid): A_bid = A_bid_list[-1]
+    if pd.isna(k_bid): k_bid = k_bid_list[-1]
+    if pd.isna(A_ask): A_ask = A_ask_list[-1]
+    if pd.isna(k_ask): k_ask = k_ask_list[-1]
 
     sigma = sigma_list[-1]
 
@@ -142,7 +146,7 @@ def main():
     period_end = list_of_periods[-1] + pd.Timedelta(minutes=window_minutes) if list_of_periods else None
 
     # Calculate final quotes using fixed gamma and optimized horizon
-    results = backtest.calculate_final_quotes(fixed_gamma, sigma, A, k, window_minutes, mid_price_full_df, ma_window, period_start, period_end, TICKER, final_horizon_days)
+    results = backtest.calculate_final_quotes(fixed_gamma, sigma, A_bid, k_bid, A_ask, k_ask, window_minutes, mid_price_full_df, ma_window, period_start, period_end, TICKER, final_horizon_days)
     utils.print_summary(results, list_of_periods)
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ except ImportError:
 import logging
 logging.getLogger('numba').setLevel(logging.WARNING)
 
-def optimize_horizon(list_of_periods, sigma_list, Alist, klist, window_minutes, ma_window, mid_price_df, buy_trades, sell_trades, fixed_gamma):
+def optimize_horizon(list_of_periods, sigma_list, A_bid_list, k_bid_list, A_ask_list, k_ask_list, window_minutes, ma_window, mid_price_df, buy_trades, sell_trades, fixed_gamma):
     """Optimize time horizon parameter via backtesting with fixed gamma."""
     print("\n" + "-"*20)
     print(f"Optimizing time horizon via backtesting (Fixed Gamma={fixed_gamma})...")
@@ -36,17 +36,15 @@ def optimize_horizon(list_of_periods, sigma_list, Alist, klist, window_minutes, 
 
     for j in period_index_range:
         if ma_window > 1:
-            a_slice = Alist[max(0, j - ma_window):j]
-            k_slice = klist[max(0, j - ma_window):j]
-            A = pd.Series(a_slice).mean()
-            k = pd.Series(k_slice).mean()
+            k_bid = pd.Series(k_bid_list[max(0, j - ma_window):j]).mean()
+            k_ask = pd.Series(k_ask_list[max(0, j - ma_window):j]).mean()
         else:
-            A = Alist[j-1]
-            k = klist[j-1]
+            k_bid = k_bid_list[j-1]
+            k_ask = k_ask_list[j-1]
 
         sigma = sigma_list[j-1]
 
-        if pd.isna(sigma) or pd.isna(A) or pd.isna(k):
+        if pd.isna(sigma) or pd.isna(k_bid) or pd.isna(k_ask):
             best_horizons.append(np.nan)
             continue
 
@@ -73,7 +71,7 @@ def optimize_horizon(list_of_periods, sigma_list, Alist, klist, window_minutes, 
         # Iterate over Time Horizons
         for horizon_minutes in time_horizons_to_test:
             # Run backtest with fixed gamma and current horizon
-            res = run_backtest(s, buy_trades_period, sell_trades_period, fixed_gamma, k, sigma, window_minutes, horizon_minutes)
+            res = run_backtest(s, buy_trades_period, sell_trades_period, fixed_gamma, k_bid, k_ask, sigma, window_minutes, horizon_minutes)
             pnl = res['pnl'][-1]
             
             if not np.isnan(pnl) and pnl != 0:
@@ -88,14 +86,14 @@ def optimize_horizon(list_of_periods, sigma_list, Alist, klist, window_minutes, 
     return best_horizons
 
 @jit(nopython=True)
-def jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k, sigma, fee, time_remaining):
+def jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k_bid, k_ask, sigma, fee, time_remaining):
     """
     Core JIT-compiled backtest loop.
     Assumes gamma and sigma are DIMENSIONLESS.
-    k is ABSOLUTE (1/$).
+    k_bid, k_ask are ABSOLUTE (1/$).
     """
     N = len(s_values)
-    q, x, pnl, spr, r, r_a, r_b = np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1)
+    q, x, pnl, spr_bid, spr_ask, r, r_a, r_b = np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1)
     
     # Pre-calculate constants where possible, but s_values[i] is dynamic
     gamma_sigma2 = gamma * sigma**2
@@ -108,22 +106,31 @@ def jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k, sigma
         r[i] = s * (1.0 - q[i] * gamma_sigma2 * t_rem)
         
         # Spread Calculation (Dimensionless Gamma Logic)
-        # Standard AS: Width depends on liquidity (gamma, k), Shift depends on inventory/vol.
         # Spread Width (Total) = (2/gamma_abs) * log(1 + gamma_abs/k)
         #                      = (2*s/gamma) * log(1 + gamma/(s*k))
         
-        val_inside_log = 1.0 + gamma / (s * k + 1e-9)
-        spread_base = (2.0 * s / gamma) * np.log(val_inside_log)
+        # Bid Spread uses k_bid
+        val_inside_log_bid = 1.0 + gamma / (s * k_bid + 1e-9)
+        spread_base_bid = (2.0 * s / gamma) * np.log(val_inside_log_bid)
         
-        half_spread = spread_base / 2.0
+        # Ask Spread uses k_ask
+        val_inside_log_ask = 1.0 + gamma / (s * k_ask + 1e-9)
+        spread_base_ask = (2.0 * s / gamma) * np.log(val_inside_log_ask)
         
-        spr[i] = spread_base
+        half_spread_bid = spread_base_bid / 2.0
+        half_spread_ask = spread_base_ask / 2.0
+        
+        spr_bid[i] = spread_base_bid
+        spr_ask[i] = spread_base_ask
+        
         gap = abs(r[i] - s)
         
         if r[i] >= s:
-            delta_a, delta_b = half_spread + gap, half_spread - gap
+            delta_a = half_spread_ask + gap
+            delta_b = half_spread_bid - gap
         else:
-            delta_a, delta_b = half_spread - gap, half_spread + gap
+            delta_a = half_spread_ask - gap
+            delta_b = half_spread_bid + gap
             
         r_a[i], r_b[i] = r[i] + delta_a, r[i] - delta_b
         
@@ -142,9 +149,9 @@ def jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k, sigma
         x[i+1] = x[i] + sell_net - buy_total
         pnl[i+1] = x[i+1] + q[i+1] * s
         
-    return pnl, x, q, spr, r, r_a, r_b
+    return pnl, x, q, spr_bid, spr_ask, r, r_a, r_b
 
-def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_minutes, horizon_minutes, fee=0.00030):
+def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k_bid, k_ask, sigma, window_minutes, horizon_minutes, fee=0.00030):
     """Simulate the market making strategy."""
     time_index = mid_prices.index
     buy_trades_clean = buy_trades.groupby(level=0).min()
@@ -176,10 +183,10 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_mi
     time_remaining = np.maximum(time_remaining, 0.0)
     
     # Pass raw params to JIT loop, which handles the unit conversions dynamic to price
-    pnl, x, q, spr, r, r_a, r_b = jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k, sigma, fee, time_remaining)
-    return {'pnl': pnl, 'x': x, 'q': q, 'spread': spr, 'r': r, 'r_a': r_a, 'r_b': r_b}
+    pnl, x, q, spr_bid, spr_ask, r, r_a, r_b = jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k_bid, k_ask, sigma, fee, time_remaining)
+    return {'pnl': pnl, 'x': x, 'q': q, 'spread_bid': spr_bid, 'spread_ask': spr_ask, 'r': r, 'r_a': r_a, 'r_b': r_b}
 
-def calculate_final_quotes(gamma, sigma, A, k, window_minutes, mid_price_df, ma_window, period_start, period_end, ticker, time_horizon_days):
+def calculate_final_quotes(gamma, sigma, A_bid, k_bid, A_ask, k_ask, window_minutes, mid_price_df, ma_window, period_start, period_end, ticker, time_horizon_days):
     """Calculate the final reservation price and quotes."""
     print("\n" + "-"*20)
     print("Calculating final parameters for current state...")
@@ -197,23 +204,37 @@ def calculate_final_quotes(gamma, sigma, A, k, window_minutes, mid_price_df, ma_
     r = s * (1.0 - q * gamma * sigma**2 * time_remaining)
     
     # Spread (Pure Liquidity component)
-    term2 = (2.0 * s / gamma) * np.log(1.0 + gamma / (s * k + 1e-9))
-    spread_base = term2
+    # Bid Spread uses k_bid
+    term2_bid = (2.0 * s / gamma) * np.log(1.0 + gamma / (s * k_bid + 1e-9))
+    spread_base_bid = term2_bid
     
-    half_spread = spread_base / 2.0
+    # Ask Spread uses k_ask
+    term2_ask = (2.0 * s / gamma) * np.log(1.0 + gamma / (s * k_ask + 1e-9))
+    spread_base_ask = term2_ask
+    
+    half_spread_bid = spread_base_bid / 2.0
+    half_spread_ask = spread_base_ask / 2.0
+    
     gap = abs(r - s)
 
     if r >= s:
-        delta_a, delta_b = half_spread + gap, half_spread - gap
+        delta_a = half_spread_ask + gap
+        delta_b = half_spread_bid - gap
     else:
-        delta_a, delta_b = half_spread - gap, half_spread + gap
+        delta_a = half_spread_ask - gap
+        delta_b = half_spread_bid + gap
 
     r_a, r_b = r + delta_a, r - delta_b
 
     return {
         "ticker": ticker,
         "timestamp": pd.Timestamp.now().isoformat(),
-        "market_data": {"mid_price": float(s), "sigma": float(sigma), "A": float(A), "k": float(k)},
+        "market_data": {
+            "mid_price": float(s), 
+            "sigma": float(sigma), 
+            "A_bid": float(A_bid), "k_bid": float(k_bid),
+            "A_ask": float(A_ask), "k_ask": float(k_ask)
+        },
         "optimal_parameters": {"gamma": float(gamma)},
         "current_state": {
             "time_remaining": float(time_remaining),
@@ -226,7 +247,12 @@ def calculate_final_quotes(gamma, sigma, A, k, window_minutes, mid_price_df, ma_
             "start": period_start.isoformat() if period_start is not None else None,
             "end": period_end.isoformat() if period_end is not None else None
         },
-        "calculated_values": {"reservation_price": float(r), "gap": float(gap), "spread_base": float(spread_base), "half_spread": float(half_spread)},
+        "calculated_values": {
+            "reservation_price": float(r), 
+            "gap": float(gap), 
+            "spread_base_bid": float(spread_base_bid), "half_spread_bid": float(half_spread_bid),
+            "spread_base_ask": float(spread_base_ask), "half_spread_ask": float(half_spread_ask)
+        },
         "limit_orders": {"ask_price": float(r_a), "bid_price": float(r_b), "delta_a": float(delta_a), "delta_b": float(delta_b),
                          "delta_a_percent": (delta_a / s) * 100.0, "delta_b_percent": (delta_b / s) * 100.0}
     }
