@@ -3,11 +3,8 @@
 # "High-frequency trading in a limit order book" by Avellaneda & Stoikov (2008)
 
 import sys
-import os
-import argparse
 import pandas as pd
 import numpy as np
-from pathlib import Path
 import utils
 import volatility
 import intensity
@@ -47,18 +44,10 @@ def main():
     delta_list = np.arange(tick_size, 50.0 * tick_size, tick_size)
     
     # Load data
-    script_dir = Path(__file__).parent.absolute()
-    default_if_not_env = script_dir / 'lighter_data'
-    HL_DATA_DIR = os.getenv('HL_DATA_LOC', default_if_not_env)
-    
-    prices_file_path = os.path.join(HL_DATA_DIR, f'prices_{TICKER}.parquet')
-    if not os.path.exists(prices_file_path):
-        print(f"Error: File {prices_file_path} not found!")
-        sys.exit(1)
-
-    trades_file_path = os.path.join(HL_DATA_DIR, f'trades_{TICKER}.parquet')
-    if not os.path.exists(trades_file_path):
-        print(f"Error: File {trades_file_path} not found!")
+    try:
+        HL_DATA_DIR, prices_file_path, trades_file_path = utils.require_data_files(TICKER)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
 
     mid_price_full_df = utils.load_and_resample_mid_price(prices_file_path)

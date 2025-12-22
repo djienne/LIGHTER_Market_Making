@@ -3,6 +3,7 @@ import os
 import time
 import logging
 import traceback
+import re
 from datetime import datetime
 from collections import defaultdict
 from decimal import Decimal
@@ -101,8 +102,23 @@ def load_config():
         return ['ETH', 'BTC', 'SOL', 'PAXG'] # Default on any other error
 
 CRYPTO_TICKERS = load_config() # Symbols to track
-DATA_FOLDER = 'lighter_data'             # Directory for CSV output
+DATA_FOLDER = 'lighter_data'             # Directory for Parquet output
 BUFFER_SECONDS = 5                       # Interval to write buffered data to disk
+PARQUET_PART_WIDTH = 6
+
+def _get_max_parquet_bytes():
+    raw_value = os.getenv("PARQUET_MAX_MB", "5")
+    try:
+        max_mb = float(raw_value)
+        if max_mb <= 0:
+            raise ValueError
+    except ValueError:
+        logger.warning(f"Invalid PARQUET_MAX_MB={raw_value}; using 5MB")
+        max_mb = 5.0
+    return int(max_mb * 1024 * 1024)
+
+MAX_PARQUET_BYTES = _get_max_parquet_bytes()
+parquet_part_indices = {"prices": {}, "trades": {}}
 
 import websockets
 
@@ -136,6 +152,75 @@ stats = {
 logger.info(f"Creating data directory: {DATA_FOLDER}")
 os.makedirs(DATA_FOLDER, exist_ok=True)
 logger.info(f"Data directory created successfully")
+
+def _parse_part_index(filename: str) -> int | None:
+    match = re.search(r"_part(\d+)\.parquet$", filename)
+    if not match:
+        return None
+    return int(match.group(1))
+
+def _list_parquet_parts(kind: str, symbol: str) -> list[tuple[int, str]]:
+    prefix = f"{kind}_{symbol}_part"
+    parts = []
+    for name in os.listdir(DATA_FOLDER):
+        if not name.startswith(prefix) or not name.endswith(".parquet"):
+            continue
+        idx = _parse_part_index(name)
+        if idx is None:
+            continue
+        parts.append((idx, os.path.join(DATA_FOLDER, name)))
+    parts.sort(key=lambda item: item[0])
+    return parts
+
+def _parquet_part_path(kind: str, symbol: str, index: int) -> str:
+    return os.path.join(
+        DATA_FOLDER,
+        f"{kind}_{symbol}_part{index:0{PARQUET_PART_WIDTH}d}.parquet"
+    )
+
+def _get_or_init_part_index(kind: str, symbol: str) -> int:
+    current = parquet_part_indices[kind].get(symbol)
+    if current is not None:
+        return current
+    parts = _list_parquet_parts(kind, symbol)
+    current = parts[-1][0] if parts else 0
+    parquet_part_indices[kind][symbol] = current
+    return current
+
+def _get_latest_parquet_file(kind: str, symbol: str) -> str | None:
+    parts = _list_parquet_parts(kind, symbol)
+    if parts:
+        return parts[-1][1]
+    legacy_path = os.path.join(DATA_FOLDER, f"{kind}_{symbol}.parquet")
+    if os.path.exists(legacy_path):
+        return legacy_path
+    return None
+
+def _get_parquet_write_path(kind: str, symbol: str) -> str:
+    index = _get_or_init_part_index(kind, symbol)
+    file_path = _parquet_part_path(kind, symbol, index)
+    if os.path.exists(file_path):
+        try:
+            size_bytes = os.path.getsize(file_path)
+        except OSError:
+            size_bytes = 0
+        if size_bytes >= MAX_PARQUET_BYTES:
+            index += 1
+            parquet_part_indices[kind][symbol] = index
+            file_path = _parquet_part_path(kind, symbol, index)
+            logger.info(
+                f"Rotating {kind} parquet for {symbol}: "
+                f"{size_bytes / (1024 * 1024):.1f}MB -> {os.path.basename(file_path)}"
+            )
+    return file_path
+
+def _write_parquet_dataframe(df: pd.DataFrame, file_path: str, label: str, symbol: str) -> None:
+    if os.path.exists(file_path):
+        df.to_parquet(file_path, engine='fastparquet', append=True, index=False, compression='zstd')
+    else:
+        df.to_parquet(file_path, engine='fastparquet', index=False, compression='zstd')
+    logger.info(f"Saved {len(df)} {label} for {symbol}")
+    stats['parquet_writes'] += len(df)
 
 
 async def print_summary():
@@ -205,8 +290,8 @@ def get_last_recorded_trade_ids():
     ids = {}
     logger.info("Checking for existing trade data...")
     for symbol in CRYPTO_TICKERS:
-        file_path = os.path.join(DATA_FOLDER, f'trades_{symbol}.parquet')
-        if os.path.exists(file_path):
+        file_path = _get_latest_parquet_file("trades", symbol)
+        if file_path:
             try:
                 # Read only trade_id column to minimize I/O
                 df = pd.read_parquet(file_path, engine='fastparquet', columns=['trade_id'])
@@ -299,7 +384,7 @@ async def write_buffers_to_parquet():
 
                 if not deduplicated_data: continue
 
-                prices_file = os.path.join(DATA_FOLDER, f'prices_{symbol}.parquet')
+                prices_file = _get_parquet_write_path("prices", symbol)
                 try:
                     df = pd.DataFrame(deduplicated_data)
                     # Convert float columns explicitly to avoid object types
@@ -308,12 +393,7 @@ async def write_buffers_to_parquet():
                             df[col] = pd.to_numeric(df[col], errors='coerce')
                             
                     df.sort_values(by='timestamp', inplace=True)
-                    if os.path.exists(prices_file):
-                         df.to_parquet(prices_file, engine='fastparquet', append=True, index=False, compression='zstd')
-                    else:
-                        df.to_parquet(prices_file, engine='fastparquet', index=False, compression='zstd')
-                    logger.info(f"Saved {len(df)} price points for {symbol}")
-                    stats['parquet_writes'] += len(df)
+                    _write_parquet_dataframe(df, prices_file, "price points", symbol)
                 except Exception as e:
                     logger.error(f"Error writing price data for {symbol}: {e}", exc_info=True)
                     stats['errors'] += 1
@@ -326,7 +406,7 @@ async def write_buffers_to_parquet():
                 trade_buffers[symbol].clear()
                 if not trade_data: continue
 
-                trades_file = os.path.join(DATA_FOLDER, f'trades_{symbol}.parquet')
+                trades_file = _get_parquet_write_path("trades", symbol)
                 try:
                     df = pd.DataFrame(trade_data)
                     df.drop_duplicates(subset=['trade_id'], keep='last', inplace=True)
@@ -336,12 +416,7 @@ async def write_buffers_to_parquet():
                     if 'price' in df.columns: df['price'] = pd.to_numeric(df['price'])
                     if 'size' in df.columns: df['size'] = pd.to_numeric(df['size'])
 
-                    if os.path.exists(trades_file):
-                        df.to_parquet(trades_file, engine='fastparquet', append=True, index=False, compression='zstd')
-                    else:
-                        df.to_parquet(trades_file, engine='fastparquet', index=False, compression='zstd')
-                    logger.info(f"Saved {len(df)} trades for {symbol}")
-                    stats['parquet_writes'] += len(df)
+                    _write_parquet_dataframe(df, trades_file, "trades", symbol)
                 except Exception as e:
                     logger.error(f"Error writing trade data for {symbol}: {e}", exc_info=True)
                     stats['errors'] += 1

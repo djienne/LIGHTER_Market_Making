@@ -116,7 +116,7 @@ Here is an example of the market maker logs in action:
 ├── backtest.py                     # Parameter optimization and backtesting
 ├── test_runner.py                  # Testing utilities
 ├── check_parquet.py                # Data validation tool
-├── lighter_data/                   # Parquet output data (prices_*.parquet, trades_*.parquet)
+├── lighter_data/                   # Parquet output data (prices_*_part*.parquet, trades_*_part*.parquet)
 ├── params/                         # JSON output from the parameter calculator
 ├── logs/                           # Log files for all services
 ├── DOC/                            # Documentation
@@ -127,7 +127,7 @@ Here is an example of the market maker logs in action:
 
 ### 1. Data Collection
 
-The `gather_lighter_data.py` script connects to the Lighter DEX websocket and subscribes to the order book and trade channels for the configured markets (e.g., 'ETH', 'PAXG'). It captures **10 levels of order book depth** and saves this data to efficient, ZSTD-compressed **Parquet** files in the `lighter_data` directory. It handles deduplication and gap detection automatically.
+The `gather_lighter_data.py` script connects to the Lighter DEX websocket and subscribes to the order book and trade channels for the configured markets (e.g., 'ETH', 'PAXG'). It captures **10 levels of order book depth** and saves this data to efficient, ZSTD-compressed **Parquet** part files in the `lighter_data` directory. File rotation is size-based (see `PARQUET_MAX_MB`) and it handles deduplication and gap detection automatically.
 
 ### 2. Parameter Calculation
 

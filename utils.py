@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import logging
 import zipfile
+import re
 from typing import Tuple, Optional, Dict, Any, List
 from pathlib import Path
 
@@ -126,6 +127,24 @@ def load_config_params():
 def get_market_details(symbol: str) -> Tuple[Optional[int], float, Optional[float]]:
     return asyncio.run(_get_market_details_async(symbol))
 
+def get_data_paths(ticker: str) -> Tuple[str, str, str]:
+    """Return data directory and expected price/trade parquet paths for a ticker."""
+    script_dir = Path(__file__).parent.absolute()
+    default_if_not_env = script_dir / 'lighter_data'
+    data_dir = Path(os.getenv('HL_DATA_LOC', default_if_not_env))
+    prices_file_path = data_dir / f'prices_{ticker}.parquet'
+    trades_file_path = data_dir / f'trades_{ticker}.parquet'
+    return str(data_dir), str(prices_file_path), str(trades_file_path)
+
+def require_data_files(ticker: str) -> Tuple[str, str, str]:
+    """Return paths or raise if price/trade data is missing."""
+    data_dir, prices_file_path, trades_file_path = get_data_paths(ticker)
+    if not has_parquet_data(prices_file_path):
+        raise FileNotFoundError(f"No price data found for {ticker} in {data_dir}!")
+    if not has_parquet_data(trades_file_path):
+        raise FileNotFoundError(f"No trade data found for {ticker} in {data_dir}!")
+    return data_dir, prices_file_path, trades_file_path
+
 def load_trades_data(file_path):
     """Load trades data from a Parquet file."""
     df = _read_parquet_with_fallback(file_path)
@@ -138,6 +157,29 @@ def load_trades_data(file_path):
     df['datetime'] = pd.to_datetime(df['timestamp'], format='mixed')
     df = df.set_index('datetime')
     return df
+
+def find_parquet_parts(file_path: str) -> List[str]:
+    """Return ordered part files for a base parquet path (e.g., prices_ETH_part*.parquet)."""
+    base = Path(file_path)
+    pattern = f"{base.stem}_part*.parquet"
+    parts = list(base.parent.glob(pattern))
+
+    def sort_key(path: Path):
+        match = re.search(r"_part(\d+)\.parquet$", path.name)
+        if match:
+            return (0, int(match.group(1)))
+        return (1, path.name)
+
+    parts.sort(key=sort_key)
+    return [str(path) for path in parts]
+
+def has_parquet_data(file_path: str) -> bool:
+    """Check for either a legacy parquet file or chunked part files."""
+    return bool(find_parquet_parts(file_path)) or os.path.exists(file_path)
+
+def read_parquet_data(file_path: str, columns=None):
+    """Read parquet data from chunked part files or a legacy file."""
+    return _read_parquet_with_fallback(file_path, columns=columns)
 
 def calculate_depth_vwap(df, side, levels=10, target_notional=1000.0):
     """
@@ -265,6 +307,10 @@ def load_and_resample_mid_price(file_path):
 
 def _read_parquet_with_fallback(file_path, columns=None):
     """Read parquet with pyarrow first, then fastparquet as a fallback."""
+    part_files = find_parquet_parts(file_path)
+    if part_files:
+        return _read_parquet_parts(part_files, columns=columns)
+
     last_err = None
     for engine in ("pyarrow", "fastparquet"):
         try:
@@ -274,6 +320,38 @@ def _read_parquet_with_fallback(file_path, columns=None):
             continue
     print(f"Warning: failed to read parquet {file_path}: {last_err}")
     return None
+
+def _read_parquet_parts(part_files: List[str], columns=None):
+    """Read multiple parquet part files and concatenate them."""
+    dataframes = []
+    errors = []
+    for part_file in part_files:
+        last_err = None
+        df = None
+        for engine in ("pyarrow", "fastparquet"):
+            try:
+                df = pd.read_parquet(part_file, engine=engine, columns=columns)
+                break
+            except Exception as exc:
+                last_err = exc
+                continue
+        if df is None:
+            errors.append((part_file, last_err))
+            continue
+        dataframes.append(df)
+
+    if errors:
+        print(f"Warning: failed to read {len(errors)} parquet part file(s).")
+        for part_file, err in errors[:3]:
+            print(f"  - {part_file}: {err}")
+        if len(errors) > 3:
+            print("  - (additional errors omitted)")
+
+    if not dataframes:
+        return None
+    if len(dataframes) == 1:
+        return dataframes[0]
+    return pd.concat(dataframes, ignore_index=True)
 
 def _read_csv_fallback(file_path):
     """Read CSV from disk or lighter_data.zip when parquet is invalid."""
