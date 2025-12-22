@@ -1,6 +1,17 @@
 import pandas as pd
 import os
 
+def read_parquet_with_fallback(file_path, columns=None):
+    """Read parquet with pyarrow first, then fastparquet as a fallback."""
+    last_err = None
+    for engine in ("pyarrow", "fastparquet"):
+        try:
+            return pd.read_parquet(file_path, engine=engine, columns=columns)
+        except Exception as exc:
+            last_err = exc
+            continue
+    raise last_err
+
 data_folder = 'lighter_data'
 files = [f for f in os.listdir(data_folder) if f.endswith('.parquet') and 'prices' in f]
 
@@ -10,7 +21,7 @@ else:
     file_path = os.path.join(data_folder, files[0])
     print(f"Reading {file_path}...")
     try:
-        df = pd.read_parquet(file_path, engine='fastparquet')
+        df = read_parquet_with_fallback(file_path)
         print("Columns:", df.columns.tolist())
         print("\nLast 5 rows:")
         print(df.tail(5).to_string())

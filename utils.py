@@ -4,6 +4,7 @@ import math
 import argparse
 import asyncio
 import logging
+import zipfile
 from typing import Tuple, Optional, Dict, Any, List
 from pathlib import Path
 
@@ -127,7 +128,9 @@ def get_market_details(symbol: str) -> Tuple[Optional[int], float, Optional[floa
 
 def load_trades_data(file_path):
     """Load trades data from a Parquet file."""
-    df = pd.read_parquet(file_path, engine='fastparquet')
+    df = _read_parquet_with_fallback(file_path)
+    if df is None:
+        df = _read_csv_fallback(file_path)
     if 'trade_id' in df.columns:
         df = df.drop_duplicates(subset=['trade_id'])
     else:
@@ -229,7 +232,9 @@ def calculate_depth_vwap(df, side, levels=10, target_notional=1000.0):
 
 def load_and_resample_mid_price(file_path):
     """Load and resample mid-price data from a Parquet file."""
-    df = pd.read_parquet(file_path, engine='fastparquet')
+    df = _read_parquet_with_fallback(file_path)
+    if df is None:
+        df = _read_csv_fallback(file_path)
     df['datetime'] = pd.to_datetime(df['timestamp'], format='mixed')
 
     # Drop duplicate timestamps before setting the index, keeping the last entry
@@ -239,18 +244,55 @@ def load_and_resample_mid_price(file_path):
 
     df = df.set_index('datetime')
 
-    # Calculate Effective Bid and Ask Price (VWAP for $1000 depth)
-    # Use a default of $1000 notional.
-    TARGET_NOTIONAL = 1000.0
-    
-    df['price_bid'] = calculate_depth_vwap(df, 'bid', levels=10, target_notional=TARGET_NOTIONAL)
-    df['price_ask'] = calculate_depth_vwap(df, 'ask', levels=10, target_notional=TARGET_NOTIONAL)
+    # Calculate Effective Bid and Ask Price
+    if 'bid_price_0' in df.columns and 'ask_price_0' in df.columns:
+        # Use depth-based VWAP when full order book levels are available.
+        TARGET_NOTIONAL = 1000.0
+        df['price_bid'] = calculate_depth_vwap(df, 'bid', levels=10, target_notional=TARGET_NOTIONAL)
+        df['price_ask'] = calculate_depth_vwap(df, 'ask', levels=10, target_notional=TARGET_NOTIONAL)
+    elif 'bid_price' in df.columns and 'ask_price' in df.columns:
+        # CSV fallback provides top-of-book only.
+        df['price_bid'] = df['bid_price']
+        df['price_ask'] = df['ask_price']
+    else:
+        raise ValueError("Price data missing bid/ask columns for mid-price calculation.")
 
     # Resample and forward fill
     merged = df[['price_bid', 'price_ask']].resample('s').ffill()
     merged['mid_price'] = (merged['price_bid'] + merged['price_ask']) / 2
     merged.dropna(inplace=True)
     return merged
+
+def _read_parquet_with_fallback(file_path, columns=None):
+    """Read parquet with pyarrow first, then fastparquet as a fallback."""
+    last_err = None
+    for engine in ("pyarrow", "fastparquet"):
+        try:
+            return pd.read_parquet(file_path, engine=engine, columns=columns)
+        except Exception as exc:
+            last_err = exc
+            continue
+    print(f"Warning: failed to read parquet {file_path}: {last_err}")
+    return None
+
+def _read_csv_fallback(file_path):
+    """Read CSV from disk or lighter_data.zip when parquet is invalid."""
+    csv_path = str(Path(file_path).with_suffix('.csv'))
+    if os.path.exists(csv_path):
+        return pd.read_csv(csv_path)
+
+    zip_path = Path(file_path).resolve().parent.parent / 'lighter_data.zip'
+    if not zip_path.exists():
+        zip_path = Path.cwd() / 'lighter_data.zip'
+
+    inner_name = f"lighter_data/{Path(file_path).with_suffix('.csv').name}"
+    if zip_path.exists():
+        with zipfile.ZipFile(zip_path) as zf:
+            if inner_name in zf.namelist():
+                with zf.open(inner_name) as f:
+                    return pd.read_csv(f)
+
+    raise FileNotFoundError(f"CSV fallback not found for {file_path}")
 
 
 def prepare_calculation_windows(mid_price_df: pd.DataFrame, trades_df: pd.DataFrame,
