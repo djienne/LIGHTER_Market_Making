@@ -40,7 +40,6 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", "cross")
 FLIP_DEFAULT = os.getenv("FLIP", "false").lower() == "true"
 flip_state = FLIP_DEFAULT
 flip_target_state = flip_state
-SUPER_TREND_REFRESH_SECONDS = 120
 POSITION_VALUE_THRESHOLD_USD = 15.0
 
 # Directories (mounted by docker-compose)
@@ -79,6 +78,7 @@ available_capital = None
 portfolio_value = None
 last_capital_check = 0
 current_position_size = 0
+last_client_order_index = 0
 
 avellaneda_params = None
 last_avellaneda_update = 0
@@ -126,6 +126,15 @@ logging.root.setLevel(logging.WARNING)
 # =========================
 def trim_exception(e: Exception) -> str:
     return str(e).strip().split("\n")[-1]
+
+
+def next_client_order_index() -> int:
+    global last_client_order_index
+    new_id = time.time_ns()
+    if new_id <= last_client_order_index:
+        new_id = last_client_order_index + 1
+    last_client_order_index = new_id
+    return new_id
 
 
 def calculate_microprice_deviation(mid_price: float) -> Decimal:
@@ -814,11 +823,11 @@ async def market_making_loop(client, account_api, order_api):
                 )
 
                 # Place buy order
-                buy_order_id = int(time.time() * 1_000_000) % 1_000_000
+                buy_order_id = next_client_order_index()
                 await place_order(client, 'buy', buy_price, buy_order_id, base_amount)
 
                 # Place sell order
-                sell_order_id = buy_order_id + 1
+                sell_order_id = next_client_order_index()
                 await place_order(client, 'sell', sell_price, sell_order_id, base_amount)
             else:
                 logger.warning("⚠️ Could not calculate valid orders this cycle, skipping placement.")

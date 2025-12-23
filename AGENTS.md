@@ -1,24 +1,51 @@
 # Repository Guidelines
 
-Use this playbook to onboard quickly and ship safe changes to the Lighter DEX market-making stack.
-
 ## Project Structure & Module Organization
-Core scripts live at the repository root: `market_maker.py` executes orders, `gather_lighter_data.py` streams raw market data, and `calculate_avellaneda_parameters.py` computes strategy inputs. Generated artifacts land in `lighter_data/` (CSV history), `params/` (model outputs), and `logs/` (service logs). Docker orchestration resides in `docker-compose.yml` and `Dockerfile`; tweak credentials and symbols in `.env` and `CRYPTO_CONFIGURATION.md` when targeting new markets.
+This repo is a Python market-making system for the Lighter DEX. Key files live in the root:
+- `gather_lighter_data.py` streams order book and trades to `lighter_data/` (Parquet).
+- `calculate_avellaneda_parameters.py` writes model parameters to `params/`.
+- `market_maker_v2.py` places and manages orders.
+- Supporting modules: `utils.py`, `volatility.py`, `intensity.py`, `backtest.py`.
+- Operational assets: `docker-compose.yml`, `Dockerfile`, `requirements.txt`, `.env.example`, `config.json`.
+- `DOC/` holds protocol notes; `OLD/` contains legacy scripts.
 
 ## Build, Test, and Development Commands
-- `pip install -r requirements.txt` creates a local Python environment for isolated debugging.
-- `docker-compose build` compiles the services with the latest dependencies.
-- `docker-compose up -d` starts data collection, parameter calculation, and the market maker in the background.
-- `docker-compose logs -f market_maker` tails live trading output for validation; pair with `docker-compose down` to stop services.
+Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+Build and run services with Docker:
+```bash
+docker-compose build
+docker-compose up -d
+docker-compose down
+```
+Run individual scripts locally:
+```bash
+python gather_lighter_data.py
+python calculate_avellaneda_parameters.py --minutes 15
+python market_maker_v2.py
+```
+Smoke-check the data collector:
+```bash
+python test_runner.py
+```
 
 ## Coding Style & Naming Conventions
-Follow PEP 8 with 4-space indentation and descriptive snake_case identifiers. Group configuration constants near the top of each script and document magic numbers with inline comments. Keep new modules under the root or introduce a `src/` folder if the codebase grows; mirror naming between modules and Docker service labels.
+- Python uses 4-space indentation, snake_case for functions and variables, and UPPER_CASE for constants.
+- Keep configuration in `.env` and `config.json`; avoid hardcoding credentials or symbols.
+- No formatter or linter is enforced; keep changes PEP 8 friendly and consistent with existing modules.
 
 ## Testing Guidelines
-Automated tests are not yet in place, so emphasize reproducible manual checks. After telemetry or strategy changes, run the stack via Docker Compose and confirm parameter JSONs appear in `params/` and orders register correctly in market maker logs. When adding unit tests, prefer `pytest`, store them under `tests/`, and name files `test_<feature>.py` for discoverability.
+- There is no formal test framework configured.
+- Use `test_runner.py` as a quick smoke test for data collection and `check_parquet.py` to validate stored data.
+- If you add tests, document how to run them in this file.
+ - Unit tests (market maker logic): `python -m unittest discover -s tests -p "test_*.py"`.
 
 ## Commit & Pull Request Guidelines
-Write imperative, present-tense commit subjects ("Add leverage guard"), wrapping bodies at 72 characters. Reference related issues or incident IDs in the body when relevant. Pull requests should summarize scope, list validation steps (commands run, key log excerpts), and attach screenshots for UI-facing tooling like the dashboard scripts. Flag configuration updates in PR descriptions so operators can roll them out safely.
+- Recent commits use short, imperative messages like "Add ...", "Update ...", or "Implement ...".
+- PRs should include: a concise summary, affected scripts, configuration changes (`.env`, `config.json`, `docker-compose.yml`), and any safety or risk notes for live trading.
 
 ## Security & Configuration Tips
-Keep `.env` and `lighter.pem` out of version control; use local environment variables or secret managers. Rotate API keys regularly, and prefer read-only credentials when testing. Document any rate-limit or margin changes in `CRYPTO_CONFIGURATION.md` to keep trading behavior predictable.
+- Never commit real API keys or private keys; use `.env` and update `.env.example` when adding variables.
+- Treat `lighter.pem` and any key material as sensitive and keep them out of PRs.
