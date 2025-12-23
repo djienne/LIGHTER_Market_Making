@@ -1,4 +1,4 @@
 {
-    "CRYPTO_TICKERS": ["ETH", "PAXG"],
+    "CRYPTO_TICKERS": ["ETH", "PAXG", "CRV"],
     "GAMMA": 0.5
 }

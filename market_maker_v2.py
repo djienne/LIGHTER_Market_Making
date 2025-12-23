@@ -55,6 +55,7 @@ CAPITAL_USAGE_PERCENT = 0.12
 SAFETY_MARGIN_PERCENT = 0.01
 ORDER_TIMEOUT = 3           # seconds
 MINIMUM_SPREAD_PERCENT = 0.005 # Safety net for calculated spreads
+QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv("QUOTE_UPDATE_THRESHOLD_BPS", "1.0"))  # 1 bps
 
 # Avellaneda
 AVELLANEDA_REFRESH_INTERVAL = 900  # seconds
@@ -73,6 +74,12 @@ ws_task = None
 
 current_order_id = None
 current_order_timestamp = None
+current_bid_order_id = None
+current_ask_order_id = None
+current_bid_price = None
+current_ask_price = None
+current_bid_size = None
+current_ask_size = None
 last_mid_price = None
 available_capital = None
 portfolio_value = None
@@ -135,6 +142,12 @@ def next_client_order_index() -> int:
         new_id = last_client_order_index + 1
     last_client_order_index = new_id
     return new_id
+
+
+def price_change_bps(old_price: Optional[float], new_price: Optional[float]) -> float:
+    if old_price is None or new_price is None or old_price <= 0:
+        return float("inf")
+    return abs(new_price - old_price) / old_price * 10000.0
 
 
 def calculate_microprice_deviation(mid_price: float) -> Decimal:
@@ -465,18 +478,32 @@ def on_user_stats_update(account_id, stats):
     global available_capital, portfolio_value
     try:
         if int(account_id) == ACCOUNT_INDEX:
-            new_available_capital = float(stats.get('available_balance', 0))
-            new_portfolio_value = float(stats.get('portfolio_value', 0))
+            if not isinstance(stats, dict):
+                logger.warning(f"Received user stats with unexpected payload: {stats}")
+                return
+            if "available_balance" not in stats or "portfolio_value" not in stats:
+                logger.warning(f"Received user stats missing fields: {stats}")
+                return
 
-            if new_available_capital > 0 and new_portfolio_value > 0:
+            new_available_capital = float(stats.get("available_balance"))
+            new_portfolio_value = float(stats.get("portfolio_value"))
+
+            if new_available_capital >= 0 and new_portfolio_value >= 0:
                 available_capital = new_available_capital
                 portfolio_value = new_portfolio_value
-                logger.info(f"💰 Received user stats for account {account_id}: Available Capital=${available_capital}, Portfolio Value=${portfolio_value}")
+                logger.info(
+                    f"Received user stats for account {account_id}: "
+                    f"Available Capital=${available_capital}, Portfolio Value=${portfolio_value}"
+                )
                 account_state_received.set()
             else:
-                logger.warning(f"⚠️ Received user stats with invalid values: available_balance={stats.get('available_balance')}, portfolio_value={stats.get('portfolio_value')}")
+                logger.warning(
+                    f"Received user stats with negative values: "
+                    f"available_balance={stats.get('available_balance')}, "
+                    f"portfolio_value={stats.get('portfolio_value')}"
+                )
     except (ValueError, TypeError) as e:
-        logger.error(f"❌ Error processing user stats update: {e}", exc_info=True)
+        logger.error(f"Error processing user stats update: {e}", exc_info=True)
 
 async def subscribe_to_user_stats(account_id):
     """Connects to the websocket, subscribes to user_stats, and updates global state."""
@@ -529,43 +556,50 @@ def on_account_all_update(account_id, data):
     global account_positions, recent_trades, current_position_size
     try:
         if int(account_id) == ACCOUNT_INDEX:
-            # Update positions
-            new_positions = data.get("positions", {})
-            account_positions = new_positions
-            
-            market_position = new_positions.get(str(MARKET_ID))
-            new_size = 0.0
-            if market_position:
-                size = float(market_position.get('position', 0))
-                # The Lighter API uses a 'sign' field for positions: -1 for short, 1 for long.
-                sign = int(market_position.get('sign', 1))
-                if sign == -1:
-                    new_size = -size
-                else:
-                    new_size = size
-            else:
-                # Explicitly set to zero if no position for this market exists in the update
-                new_size = 0.0
+            positions_updated = False
+            if isinstance(data, dict) and "positions" in data:
+                # Update positions
+                new_positions = data.get("positions") or {}
+                account_positions = new_positions
+                positions_updated = True
 
-            if new_size != current_position_size:
-                logger.info(f"📊 WebSocket position update for market {MARKET_ID}: {current_position_size} -> {new_size}")
-                current_position_size = new_size
-            
-            # Update trades
-            new_trades_by_market = data.get("trades", {})
+                market_position = new_positions.get(str(MARKET_ID))
+                new_size = 0.0
+                if market_position:
+                    size = float(market_position.get("position", 0))
+                    # The Lighter API uses a sign field for positions: -1 for short, 1 for long.
+                    sign = int(market_position.get("sign", 1))
+                    new_size = -size if sign == -1 else size
+                else:
+                    # Explicitly set to zero if no position for this market exists in the update
+                    new_size = 0.0
+
+                if new_size != current_position_size:
+                    logger.info(
+                        f"WebSocket position update for market {MARKET_ID}: "
+                        f"{current_position_size} -> {new_size}"
+                    )
+                    current_position_size = new_size
+
+            # Update trades only if present in payload
+            new_trades_by_market = data.get("trades", {}) if isinstance(data, dict) else {}
             if new_trades_by_market:
                 all_new_trades = [trade for trades in new_trades_by_market.values() for trade in trades]
-                all_new_trades.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+                all_new_trades.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
                 for trade in reversed(all_new_trades):
-                     if trade not in recent_trades:
+                    if trade not in recent_trades:
                         recent_trades.append(trade)
-                        logger.info(f"💱 WebSocket trade update: Market {trade.get('market_id')}, Type {trade.get('type')}, Size {trade.get('size')}, Price {trade.get('price')}")
+                        logger.info(
+                            f"WebSocket trade update: Market {trade.get('market_id')}, "
+                            f"Type {trade.get('type')}, Size {trade.get('size')}, "
+                            f"Price {trade.get('price')}"
+                        )
 
-            if not account_all_received.is_set():
+            if positions_updated and not account_all_received.is_set():
                 account_all_received.set()
 
     except (ValueError, TypeError) as e:
-        logger.error(f"❌ Error processing account_all update: {e}", exc_info=True)
+        logger.error(f"Error processing account_all update: {e}", exc_info=True)
 
 async def subscribe_to_account_all(account_id):
     """Connects to the websocket, subscribes to account_all, and updates global state."""
@@ -679,7 +713,7 @@ async def calculate_dynamic_base_amount(mid_price):
 async def place_order(client, side, price, order_id, size):
     try:
         is_ask = (side == 'sell')
-        
+
         tx, tx_hash, err = await client.create_order(
             market_index=MARKET_ID,
             client_order_index=order_id,
@@ -689,14 +723,34 @@ async def place_order(client, side, price, order_id, size):
             order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
             time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
         )
-        
+
         if err:
-             logger.error(f"❌ Failed to place {side} order: {err}")
-        else:
-             logger.info(f"✅ Placed {side} order: {size} @ {price}")
-             
+            logger.error(f"Failed to place {side} order: {err}")
+            return False
+        logger.info(f"Placed {side} order: {size} @ {price}")
+        return True
     except Exception as e:
-        logger.error(f"❌ Failed to place {side} order: {e}", exc_info=True)
+        logger.error(f"Failed to place {side} order: {e}", exc_info=True)
+        return False
+
+
+async def cancel_order(client, order_id):
+    if order_id is None:
+        return True
+    try:
+        tx, tx_hash, err = await client.cancel_order(
+            market_index=MARKET_ID,
+            order_index=order_id,
+        )
+        if err:
+            logger.error(f"Failed to cancel order {order_id}: {err}")
+            return False
+        logger.info(f"Cancelled order {order_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to cancel order {order_id}: {e}", exc_info=True)
+        return False
+
 
 async def cancel_all_orders(client):
     try:
@@ -708,73 +762,196 @@ async def cancel_all_orders(client):
     except Exception as e:
         logger.error(f"❌ Failed to cancel orders: {e}", exc_info=True)
 
+async def refresh_order_if_needed(client, side, new_price, new_size):
+    global current_bid_order_id, current_ask_order_id
+    global current_bid_price, current_ask_price, current_bid_size, current_ask_size
+
+    if new_price is None or new_size is None:
+        logger.warning(f"Skipping {side} update: missing price or size.")
+        return
+
+    new_price_f = float(new_price)
+    new_size_f = float(new_size)
+
+    if new_price_f <= 0 or new_size_f <= 0:
+        logger.warning(f"Skipping {side} update: invalid price or size.")
+        return
+
+    if side == 'buy':
+        existing_id = current_bid_order_id
+        existing_price = current_bid_price
+    elif side == 'sell':
+        existing_id = current_ask_order_id
+        existing_price = current_ask_price
+    else:
+        logger.warning(f"Unknown side {side}; cannot refresh order.")
+        return
+
+    if existing_id is not None and existing_price is not None:
+        change_bps = price_change_bps(existing_price, new_price_f)
+        if change_bps <= QUOTE_UPDATE_THRESHOLD_BPS:
+            logger.info(
+                f"Keeping {side} order: price change {change_bps:.2f} bps <= {QUOTE_UPDATE_THRESHOLD_BPS:.2f}"
+            )
+            return
+
+    if existing_id is not None:
+        cancelled = await cancel_order(client, existing_id)
+        if not cancelled:
+            logger.warning(f"Cancel failed for {side} order {existing_id}; skipping replace.")
+            return
+        if side == 'buy':
+            current_bid_order_id = None
+            current_bid_price = None
+            current_bid_size = None
+        else:
+            current_ask_order_id = None
+            current_ask_price = None
+            current_ask_size = None
+
+    new_order_id = next_client_order_index()
+    placed = await place_order(client, side, new_price_f, new_order_id, new_size_f)
+    if not placed:
+        return
+
+    if side == 'buy':
+        current_bid_order_id = new_order_id
+        current_bid_price = new_price_f
+        current_bid_size = new_size_f
+    else:
+        current_ask_order_id = new_order_id
+        current_ask_price = new_price_f
+        current_ask_size = new_size_f
+
+
+def load_avellaneda_parameters() -> bool:
+    """Load and validate Avellaneda parameters from PARAMS_DIR."""
+    global avellaneda_params, last_avellaneda_update
+    try:
+        now = time.time()
+        if avellaneda_params is not None and (now - last_avellaneda_update) < AVELLANEDA_REFRESH_INTERVAL:
+            return True
+
+        avellaneda_params = None
+        candidates = [
+            os.path.join(PARAMS_DIR, f"avellaneda_parameters_{MARKET_SYMBOL}.json"),
+            f"params/avellaneda_parameters_{MARKET_SYMBOL}.json",
+            f"avellaneda_parameters_{MARKET_SYMBOL}.json",
+            f"TRADER/avellaneda_parameters_{MARKET_SYMBOL}.json",
+        ]
+        data = None
+        for p in candidates:
+            try:
+                with open(p, "r") as f:
+                    data = json.load(f)
+                logger.info(f"Loaded Avellaneda params from: {p}")
+                break
+            except FileNotFoundError:
+                continue
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON in {p}: {e}.")
+                return False
+
+        if not data:
+            logger.warning(f"Params file not found for {MARKET_SYMBOL}.")
+            return False
+
+        try:
+            gamma = float(data["optimal_parameters"]["gamma"])
+            market_data = data["market_data"]
+            sigma = float(market_data["sigma"])
+            k_bid = float(market_data.get("k_bid", market_data.get("k", 0)))
+            k_ask = float(market_data.get("k_ask", market_data.get("k", 0)))
+            time_remaining = float(data["current_state"]["time_remaining"])
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(f"Invalid Avellaneda params structure: {e}")
+            return False
+
+        if not (math.isfinite(gamma) and gamma > 0):
+            logger.warning("Avellaneda gamma must be finite and > 0.")
+            return False
+        if not (math.isfinite(sigma) and sigma >= 0):
+            logger.warning("Avellaneda sigma must be finite and >= 0.")
+            return False
+        if not (math.isfinite(k_bid) and k_bid > 0 and math.isfinite(k_ask) and k_ask > 0):
+            logger.warning("Avellaneda k_bid/k_ask must be finite and > 0.")
+            return False
+        if not (math.isfinite(time_remaining) and time_remaining > 0):
+            logger.warning("Avellaneda time_remaining must be finite and > 0.")
+            return False
+
+        avellaneda_params = data
+        last_avellaneda_update = now
+        logger.info(
+            f"Avellaneda params loaded: gamma={gamma}, sigma={sigma}, "
+            f"k_bid={k_bid}, k_ask={k_ask}, T={time_remaining}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Unexpected error loading params: {e}", exc_info=True)
+        avellaneda_params = None
+        return False
+
+
 def calculate_order_price(mid_price, side, inventory_factor):
     """
     Calculates the optimal bid or ask price using Avellaneda-Stoikov formula.
     """
     global avellaneda_params
-    
-    if not avellaneda_params:
-        # Fallback: simple fixed percentage spread
-        spread = mid_price * 0.001 # 0.1% spread
-        if side == 'buy':
-            return mid_price - (spread / 2)
-        else:
-            return mid_price + (spread / 2)
 
-    try:
-        # Extract parameters
-        gamma = float(avellaneda_params['optimal_parameters']['gamma'])
-        sigma = float(avellaneda_params['market_data']['sigma'])
-        
-        # Use separate k for bid and ask if available, otherwise fallback to 'k' or defaults
-        market_data = avellaneda_params.get('market_data', {})
-        k_bid = float(market_data.get('k_bid', market_data.get('k', 0.5)))
-        k_ask = float(market_data.get('k_ask', market_data.get('k', 0.5)))
-        
-        time_horizon = float(avellaneda_params['current_state']['time_remaining']) # in days
-        
-        # 1. Calculate Reservation Price (r)
-        # r = s - q * gamma * sigma^2 * (T - t)
-        # inventory_factor is q (current inventory)
-        reservation_price = mid_price - (inventory_factor * gamma * (sigma**2) * time_horizon)
-        
-        # 2. Calculate Spread (delta)
-        # delta = (2 / gamma) * ln(1 + gamma / k)
-        # We use k_bid for bid spread and k_ask for ask spread
-        
-        if side == 'buy':
-            # Bid Spread
-            val_inside_log = 1.0 + gamma / (mid_price * k_bid + 1e-9)
-            spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
-            final_price = reservation_price - (spread / 2.0)
-        else:
-            # Ask Spread
-            val_inside_log = 1.0 + gamma / (mid_price * k_ask + 1e-9)
-            spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
-            final_price = reservation_price + (spread / 2.0)
+    ok = load_avellaneda_parameters()
+    if ok and avellaneda_params:
+        try:
+            # Extract parameters
+            gamma = float(avellaneda_params["optimal_parameters"]["gamma"])
+            sigma = float(avellaneda_params["market_data"]["sigma"])
 
-        # Ensure price is valid tick size
-        if PRICE_TICK_SIZE:
-            final_price = round(final_price / float(PRICE_TICK_SIZE)) * float(PRICE_TICK_SIZE)
-        
-        return final_price
+            # Use separate k for bid and ask if available, otherwise fallback to k
+            market_data = avellaneda_params.get("market_data", {})
+            k_bid = float(market_data.get("k_bid", market_data.get("k", 0.5)))
+            k_ask = float(market_data.get("k_ask", market_data.get("k", 0.5)))
 
-    except Exception as e:
-        logger.error(f"❌ Error calculating order price: {e}", exc_info=True)
+            time_horizon = float(avellaneda_params["current_state"]["time_remaining"])  # in days
+
+            # 1. Calculate Reservation Price (r)
+            # r = s - q * gamma * sigma^2 * (T - t)
+            reservation_price = mid_price - (inventory_factor * gamma * (sigma**2) * time_horizon)
+
+            # 2. Calculate Spread (delta)
+            if side == "buy":
+                val_inside_log = 1.0 + gamma / (mid_price * k_bid + 1e-9)
+                spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
+                final_price = reservation_price - (spread / 2.0)
+            else:
+                val_inside_log = 1.0 + gamma / (mid_price * k_ask + 1e-9)
+                spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
+                final_price = reservation_price + (spread / 2.0)
+
+            # Ensure price is valid tick size
+            if PRICE_TICK_SIZE:
+                final_price = round(final_price / float(PRICE_TICK_SIZE)) * float(PRICE_TICK_SIZE)
+
+            return final_price
+        except Exception as e:
+            logger.error(f"Error calculating order price: {e}", exc_info=True)
+            return None
+
+    if REQUIRE_PARAMS:
+        logger.warning("REQUIRE_PARAMS enabled and no valid Avellaneda params; skipping quoting.")
         return None
 
+    # Fallback: simple fixed percentage spread
+    spread = mid_price * 0.001  # 0.1% spread
+    return mid_price - (spread / 2) if side == "buy" else mid_price + (spread / 2)
+
 async def market_making_loop(client, account_api, order_api):
-    logger.info("🚀 Starting 2-sided market making loop...")
+    logger.info("Starting 2-sided market making loop...")
 
     while True:
         try:
-            # 1. Always start by cancelling existing orders to ensure a clean slate for the cycle
-            await cancel_all_orders(client)
-
-            # 2. Wait for fresh data and check websocket health
+            # 1. Wait for fresh data and check websocket health
             if not await check_websocket_health():
-                logger.warning("⚠ Websocket connection unhealthy, attempting restart...")
+                logger.warning("Websocket connection unhealthy, attempting restart...")
                 if not await restart_websocket():
                     await asyncio.sleep(10)
                     continue
@@ -783,37 +960,34 @@ async def market_making_loop(client, account_api, order_api):
                 # Wait for a fresh order book update before proceeding
                 await asyncio.wait_for(order_book_received.wait(), timeout=10.0)
             except asyncio.TimeoutError:
-                logger.warning("⏳ Timed out waiting for fresh order book data, retrying...")
+                logger.warning("Timed out waiting for fresh order book data, retrying...")
                 continue
 
             current_mid_price = get_current_mid_price()
             if current_mid_price is None:
-                logger.info("⏳ No mid-price available, sleeping...")
+                logger.info("No mid-price available, sleeping...")
                 await asyncio.sleep(2)
                 continue
 
-            # 3. Calculate order parameters
+            # 2. Calculate order parameters
             base_amount = await calculate_dynamic_base_amount(current_mid_price)
-            
-            inventory_param = 0.0
-            if base_amount and base_amount > 0:
-                # base_amount is Decimal, current_position_size is float. 
-                # Convert base_amount to float for this ratio calculation.
-                inventory_param = current_position_size / float(base_amount)
-            else:
-                logger.warning("⚠️ Base amount is zero or invalid; using inventory of 0.")
+            if base_amount is None or base_amount <= 0:
+                logger.warning("Base amount is zero or invalid; skipping order refresh.")
+                await asyncio.sleep(ORDER_TIMEOUT)
+                continue
 
-            buy_price = calculate_order_price(current_mid_price, 'buy', inventory_param)
-            sell_price = calculate_order_price(current_mid_price, 'sell', inventory_param)
+            # base_amount is Decimal, current_position_size is float.
+            inventory_param = current_position_size / float(base_amount)
 
-            # 4. Place new buy and sell orders
-            if buy_price and sell_price and base_amount > 0:
-                # Convert Decimals to float for logging calculation
+            buy_price = calculate_order_price(current_mid_price, "buy", inventory_param)
+            sell_price = calculate_order_price(current_mid_price, "sell", inventory_param)
+
+            if buy_price and sell_price:
                 bp_f = float(buy_price)
                 sp_f = float(sell_price)
                 bid_spread_pct = (current_mid_price - bp_f) / current_mid_price * 100 if current_mid_price > 0 else 0
                 ask_spread_pct = (sp_f - current_mid_price) / current_mid_price * 100 if current_mid_price > 0 else 0
-                
+
                 logger.info(
                     f"QUOTING | "
                     f"Inventory: {inventory_param:+.2f} | "
@@ -821,24 +995,22 @@ async def market_making_loop(client, account_api, order_api):
                     f"Bid: ${bp_f:.4f} (-{bid_spread_pct:.4f}%) | "
                     f"Ask: ${sp_f:.4f} (+{ask_spread_pct:.4f}%)"
                 )
-
-                # Place buy order
-                buy_order_id = next_client_order_index()
-                await place_order(client, 'buy', buy_price, buy_order_id, base_amount)
-
-                # Place sell order
-                sell_order_id = next_client_order_index()
-                await place_order(client, 'sell', sell_price, sell_order_id, base_amount)
             else:
-                logger.warning("⚠️ Could not calculate valid orders this cycle, skipping placement.")
+                logger.warning("Could not calculate one or both quotes; skipping refresh for missing side(s).")
 
-            # 5. Wait for the defined interval before the next cycle
+            if buy_price:
+                await refresh_order_if_needed(client, "buy", buy_price, base_amount)
+            if sell_price:
+                await refresh_order_if_needed(client, "sell", sell_price, base_amount)
+
+            # 3. Wait for the defined interval before the next cycle
             logger.info(f"Cycle complete. Waiting for {ORDER_TIMEOUT} seconds...")
             await asyncio.sleep(ORDER_TIMEOUT)
 
         except Exception as e:
-            logger.error(f"❌ Unhandled error in market_making_loop: {e}", exc_info=True)
-            await asyncio.sleep(5) # Wait before retrying on error
+            logger.error(f"Unhandled error in market_making_loop: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
 
 async def track_balance():
     log_path = os.path.join(LOG_DIR, "balance_log.txt")
