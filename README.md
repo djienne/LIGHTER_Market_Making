@@ -7,7 +7,7 @@ This repository is a Python market-making system for the Lighter DEX. It has thr
 
 By default, the market maker uses 12% of available balance per order (see `CAPITAL_USAGE_PERCENT` in `market_maker_v2.py`).
 
-Note: `market_maker_v2.py` currently uses a simple 0.1% fallback spread because parameter loading is not wired yet. The calculator still produces JSON outputs for future integration.
+Note: `market_maker_v2.py` loads Avellaneda parameters from `PARAMS_DIR` and refreshes them periodically. If the params file is missing or invalid, it falls back to a 0.1% spread; with `REQUIRE_PARAMS=true`, it skips quoting instead.
 
 ## Quick Start
 
