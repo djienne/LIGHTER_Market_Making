@@ -7,6 +7,8 @@ This repository is a Python market-making system for the Lighter DEX. It has thr
 
 By default, the market maker uses 12% of available balance per order (see `CAPITAL_USAGE_PERCENT` in `market_maker_v2.py`).
 
+Affiliate link to Support this project : ⚡Trade on Lighter – Spot & Perpetuals, 100% decentralized, no KYC, and ZERO fees – [https://app.lighter.xyz/?referral=FREQTRADE](https://app.lighter.xyz/?referral=FREQTRADE) (I’ll give you 100% kickback with this link)
+
 Note: `market_maker_v2.py` loads Avellaneda parameters from `PARAMS_DIR` and refreshes them periodically. If the params file is missing or invalid, it falls back to a 0.1% spread; with `REQUIRE_PARAMS=true`, it skips quoting instead.
 
 ## Quick Start
