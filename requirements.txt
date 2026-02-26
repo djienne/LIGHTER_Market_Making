@@ -13,3 +13,5 @@ argparse
 fastparquet
 pyarrow
 zstandard
+orjson
+sortedcontainers
