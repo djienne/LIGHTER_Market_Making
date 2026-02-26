@@ -41,7 +41,9 @@ Optional and data/ops:
 
 Reserved (declared in code but not currently used in `market_maker_v2.py`):
 - `FLIP`
-- `REQUIRE_PARAMS`
+
+Other optional:
+- `REQUIRE_PARAMS`: when `true`, skip quoting if no valid Avellaneda params are loaded (default `false`).
 
 ### Notes
 - Use a dedicated account or sub-account and start with small amounts.
@@ -82,6 +84,8 @@ python -m unittest discover -s tests -p "test_*.py"
 - calculate_avellaneda_parameters.py
 - market_maker_v2.py
 - utils.py
+- orderbook.py (shared order book update logic)
+- ws_manager.py (shared WebSocket subscription manager)
 - volatility.py
 - intensity.py
 - backtest.py
