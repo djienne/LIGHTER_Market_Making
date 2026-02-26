@@ -13,13 +13,62 @@ except ImportError:
     sys.path.append(str(Path(__file__).parent))
     import utils
 
+def _compute_hit_lambdas(orders, reference_mid, price_delta, window_minutes, side):
+    """Compute hit count and arrival rate for one side at one delta level.
+
+    Args:
+        orders: DataFrame of aggressor orders (sells for bid side, buys for ask side).
+        reference_mid: Reference mid price for the period.
+        price_delta: Distance from mid to the limit level.
+        window_minutes: Length of the period in minutes.
+        side: 'bid' or 'ask'.
+
+    Returns:
+        (lambda_value, valid_delta) — the arrival rate and the delta used.
+    """
+    if side == 'bid':
+        limit_price = reference_mid - price_delta
+        hits = orders[orders['price'] <= limit_price].index.tolist() if not orders.empty else []
+    else:
+        limit_price = reference_mid + price_delta
+        hits = orders[orders['price'] >= limit_price].index.tolist() if not orders.empty else []
+
+    num_hits = len(hits)
+    if num_hits > 1:
+        hit_times = pd.DatetimeIndex(hits)
+        avg_inter = hit_times.to_series().diff().dt.total_seconds().dropna().mean()
+        return 1.0 / avg_inter if avg_inter > 0 else 1.0 / 0.001, price_delta
+    elif num_hits == 1:
+        return 1.0 / (window_minutes * 60.0), price_delta
+    else:
+        return 0.0, price_delta
+
+
+def _fit_exponential(valid_deltas, lambdas, side_label):
+    """Fit an exponential decay to (delta, lambda) pairs.
+
+    Returns:
+        (A, k) or (nan, nan) on failure.
+    """
+    def exp_fit(x, a, b):
+        return a * np.exp(-b * x)
+
+    if not valid_deltas:
+        return float('nan'), float('nan')
+    try:
+        params, _ = scipy.optimize.curve_fit(
+            exp_fit, valid_deltas, lambdas, p0=[1.0, 0.5], bounds=(0, np.inf), maxfev=5000
+        )
+        return params[0], params[1]
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"{side_label} intensity fit failed: {e}")
+        return float('nan'), float('nan')
+
+
 def calculate_intensity_params(list_of_periods, window_minutes, buy_orders, sell_orders, deltalist, mid_price_df):
     """Calculate order arrival intensity parameters (A and k)."""
     print("\n" + "-"*20)
     print("Calculating order arrival intensity (A and k)...")
-
-    def exp_fit(x, a, b):
-        return a * np.exp(-b * x)
 
     A_bid_list, k_bid_list = [], []
     A_ask_list, k_ask_list = [], []
@@ -40,7 +89,7 @@ def calculate_intensity_params(list_of_periods, window_minutes, buy_orders, sell
             A_bid_list.append(float('nan')); k_bid_list.append(float('nan'))
             A_ask_list.append(float('nan')); k_ask_list.append(float('nan'))
             continue
-            
+
         reference_mid = s_period['mid_price'].mean()
 
         if pd.isna(reference_mid):
@@ -48,82 +97,23 @@ def calculate_intensity_params(list_of_periods, window_minutes, buy_orders, sell
             A_ask_list.append(float('nan')); k_ask_list.append(float('nan'))
             continue
 
-        lambdas_bid = []
-        lambdas_ask = []
-        valid_deltas_bid = []
-        valid_deltas_ask = []
+        lambdas_bid, valid_deltas_bid = [], []
+        lambdas_ask, valid_deltas_ask = [], []
 
         for price_delta in deltalist:
-            limit_bid = reference_mid - price_delta
-            limit_ask = reference_mid + price_delta
-            
-            # --- BID SIDE INTENSITY (Hit by Sells) ---
-            bid_hits = []
-            if not period_sell_orders.empty:
-                sell_hits_bid = period_sell_orders[period_sell_orders['price'] <= limit_bid]
-                if not sell_hits_bid.empty:
-                    bid_hits = sell_hits_bid.index.tolist()
-            
-            num_hits_bid = len(bid_hits)
-            if num_hits_bid > 1:
-                hit_times = pd.DatetimeIndex(bid_hits)
-                deltas = hit_times.to_series().diff().dt.total_seconds().dropna()
-                avg_inter = deltas.mean()
-                lambdas_bid.append(1.0 / avg_inter if avg_inter > 0 else 1.0/0.001)
-                valid_deltas_bid.append(price_delta)
-            elif num_hits_bid == 1:
-                lambdas_bid.append(1.0 / (window_minutes * 60.0))
-                valid_deltas_bid.append(price_delta)
-            else:
-                lambdas_bid.append(0.0)
-                valid_deltas_bid.append(price_delta)
+            lam_bid, delta_bid = _compute_hit_lambdas(period_sell_orders, reference_mid, price_delta, window_minutes, 'bid')
+            lambdas_bid.append(lam_bid)
+            valid_deltas_bid.append(delta_bid)
 
-            # --- ASK SIDE INTENSITY (Hit by Buys) ---
-            ask_hits = []
-            if not period_buy_orders.empty:
-                buy_hits_ask = period_buy_orders[period_buy_orders['price'] >= limit_ask]
-                if not buy_hits_ask.empty:
-                    ask_hits = buy_hits_ask.index.tolist()
+            lam_ask, delta_ask = _compute_hit_lambdas(period_buy_orders, reference_mid, price_delta, window_minutes, 'ask')
+            lambdas_ask.append(lam_ask)
+            valid_deltas_ask.append(delta_ask)
 
-            num_hits_ask = len(ask_hits)
-            if num_hits_ask > 1:
-                hit_times = pd.DatetimeIndex(ask_hits)
-                deltas = hit_times.to_series().diff().dt.total_seconds().dropna()
-                avg_inter = deltas.mean()
-                lambdas_ask.append(1.0 / avg_inter if avg_inter > 0 else 1.0/0.001)
-                valid_deltas_ask.append(price_delta)
-            elif num_hits_ask == 1:
-                lambdas_ask.append(1.0 / (window_minutes * 60.0))
-                valid_deltas_ask.append(price_delta)
-            else:
-                lambdas_ask.append(0.0)
-                valid_deltas_ask.append(price_delta)
+        A_bid, k_bid = _fit_exponential(valid_deltas_bid, lambdas_bid, "Bid")
+        A_bid_list.append(A_bid); k_bid_list.append(k_bid)
 
-        # Fit Bid
-        if valid_deltas_bid:
-            try:
-                p0 = [1.0, 0.5]
-                paramsB, _ = scipy.optimize.curve_fit(exp_fit, valid_deltas_bid, lambdas_bid, p0=p0, bounds=(0, np.inf), maxfev=5000)
-                A_bid_list.append(paramsB[0])
-                k_bid_list.append(paramsB[1])
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"Bid intensity fit failed: {e}")
-                A_bid_list.append(float('nan')); k_bid_list.append(float('nan'))
-        else:
-            A_bid_list.append(float('nan')); k_bid_list.append(float('nan'))
-
-        # Fit Ask
-        if valid_deltas_ask:
-            try:
-                p0 = [1.0, 0.5]
-                paramsA, _ = scipy.optimize.curve_fit(exp_fit, valid_deltas_ask, lambdas_ask, p0=p0, bounds=(0, np.inf), maxfev=5000)
-                A_ask_list.append(paramsA[0])
-                k_ask_list.append(paramsA[1])
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"Ask intensity fit failed: {e}")
-                A_ask_list.append(float('nan')); k_ask_list.append(float('nan'))
-        else:
-            A_ask_list.append(float('nan')); k_ask_list.append(float('nan'))
+        A_ask, k_ask = _fit_exponential(valid_deltas_ask, lambdas_ask, "Ask")
+        A_ask_list.append(A_ask); k_ask_list.append(k_ask)
 
     if A_bid_list and k_bid_list:
         print("Latest Intensity Values:")

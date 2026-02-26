@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from numba import jit
-from scipy.optimize import brentq, fsolve
+
 import warnings
 import sys
 from pathlib import Path

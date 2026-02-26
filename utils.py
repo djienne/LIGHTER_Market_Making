@@ -81,7 +81,7 @@ def get_fallback_tick_size(ticker):
     else:
         return 0.01
 
-async def _get_market_details_async(symbol: str) -> Tuple[Optional[int], float, Optional[float]]:
+async def get_market_details_async(symbol: str) -> Tuple[Optional[int], float, Optional[float]]:
     """
     Retrieves the market index, price tick size, and amount tick size for a given symbol.
     Falls back to a hardcoded price tick size if the API call fails.
@@ -127,7 +127,7 @@ def load_config_params():
         return {}
 
 def get_market_details(symbol: str) -> Tuple[Optional[int], float, Optional[float]]:
-    return asyncio.run(_get_market_details_async(symbol))
+    return asyncio.run(get_market_details_async(symbol))
 
 def get_data_paths(ticker: str) -> Tuple[str, str, str]:
     """Return data directory and expected price/trade parquet paths for a ticker."""

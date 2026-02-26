@@ -1,6 +1,8 @@
 import json
 import logging
 import asyncio
+import argparse
+import os
 import websockets
 
 # Configure logging
@@ -53,8 +55,16 @@ async def subscribe_to_user_stats(account_id):
 
 async def main():
     """Main function to run the subscriber and print global state."""
-    account_id = 107607
-    
+    parser = argparse.ArgumentParser(description="Subscribe to Lighter user stats")
+    parser.add_argument(
+        "--account-id",
+        type=int,
+        default=int(os.getenv("ACCOUNT_INDEX", "107607")),
+        help="Account ID to subscribe to (default: ACCOUNT_INDEX env var or 107607)",
+    )
+    args = parser.parse_args()
+    account_id = args.account_id
+
     # Start the subscriber in the background
     subscriber_task = asyncio.create_task(subscribe_to_user_stats(account_id))
 

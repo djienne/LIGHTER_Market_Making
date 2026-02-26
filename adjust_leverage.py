@@ -1,11 +1,12 @@
 
+import logging
 import lighter
 import asyncio
 import argparse
 import os
 from dotenv import load_dotenv
 
-async def adjust_leverage(client: lighter.SignerClient, market_id: int, leverage: int, margin_mode_str: str):
+async def adjust_leverage(client: lighter.SignerClient, market_id: int, leverage: int, margin_mode_str: str, logger=None):
     """
     Adjusts the leverage for a given market.
 
@@ -14,23 +15,27 @@ async def adjust_leverage(client: lighter.SignerClient, market_id: int, leverage
         market_id: The ID of the market to adjust leverage for.
         leverage: The desired leverage.
         margin_mode_str: The margin mode ("cross" or "isolated").
+        logger: Optional logger instance. Defaults to module-level logger.
     """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
     margin_mode = client.CROSS_MARGIN_MODE if margin_mode_str == "cross" else client.ISOLATED_MARGIN_MODE
-    
-    print(f"Attempting to set leverage to {leverage} for market {market_id} with {margin_mode_str} margin.")
+
+    logger.info(f"Attempting to set leverage to {leverage} for market {market_id} with {margin_mode_str} margin.")
 
     try:
         tx, response, err = await client.update_leverage(market_id, margin_mode, leverage)
         if err:
-            print(f"Error updating leverage: {err}")
+            logger.error(f"Error updating leverage: {err}")
             return None, None, err
         else:
-            print("Leverage updated successfully.")
-            print(f"Transaction: {tx}")
-            print(f"Response: {response}")
+            logger.info("Leverage updated successfully.")
+            logger.debug(f"Transaction: {tx}")
+            logger.debug(f"Response: {response}")
             return tx, response, None
     except Exception as e:
-        print(f"An exception occurred: {e}")
+        logger.error(f"An exception occurred: {e}")
         return None, None, e
 
 async def main():

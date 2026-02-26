@@ -6,9 +6,11 @@ import traceback
 import re
 from datetime import datetime
 from collections import defaultdict
-from decimal import Decimal
+
 import json
 import pandas as pd
+from orderbook import apply_orderbook_update
+from ws_manager import ws_subscribe
 
 # It is recommended to install the lighter sdk using pip
 # pip install git+https://github.com/elliottech/lighter-python.git
@@ -120,7 +122,6 @@ def _get_max_parquet_bytes():
 MAX_PARQUET_BYTES = _get_max_parquet_bytes()
 parquet_part_indices = {"prices": {}, "trades": {}}
 
-import websockets
 
 # --- Global State ---
 # In-memory buffers to store data points before writing them to files in batches.
@@ -436,47 +437,17 @@ def handle_orderbook_message(market_id, payload):
     if not symbol: return
 
     lb = local_order_books[symbol]
-    
+
     bids_in = payload.get('bids', [])
     asks_in = payload.get('asks', [])
     offset = payload.get('offset', 0)
 
-    # Heuristic: If we receive a massive list, treat it as a snapshot/re-init
-    # OR if we haven't initialized yet.
-    is_snapshot = False
-    if not lb['initialized']:
-        is_snapshot = True
-        logger.info(f"Initializing local orderbook for {symbol} (Offset: {offset})")
-    elif len(bids_in) > 100 or len(asks_in) > 100:
-        is_snapshot = True
-        logger.info(f"Received snapshot for {symbol} (Offset: {offset})")
-
+    is_snapshot = apply_orderbook_update(
+        lb['bids'], lb['asks'], lb['initialized'], bids_in, asks_in,
+    )
     if is_snapshot:
-        lb['bids'] = {}
-        lb['asks'] = {}
         lb['initialized'] = True
-        # For snapshot, we just set values
-        for item in bids_in:
-            price, size = float(item['price']), float(item['size'])
-            if size > 0: lb['bids'][price] = size
-        for item in asks_in:
-            price, size = float(item['price']), float(item['size'])
-            if size > 0: lb['asks'][price] = size
-    else:
-        # Delta update
-        for item in bids_in:
-            price, size = float(item['price']), float(item['size'])
-            if size == 0:
-                lb['bids'].pop(price, None)
-            else:
-                lb['bids'][price] = size
-        
-        for item in asks_in:
-            price, size = float(item['price']), float(item['size'])
-            if size == 0:
-                lb['asks'].pop(price, None)
-            else:
-                lb['asks'][price] = size
+        logger.info(f"Initializing/snapshot local orderbook for {symbol} (Offset: {offset})")
 
     # Update offset
     if symbol in last_offsets:
@@ -554,80 +525,36 @@ def handle_trade_message(market_id, payload):
             logger.error(f"Error parsing trade msg: {e} | Raw TS: {t.get('timestamp')}")
 
 async def custom_websocket_manager(market_ids):
-    """Custom WebSocket implementation using 'websockets' library."""
-    uri = "wss://mainnet.zklighter.elliot.ai/stream"
-    
-    while True:
+    """WebSocket manager using shared ws_subscribe infrastructure."""
+    channels = []
+    for mid in market_ids:
+        channels.append(f"order_book/{mid}")
+        channels.append(f"trade/{mid}")
+
+    def _on_message(data):
+        channel = data.get('channel', '')
+        if ':' not in channel:
+            return
+        ctype, mid_str = channel.split(':', 1)
         try:
-            summary_logger.info(f"Connecting to WebSocket: {uri}")
-            # ping_interval=20: automatically sends a ping every 20s (protocol level)
-            # ping_timeout=20: waits 20s for a pong, else closes connection
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
-                summary_logger.info("✓ WebSocket connected. Subscribing...")
-                
-                # Subscribe to all markets
-                for mid in market_ids:
-                    # Order Book
-                    await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "channel": f"order_book/{mid}"
-                    }))
-                    # Trades
-                    await ws.send(json.dumps({
-                        "type": "subscribe",
-                        "channel": f"trade/{mid}"
-                    }))
-                
-                summary_logger.info(f"Subscribed to {len(market_ids)} markets (OB + Trade). Listening...")
+            mid = int(mid_str)
+        except ValueError:
+            return
+        if ctype == 'order_book' and 'order_book' in data:
+            handle_orderbook_message(mid, data['order_book'])
+        elif ctype == 'trade':
+            handle_trade_message(mid, data)
 
-                last_message_time = time.time()
-
-                while True:
-                    try:
-                        # Wait for message with a timeout to implement watchdog
-                        msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                        last_message_time = time.time()
-                        
-                        data = json.loads(msg)
-                        
-                        # Handle application-level ping
-                        if data.get('type') == 'ping':
-                            logger.debug("Received application-level ping, sending pong.")
-                            await ws.send(json.dumps({"type": "pong"}))
-                            continue
-
-                        if 'channel' not in data: continue
-                        
-                        channel = data['channel']
-                        
-                        # Channel format: "order_book:0" or "trade:0"
-                        if ':' in channel:
-                            ctype, mid_str = channel.split(':')
-                            try:
-                                mid = int(mid_str)
-                                if ctype == 'order_book':
-                                    if 'order_book' in data:
-                                        handle_orderbook_message(mid, data['order_book'])
-                                elif ctype == 'trade':
-                                    handle_trade_message(mid, data)
-                            except ValueError:
-                                pass
-                                
-                    except asyncio.TimeoutError:
-                        # Watchdog triggered
-                        time_since_last = time.time() - last_message_time
-                        if time_since_last > 30:
-                            summary_logger.warning(f"⚠️ No messages received for {time_since_last:.1f}s. Reconnecting...")
-                            break # Break inner loop to trigger reconnection
-                    
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            summary_logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
-            stats['errors'] += 1
-            await asyncio.sleep(5)
-
-# (End of custom replacement)
+    await ws_subscribe(
+        channels=channels,
+        label="data collector",
+        on_message=_on_message,
+        ping_interval=20,
+        recv_timeout=30.0,
+        reconnect_base=5,
+        reconnect_max=60,
+        logger=summary_logger,
+    )
 
 
 
