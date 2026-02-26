@@ -10,17 +10,16 @@ import time
 import orjson as json
 import math
 import websockets
+from dataclasses import dataclass
 from typing import Tuple, Optional
 from datetime import datetime
 from lighter.exceptions import ApiException
-from decimal import Decimal, getcontext
+from decimal import Decimal
 import signal
 from collections import deque
 import argparse
 from sortedcontainers import SortedDict
-
-# Set Decimal precision
-getcontext().prec = 28
+from utils import avellaneda_quotes, EPSILON
 
 # =========================
 # Env & constants
@@ -50,14 +49,26 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 # Trading config
 SPREAD = 0.035 / 100.0       # static fallback spread (if allowed)
+FALLBACK_SPREAD_FRACTION = 0.001  # fallback spread as fraction of mid price
 BASE_AMOUNT = 0.047          # static fallback amount
 USE_DYNAMIC_SIZING = True
 CAPITAL_USAGE_PERCENT = 0.12
 SAFETY_MARGIN_PERCENT = 0.01
-ORDER_TIMEOUT = 3           # seconds
+ORDER_TIMEOUT = 0.5         # seconds — event-driven wake; low timeout for fast requoting
 MINIMUM_SPREAD_PERCENT = 0.005 # Safety net for calculated spreads
 QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv("QUOTE_UPDATE_THRESHOLD_BPS", "1.0"))  # 1 bps
 MIN_LOOP_INTERVAL = 0.1     # Avoid spinning 100% CPU on fast updates
+_PONG_MSG = '{"type":"pong"}'  # Pre-computed pong response
+
+# WebSocket tuning
+WS_PING_INTERVAL = 20          # seconds between pings
+WS_RECV_TIMEOUT = 30.0         # watchdog: no data triggers reconnect
+WS_RECONNECT_BASE_DELAY = 5    # initial reconnect backoff (seconds)
+WS_RECONNECT_MAX_DELAY = 60    # maximum reconnect backoff (seconds)
+
+# Pre-computed tick sizes as floats (set once in main())
+_PRICE_TICK_FLOAT = 0.0
+_AMOUNT_TICK_FLOAT = 0.0
 
 # Avellaneda
 AVELLANEDA_REFRESH_INTERVAL = 900  # seconds
@@ -73,8 +84,6 @@ current_mid_price_cached = None
 ws_client = None
 ws_task = None
 
-current_order_id = None
-current_order_timestamp = None
 current_bid_order_id = None
 current_ask_order_id = None
 current_bid_price = None
@@ -84,11 +93,11 @@ current_ask_size = None
 last_mid_price = None
 available_capital = None
 portfolio_value = None
-last_capital_check = 0
 current_position_size = 0
 last_client_order_index = 0
 
 avellaneda_params = None
+avellaneda_cache = None  # AvellanedaCache instance, populated by poll_avellaneda_parameters
 last_avellaneda_update = 0
 
 account_positions = {}
@@ -131,6 +140,18 @@ logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.root.setLevel(logging.WARNING)
+
+# =========================
+# Data structures
+# =========================
+@dataclass(frozen=True, slots=True)
+class AvellanedaCache:
+    """Pre-extracted Avellaneda parameters for hot path access."""
+    gamma: float
+    sigma: float
+    k_bid: float
+    k_ask: float
+    time_remaining: float
 
 # =========================
 # Helpers
@@ -180,7 +201,7 @@ def get_best_prices() -> Tuple[Optional[float], Optional[float]]:
 
 
 def is_position_significant(position_size: float, mid_price: Optional[float]) -> bool:
-    if abs(position_size) < 1e-9:
+    if abs(position_size) < EPSILON:
         return False
     if not mid_price or mid_price <= 0:
         return True
@@ -210,16 +231,13 @@ async def adjust_leverage(client: lighter.SignerClient, market_id: int, leverage
         return None, None, e
 
 async def get_market_details(order_api, symbol: str) -> Optional[Tuple[int, Decimal, Decimal]]:
+    """Fetch market details via the canonical utils implementation, converting to Decimal."""
     try:
-        order_books_response = await order_api.order_books()
-        for ob in order_books_response.order_books:
-            if ob.symbol.upper() == symbol.upper():
-                market_id = ob.market_id
-                # 10 ** -decimals
-                price_tick_size = Decimal("10") ** -ob.supported_price_decimals
-                amount_tick_size = Decimal("10") ** -ob.supported_size_decimals
-                return market_id, price_tick_size, amount_tick_size
-        return None
+        from utils import _get_market_details_async
+        market_id, price_tick, amount_tick = await _get_market_details_async(symbol)
+        if market_id is None:
+            return None
+        return market_id, Decimal(str(price_tick)), Decimal(str(amount_tick)) if amount_tick else Decimal(0)
     except Exception as e:
         logger.error(f"❌ An error occurred while fetching market details: {e}")
         return None
@@ -227,7 +245,7 @@ async def get_market_details(order_api, symbol: str) -> Optional[Tuple[int, Deci
 def on_order_book_update(market_id, payload):
     global ws_connection_healthy, last_order_book_update, current_mid_price_cached, local_order_book
     try:
-        if int(market_id) == MARKET_ID:
+        if market_id == MARKET_ID:
             bids_in = payload.get('bids', [])
             asks_in = payload.get('asks', [])
             
@@ -273,7 +291,7 @@ def on_order_book_update(market_id, payload):
                 current_mid_price_cached = (best_bid + best_ask) / 2
             
             ws_connection_healthy = True
-            last_order_book_update = time.time()
+            last_order_book_update = time.monotonic()
             order_book_received.set()
             
     except Exception as e:
@@ -282,7 +300,7 @@ def on_order_book_update(market_id, payload):
 
 def on_trade_update(market_id, trades):
     try:
-        if int(market_id) == MARKET_ID:
+        if market_id == MARKET_ID:
             for trade in trades:
                 price = trade.get('price')
                 size = trade.get('size')
@@ -291,73 +309,104 @@ def on_trade_update(market_id, trades):
     except Exception as e:
         logger.error(f"❌ Error in trade callback: {e}", exc_info=True)
 
-async def subscribe_to_market_data(market_id):
-    """Connects to the websocket, subscribes to orderbook AND trades."""
-    global ws_connection_healthy
-    
-    ob_sub_msg = {
-        "type": "subscribe",
-        "channel": f"order_book/{market_id}"
-    }
-    trade_sub_msg = {
-        "type": "subscribe",
-        "channel": f"trade/{market_id}"
-    }
-    
+async def _ws_subscribe(channels, label, on_message, on_connect=None, on_disconnect=None):
+    """Generic WebSocket subscription loop with reconnect.
+
+    Args:
+        channels: list of channel strings to subscribe to.
+        label: human-readable label for log messages.
+        on_message: callback(data: dict) called for each decoded message.
+        on_connect: optional async callback() invoked after subscribing.
+        on_disconnect: optional callback() invoked on disconnect.
+    """
+    backoff = WS_RECONNECT_BASE_DELAY
     while True:
         try:
-            ws_connection_healthy = False
-            async with websockets.connect(WEBSOCKET_URL, ping_interval=20, ping_timeout=20) as ws:
-                logger.info(f"🔌 Connected to {WEBSOCKET_URL} for market data")
-                
-                await ws.send(json.dumps(ob_sub_msg))
-                await ws.send(json.dumps(trade_sub_msg))
-                logger.info(f"📡 Subscribed to order_book/{market_id} and trade/{market_id}")
-                
-                ws_connection_healthy = True
-                
+            if on_disconnect:
+                on_disconnect()
+            async with websockets.connect(
+                WEBSOCKET_URL,
+                ping_interval=WS_PING_INTERVAL,
+                ping_timeout=WS_PING_INTERVAL,
+            ) as ws:
+                logger.info(f"🔌 Connected to {WEBSOCKET_URL} for {label}")
+
+                for ch in channels:
+                    await ws.send(json.dumps({"type": "subscribe", "channel": ch}).decode())
+                logger.info(f"📡 Subscribed to {', '.join(channels)}")
+
+                if on_connect:
+                    await on_connect()
+
+                backoff = WS_RECONNECT_BASE_DELAY  # reset on successful connect
+
                 while True:
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                        
+                        message = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT)
                         try:
                             data = json.loads(message)
                             msg_type = data.get("type")
-                            
-                            if msg_type == "update/order_book":
-                                if 'order_book' in data:
-                                    on_order_book_update(market_id, data['order_book'])
-                            elif msg_type == "update/trade":
-                                if 'trades' in data:
-                                    on_trade_update(market_id, data['trades'])
-                            elif msg_type == "ping":
-                                logger.debug("Received application-level ping, sending pong.")
-                                await ws.send(json.dumps({"type": "pong"}))
+
+                            if msg_type == "ping":
+                                await ws.send(_PONG_MSG)
                             elif msg_type == "subscribed":
-                                logger.info(f"✅ Successfully subscribed to channel: {data.get('channel')}")
+                                logger.info(f"✅ Subscribed to channel: {data.get('channel')}")
                             else:
-                                logger.debug(f"Received unhandled message on market data socket: {msg_type}")
-                                
+                                on_message(data)
                         except json.JSONDecodeError:
-                            logger.warning(f"❌ Failed to decode JSON from market data: {message}")
-                            
+                            logger.warning(f"❌ Failed to decode JSON from {label}: {message}")
+
                     except asyncio.TimeoutError:
-                        logger.warning("⚠️ Market data WebSocket watchdog triggered (no data for 30s). Reconnecting...")
-                        break 
-                        
+                        logger.warning(f"⚠️ {label} WebSocket watchdog triggered (no data for {WS_RECV_TIMEOUT}s). Reconnecting...")
+                        break
+
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
-            logger.info(f"🔌 Market data WebSocket disconnected ({e}), reconnecting in 5 seconds...")
-            ws_connection_healthy = False
-            await asyncio.sleep(5)
+            logger.info(f"🔌 {label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")
+            if on_disconnect:
+                on_disconnect()
+            await asyncio.sleep(backoff + backoff * 0.2 * (time.monotonic() % 1))  # jitter
+            backoff = min(backoff * 2, WS_RECONNECT_MAX_DELAY)
         except Exception as e:
-            logger.error(f"❌ An unexpected error occurred in market data socket: {e}. Reconnecting in 5 seconds...")
-            ws_connection_healthy = False
-            await asyncio.sleep(5)
+            logger.error(f"❌ Unexpected error in {label} socket: {e}. Reconnecting in {backoff:.0f}s...")
+            if on_disconnect:
+                on_disconnect()
+            await asyncio.sleep(backoff + backoff * 0.2 * (time.monotonic() % 1))
+            backoff = min(backoff * 2, WS_RECONNECT_MAX_DELAY)
+
+
+async def subscribe_to_market_data(market_id):
+    """Connects to the websocket, subscribes to orderbook AND trades."""
+    global ws_connection_healthy
+
+    def _on_disconnect():
+        global ws_connection_healthy
+        ws_connection_healthy = False
+
+    async def _on_connect():
+        global ws_connection_healthy
+        ws_connection_healthy = True
+
+    def _on_message(data):
+        msg_type = data.get("type")
+        if msg_type == "update/order_book":
+            if 'order_book' in data:
+                on_order_book_update(market_id, data['order_book'])
+        elif msg_type == "update/trade":
+            if 'trades' in data:
+                on_trade_update(market_id, data['trades'])
+
+    await _ws_subscribe(
+        channels=[f"order_book/{market_id}", f"trade/{market_id}"],
+        label="market data",
+        on_message=_on_message,
+        on_connect=_on_connect,
+        on_disconnect=_on_disconnect,
+    )
 
 def on_user_stats_update(account_id, stats):
     global available_capital, portfolio_value
     try:
-        if int(account_id) == ACCOUNT_INDEX:
+        if account_id == ACCOUNT_INDEX:
             if not isinstance(stats, dict):
                 logger.warning(f"Received user stats with unexpected payload: {stats}")
                 return
@@ -387,52 +436,22 @@ def on_user_stats_update(account_id, stats):
 
 async def subscribe_to_user_stats(account_id):
     """Connects to the websocket, subscribes to user_stats, and updates global state."""
-    subscription_msg = {
-        "type": "subscribe",
-        "channel": f"user_stats/{account_id}"
-    }
-    
-    while True:
-        try:
-            async with websockets.connect(WEBSOCKET_URL, ping_interval=20, ping_timeout=20) as ws:
-                logger.info(f"🔌 Connected to {WEBSOCKET_URL} for user stats")
-                await ws.send(json.dumps(subscription_msg))
-                logger.info(f"📡 Subscribed to user_stats for account {account_id}")
-                
-                while True:
-                    try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                        
-                        try:
-                            data = json.loads(message)
-                            msg_type = data.get("type")
-                            
-                            if msg_type in ("update/user_stats", "subscribed/user_stats"):
-                                stats = data.get("stats", {})
-                                on_user_stats_update(account_id, stats)
-                            elif msg_type == "ping":
-                                logger.debug("Received application-level ping, sending pong.")
-                                await ws.send(json.dumps({"type": "pong"}))
-                            else:
-                                logger.debug(f"Received unhandled message on user_stats socket: {data}")
-                        except json.JSONDecodeError:
-                            logger.warning(f"❌ Failed to decode JSON from user_stats: {message}")
-                            
-                    except asyncio.TimeoutError:
-                        logger.warning("⚠️ User stats WebSocket watchdog triggered (no data for 30s). Reconnecting...")
-                        break
-                        
-        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
-            logger.info(f"🔌 User stats WebSocket disconnected ({e}), reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"❌ An unexpected error occurred in user_stats socket: {e}. Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+
+    def _on_message(data):
+        msg_type = data.get("type")
+        if msg_type in ("update/user_stats", "subscribed/user_stats"):
+            on_user_stats_update(account_id, data.get("stats", {}))
+
+    await _ws_subscribe(
+        channels=[f"user_stats/{account_id}"],
+        label="user stats",
+        on_message=_on_message,
+    )
 
 def on_account_all_update(account_id, data):
     global account_positions, recent_trades, current_position_size
     try:
-        if int(account_id) == ACCOUNT_INDEX:
+        if account_id == ACCOUNT_INDEX:
             positions_updated = False
             if isinstance(data, dict) and "positions" in data:
                 new_positions = data.get("positions") or {}
@@ -476,46 +495,17 @@ def on_account_all_update(account_id, data):
 
 async def subscribe_to_account_all(account_id):
     """Connects to the websocket, subscribes to account_all, and updates global state."""
-    subscription_msg = {
-        "type": "subscribe",
-        "channel": f"account_all/{account_id}"
-    }
-    
-    while True:
-        try:
-            async with websockets.connect(WEBSOCKET_URL, ping_interval=20, ping_timeout=20) as ws:
-                logger.info(f"🔌 Connected to {WEBSOCKET_URL} for account_all")
-                await ws.send(json.dumps(subscription_msg))
-                logger.info(f"📡 Subscribed to account_all for account {account_id}")
-                
-                while True:
-                    try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                        
-                        try:
-                            data = json.loads(message)
-                            msg_type = data.get("type")
-                            
-                            if msg_type in ("update/account_all", "update/account", "subscribed/account_all"):
-                                on_account_all_update(account_id, data)
-                            elif msg_type == "ping":
-                                logger.debug("Received application-level ping, sending pong.")
-                                await ws.send(json.dumps({"type": "pong"}))
-                            else:
-                                logger.debug(f"Received unhandled message on account_all socket: {data}")
-                        except json.JSONDecodeError:
-                            logger.warning(f"❌ Failed to decode JSON from account_all: {message}")
-                            
-                    except asyncio.TimeoutError:
-                        logger.warning("⚠️ Account all WebSocket watchdog triggered (no data for 30s). Reconnecting...")
-                        break
-                        
-        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
-            logger.info(f"🔌 Account data WebSocket disconnected ({e}), reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"❌ An unexpected error occurred in account_all socket: {e}. Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+
+    def _on_message(data):
+        msg_type = data.get("type")
+        if msg_type in ("update/account_all", "update/account", "subscribed/account_all"):
+            on_account_all_update(account_id, data)
+
+    await _ws_subscribe(
+        channels=[f"account_all/{account_id}"],
+        label="account data",
+        on_message=_on_message,
+    )
 
 async def restart_websocket():
     global ws_task, local_order_book, order_book_received
@@ -549,32 +539,31 @@ def get_current_mid_price():
     global current_mid_price_cached
     return current_mid_price_cached
 
-async def check_websocket_health():
-    global ws_connection_healthy, last_order_book_update
+def check_websocket_health():
     if not ws_connection_healthy:
         return False
-    if time.time() - last_order_book_update > 30:
+    if time.monotonic() - last_order_book_update > WS_RECV_TIMEOUT:
         return False
     return True
 
-async def calculate_dynamic_base_amount(mid_price):
+def calculate_dynamic_base_amount(mid_price):
     global available_capital
     if not mid_price or mid_price <= 0:
         return None
-    
+
     if not available_capital:
-        return Decimal(str(BASE_AMOUNT))
-        
+        return BASE_AMOUNT
+
     try:
         usd_amount = available_capital * CAPITAL_USAGE_PERCENT
         size = usd_amount / mid_price
-        
-        if AMOUNT_TICK_SIZE:
-             size = round(size / float(AMOUNT_TICK_SIZE)) * float(AMOUNT_TICK_SIZE)
-             
-        return Decimal(str(size))
-    except:
-        return Decimal(str(BASE_AMOUNT))
+
+        if _AMOUNT_TICK_FLOAT > 0:
+             size = round(size / _AMOUNT_TICK_FLOAT) * _AMOUNT_TICK_FLOAT
+
+        return size
+    except Exception:
+        return BASE_AMOUNT
 
 async def place_order(client, side, price, order_id, size):
     try:
@@ -583,8 +572,8 @@ async def place_order(client, side, price, order_id, size):
         tx, tx_hash, err = await client.create_order(
             market_index=MARKET_ID,
             client_order_index=order_id,
-            base_amount=float(size),
-            price=float(price),
+            base_amount=size,
+            price=price,
             is_ask=is_ask,
             order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
             time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
@@ -628,45 +617,73 @@ async def cancel_all_orders(client):
     except Exception as e:
         logger.error(f"❌ Failed to cancel orders: {e}", exc_info=True)
 
-async def refresh_order_if_needed(client, side, new_price, new_size):
+# === HOT PATH ===
+
+async def refresh_order_if_needed(client, is_buy, new_price, new_size, _log_debug=False):
+    """Update a quote, preferring atomic modify_order over cancel+place."""
     global current_bid_order_id, current_ask_order_id
     global current_bid_price, current_ask_price, current_bid_size, current_ask_size
 
+    side = "buy" if is_buy else "sell"
+
     if new_price is None or new_size is None:
-        logger.debug(f"Skipping {side} update: missing price or size.")
+        if _log_debug:
+            logger.debug(f"Skipping {side} update: missing price or size.")
         return
 
-    new_price_f = float(new_price)
-    new_size_f = float(new_size)
-
-    if new_price_f <= 0 or new_size_f <= 0:
-        logger.debug(f"Skipping {side} update: invalid price or size.")
+    if new_price <= 0 or new_size <= 0:
+        if _log_debug:
+            logger.debug(f"Skipping {side} update: invalid price or size.")
         return
 
-    if side == 'buy':
+    if is_buy:
         existing_id = current_bid_order_id
         existing_price = current_bid_price
-    elif side == 'sell':
+    else:
         existing_id = current_ask_order_id
         existing_price = current_ask_price
-    else:
-        logger.warning(f"Unknown side {side}; cannot refresh order.")
-        return
 
     if existing_id is not None and existing_price is not None:
-        change_bps = price_change_bps(existing_price, new_price_f)
+        change_bps = price_change_bps(existing_price, new_price)
         if change_bps <= QUOTE_UPDATE_THRESHOLD_BPS:
-            logger.debug(
-                f"Keeping {side} order: price change {change_bps:.2f} bps <= {QUOTE_UPDATE_THRESHOLD_BPS:.2f}"
-            )
+            if _log_debug:
+                logger.debug(
+                    f"Keeping {side} order: price change {change_bps:.2f} bps <= {QUOTE_UPDATE_THRESHOLD_BPS:.2f}"
+                )
             return
 
+    # Try atomic modify if we have an existing order (single round-trip, no unquoted window)
     if existing_id is not None:
+        try:
+            tx, tx_hash, err = await client.modify_order(
+                market_index=MARKET_ID,
+                order_index=existing_id,
+                base_amount=new_size,
+                price=new_price,
+            )
+            if not err:
+                if _log_debug:
+                    logger.debug(f"Modified {side} order {existing_id}: {new_size} @ {new_price}")
+                if is_buy:
+                    current_bid_price = new_price
+                    current_bid_size = new_size
+                else:
+                    current_ask_price = new_price
+                    current_ask_size = new_size
+                return
+            else:
+                if _log_debug:
+                    logger.debug(f"Modify failed for {side} order {existing_id}: {err}; falling back to cancel+place")
+        except Exception as e:
+            if _log_debug:
+                logger.debug(f"Modify exception for {side} order {existing_id}: {e}; falling back to cancel+place")
+
+        # Fallback: cancel then place
         cancelled = await cancel_order(client, existing_id)
         if not cancelled:
             logger.warning(f"Cancel failed for {side} order {existing_id}; skipping replace.")
             return
-        if side == 'buy':
+        if is_buy:
             current_bid_order_id = None
             current_bid_price = None
             current_bid_size = None
@@ -676,24 +693,24 @@ async def refresh_order_if_needed(client, side, new_price, new_size):
             current_ask_size = None
 
     new_order_id = next_client_order_index()
-    placed = await place_order(client, side, new_price_f, new_order_id, new_size_f)
+    placed = await place_order(client, side, new_price, new_order_id, new_size)
     if not placed:
         return
 
-    if side == 'buy':
+    if is_buy:
         current_bid_order_id = new_order_id
-        current_bid_price = new_price_f
-        current_bid_size = new_size_f
+        current_bid_price = new_price
+        current_bid_size = new_size
     else:
         current_ask_order_id = new_order_id
-        current_ask_price = new_price_f
-        current_ask_size = new_size_f
+        current_ask_price = new_price
+        current_ask_size = new_size
 
 def _read_avellaneda_file_sync(candidates):
     for p in candidates:
         try:
             with open(p, "r") as f:
-                return json.load(f)
+                return json.loads(f.read())
         except FileNotFoundError:
             continue
         except json.JSONDecodeError as e:
@@ -703,17 +720,17 @@ def _read_avellaneda_file_sync(candidates):
 
 async def poll_avellaneda_parameters():
     """Continuously poll and load Avellaneda parameters from PARAMS_DIR asynchronously."""
-    global avellaneda_params, last_avellaneda_update
+    global avellaneda_params, avellaneda_cache, last_avellaneda_update
     while True:
         try:
-            now = time.time()
+            now = time.monotonic()
             candidates = [
                 os.path.join(PARAMS_DIR, f"avellaneda_parameters_{MARKET_SYMBOL}.json"),
                 f"params/avellaneda_parameters_{MARKET_SYMBOL}.json",
                 f"avellaneda_parameters_{MARKET_SYMBOL}.json",
                 f"TRADER/avellaneda_parameters_{MARKET_SYMBOL}.json",
             ]
-            
+
             loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, _read_avellaneda_file_sync, candidates)
 
@@ -727,7 +744,7 @@ async def poll_avellaneda_parameters():
                     k_bid = float(market_data.get("k_bid", market_data.get("k", 0)))
                     k_ask = float(market_data.get("k_ask", market_data.get("k", 0)))
                     time_remaining = float(data["current_state"]["time_remaining"])
-                    
+
                     if not (math.isfinite(gamma) and gamma > 0):
                         logger.warning("Avellaneda gamma must be finite and > 0.")
                     elif not (math.isfinite(sigma) and sigma >= 0):
@@ -738,6 +755,13 @@ async def poll_avellaneda_parameters():
                         logger.warning("Avellaneda time_remaining must be finite and > 0.")
                     else:
                         avellaneda_params = data
+                        avellaneda_cache = AvellanedaCache(
+                            gamma=gamma,
+                            sigma=sigma,
+                            k_bid=k_bid,
+                            k_ask=k_ask,
+                            time_remaining=time_remaining,
+                        )
                         last_avellaneda_update = now
                         logger.debug(
                             f"Avellaneda params loaded: gamma={gamma}, sigma={sigma}, "
@@ -748,112 +772,95 @@ async def poll_avellaneda_parameters():
 
         except Exception as e:
             logger.error(f"Unexpected error loading params: {e}", exc_info=True)
-            
+
         await asyncio.sleep(AVELLANEDA_REFRESH_INTERVAL)
 
 
-async def calculate_order_price(mid_price, side, inventory_factor):
+def calculate_order_prices(mid_price, inventory_factor):
     """
-    Calculates the optimal bid or ask price using Avellaneda-Stoikov formula.
+    Calculates both bid and ask prices using Avellaneda-Stoikov formula.
+    Returns (buy_price, sell_price) — either may be None on error.
     """
-    global avellaneda_params
+    cache = avellaneda_cache
 
-    if avellaneda_params:
+    if cache is not None:
         try:
-            gamma = float(avellaneda_params["optimal_parameters"]["gamma"])
-            sigma = float(avellaneda_params["market_data"]["sigma"])
+            _, buy_price, sell_price = avellaneda_quotes(
+                mid_price, cache.gamma, cache.sigma,
+                cache.k_bid, cache.k_ask, inventory_factor,
+                cache.time_remaining,
+            )
 
-            market_data = avellaneda_params.get("market_data", {})
-            k_bid = float(market_data.get("k_bid", market_data.get("k", 0.5)))
-            k_ask = float(market_data.get("k_ask", market_data.get("k", 0.5)))
+            if _PRICE_TICK_FLOAT > 0:
+                buy_price = round(buy_price / _PRICE_TICK_FLOAT) * _PRICE_TICK_FLOAT
+                sell_price = round(sell_price / _PRICE_TICK_FLOAT) * _PRICE_TICK_FLOAT
 
-            time_horizon = float(avellaneda_params["current_state"]["time_remaining"])  # in days
-
-            reservation_price = mid_price - (inventory_factor * gamma * (sigma**2) * time_horizon)
-
-            if side == "buy":
-                val_inside_log = 1.0 + gamma / (mid_price * k_bid + 1e-9)
-                spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
-                final_price = reservation_price - (spread / 2.0)
-            else:
-                val_inside_log = 1.0 + gamma / (mid_price * k_ask + 1e-9)
-                spread = (2.0 * mid_price / gamma) * math.log(val_inside_log)
-                final_price = reservation_price + (spread / 2.0)
-
-            if PRICE_TICK_SIZE:
-                final_price = round(final_price / float(PRICE_TICK_SIZE)) * float(PRICE_TICK_SIZE)
-
-            return final_price
+            return buy_price, sell_price
         except Exception as e:
-            logger.error(f"Error calculating order price: {e}", exc_info=True)
-            return None
+            logger.error(f"Error calculating order prices: {e}", exc_info=True)
+            return None, None
 
     if REQUIRE_PARAMS:
         logger.warning("REQUIRE_PARAMS enabled and no valid Avellaneda params; skipping quoting.")
-        return None
+        return None, None
 
-    spread = mid_price * 0.001
-    return mid_price - (spread / 2) if side == "buy" else mid_price + (spread / 2)
+    spread = mid_price * FALLBACK_SPREAD_FRACTION
+    return mid_price - (spread / 2), mid_price + (spread / 2)
 
 async def market_making_loop(client, account_api, order_api):
     logger.info("Starting 2-sided market making loop...")
+    _log_info = logger.isEnabledFor(logging.INFO)
+    _log_debug = logger.isEnabledFor(logging.DEBUG)
 
     while True:
         try:
-            if not await check_websocket_health():
+            if not check_websocket_health():
                 logger.warning("Websocket connection unhealthy, attempting restart...")
                 if not await restart_websocket():
                     await asyncio.sleep(10)
                     continue
 
             # Wait for fresh order book data but wake up to check state
+            # Clear before wait to avoid losing updates between wait() returning and clear()
+            order_book_received.clear()
             try:
                 await asyncio.wait_for(order_book_received.wait(), timeout=ORDER_TIMEOUT)
-                order_book_received.clear() # Clear so we block next time
             except asyncio.TimeoutError:
-                pass # Wake up gracefully and evaluate anyway
+                pass
 
             current_mid_price = get_current_mid_price()
             if current_mid_price is None:
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
-            base_amount = await calculate_dynamic_base_amount(current_mid_price)
+            base_amount = calculate_dynamic_base_amount(current_mid_price)
             if base_amount is None or base_amount <= 0:
-                logger.warning("Base amount is zero or invalid; skipping order refresh.")
+                if _log_info:
+                    logger.warning("Base amount is zero or invalid; skipping order refresh.")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
-            inventory_param = current_position_size / float(base_amount)
+            inventory_param = current_position_size / base_amount
 
-            buy_price = await calculate_order_price(current_mid_price, "buy", inventory_param)
-            sell_price = await calculate_order_price(current_mid_price, "sell", inventory_param)
+            buy_price, sell_price = calculate_order_prices(current_mid_price, inventory_param)
 
             if buy_price and sell_price:
-                bp_f = float(buy_price)
-                sp_f = float(sell_price)
-                bid_spread_pct = (current_mid_price - bp_f) / current_mid_price * 100 if current_mid_price > 0 else 0
-                ask_spread_pct = (sp_f - current_mid_price) / current_mid_price * 100 if current_mid_price > 0 else 0
-
-                logger.info(
-                    f"QUOTING | "
-                    f"Inventory: {inventory_param:+.2f} | "
-                    f"Mid: ${current_mid_price:.4f} | "
-                    f"Bid: ${bp_f:.4f} (-{bid_spread_pct:.4f}%) | "
-                    f"Ask: ${sp_f:.4f} (+{ask_spread_pct:.4f}%)"
-                )
+                if _log_info:
+                    bid_spread_pct = (current_mid_price - buy_price) / current_mid_price * 100 if current_mid_price > 0 else 0
+                    ask_spread_pct = (sell_price - current_mid_price) / current_mid_price * 100 if current_mid_price > 0 else 0
+                    logger.info(
+                        "QUOTING | Inventory: %+.2f | Mid: $%.4f | Bid: $%.4f (-%.4f%%) | Ask: $%.4f (+%.4f%%)",
+                        inventory_param, current_mid_price, buy_price, bid_spread_pct, sell_price, ask_spread_pct,
+                    )
             else:
-                logger.debug("Could not calculate one or both quotes; skipping refresh for missing side(s).")
+                if _log_debug:
+                    logger.debug("Could not calculate one or both quotes; skipping refresh for missing side(s).")
 
-            # Execute quoting in parallel
-            tasks = []
+            # Execute quoting sequentially (only 2 tasks; avoids gather() overhead)
             if buy_price:
-                tasks.append(refresh_order_if_needed(client, "buy", buy_price, base_amount))
+                await refresh_order_if_needed(client, True, buy_price, base_amount, _log_debug)
             if sell_price:
-                tasks.append(refresh_order_if_needed(client, "sell", sell_price, base_amount))
-            
-            if tasks:
-                await asyncio.gather(*tasks)
+                await refresh_order_if_needed(client, False, sell_price, base_amount, _log_debug)
 
         except Exception as e:
             logger.error(f"Unhandled error in market_making_loop: {e}", exc_info=True)
@@ -863,12 +870,13 @@ async def market_making_loop(client, account_api, order_api):
 async def track_balance():
     log_path = os.path.join(LOG_DIR, "balance_log.txt")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    loop = asyncio.get_running_loop()
     while True:
         try:
             if current_position_size == 0 and portfolio_value is not None:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                with open(log_path, "a") as f:
-                    f.write(f"[{timestamp}] Portfolio Value: ${portfolio_value:,.2f}\n")
+                line = f"[{timestamp}] Portfolio Value: ${portfolio_value:,.2f}\n"
+                await loop.run_in_executor(None, _append_line, log_path, line)
                 logger.info(f"💰 Portfolio value of ${portfolio_value:,.2f} logged to {log_path}")
             elif current_position_size != 0:
                 logger.info(f"⏸️ Skipping balance logging (open position: {current_position_size})")
@@ -879,10 +887,18 @@ async def track_balance():
         await asyncio.sleep(300)
 
 
+def _append_line(path, line):
+    with open(path, "a") as f:
+        f.write(line)
+
+
+# === COLD PATH ===
+
 async def main():
     global MARKET_ID, PRICE_TICK_SIZE, AMOUNT_TICK_SIZE
+    global _PRICE_TICK_FLOAT, _AMOUNT_TICK_FLOAT
     global ws_task, last_order_book_update
-    global last_mid_price, current_order_id, current_position_size
+    global last_mid_price, current_position_size
 
     logger.info("🚀 === Market Maker v2 Starting (2-Sided Quoting) ===")
 
@@ -895,6 +911,8 @@ async def main():
         logger.error(f"❌ Could not retrieve market details for {MARKET_SYMBOL}. Exiting.")
         return
     MARKET_ID, PRICE_TICK_SIZE, AMOUNT_TICK_SIZE = details
+    _PRICE_TICK_FLOAT = float(PRICE_TICK_SIZE)
+    _AMOUNT_TICK_FLOAT = float(AMOUNT_TICK_SIZE)
     logger.info(f"📊 Market {MARKET_SYMBOL}: id={MARKET_ID}, tick(price)={PRICE_TICK_SIZE}, tick(amount)={AMOUNT_TICK_SIZE}")
 
     client = lighter.SignerClient(
@@ -916,7 +934,7 @@ async def main():
     await asyncio.sleep(3)
 
 
-    last_order_book_update = time.time()
+    last_order_book_update = time.monotonic()
     # Start WebSocket Tasks
     ws_task = asyncio.create_task(subscribe_to_market_data(MARKET_ID))
 

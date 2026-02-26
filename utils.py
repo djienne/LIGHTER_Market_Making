@@ -13,6 +13,8 @@ import pandas as pd
 import numpy as np
 import lighter
 
+EPSILON = 1e-9
+
 # Global Constants
 PARAMS_DIR = os.getenv("PARAMS_DIR", "params")
 os.makedirs(PARAMS_DIR, exist_ok=True)
@@ -459,6 +461,36 @@ def prepare_calculation_windows(mid_price_df: pd.DataFrame, trades_df: pd.DataFr
         trades_df = trades_df.loc[(trades_df.index >= window_start) & (trades_df.index < window_end)]
 
     return mid_price_df, trades_df
+
+
+def avellaneda_quotes(s, gamma, sigma, k_bid, k_ask, q, time_remaining):
+    """Compute Avellaneda-Stoikov reservation price, bid and ask prices.
+
+    All inputs are plain floats (dimensionless gamma/sigma, absolute k in 1/$).
+
+    Returns:
+        (reservation_price, bid_price, ask_price)
+    """
+    reservation_price = s * (1.0 - q * gamma * sigma ** 2 * time_remaining)
+
+    two_s_over_gamma = 2.0 * s / gamma
+    spread_bid = two_s_over_gamma * math.log(1.0 + gamma / (s * k_bid + EPSILON))
+    spread_ask = two_s_over_gamma * math.log(1.0 + gamma / (s * k_ask + EPSILON))
+
+    half_bid = spread_bid / 2.0
+    half_ask = spread_ask / 2.0
+
+    gap = abs(reservation_price - s)
+
+    if reservation_price >= s:
+        delta_a = half_ask + gap
+        delta_b = half_bid - gap
+    else:
+        delta_a = half_ask - gap
+        delta_b = half_bid + gap
+
+    return reservation_price, reservation_price - delta_b, reservation_price + delta_a
+
 
 def print_summary(results, list_of_periods):
     """Print a summary of the results to the terminal."""

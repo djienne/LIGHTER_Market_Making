@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import pandas as pd
 import scipy.optimize
@@ -105,7 +106,8 @@ def calculate_intensity_params(list_of_periods, window_minutes, buy_orders, sell
                 paramsB, _ = scipy.optimize.curve_fit(exp_fit, valid_deltas_bid, lambdas_bid, p0=p0, bounds=(0, np.inf), maxfev=5000)
                 A_bid_list.append(paramsB[0])
                 k_bid_list.append(paramsB[1])
-            except:
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Bid intensity fit failed: {e}")
                 A_bid_list.append(float('nan')); k_bid_list.append(float('nan'))
         else:
             A_bid_list.append(float('nan')); k_bid_list.append(float('nan'))
@@ -117,7 +119,8 @@ def calculate_intensity_params(list_of_periods, window_minutes, buy_orders, sell
                 paramsA, _ = scipy.optimize.curve_fit(exp_fit, valid_deltas_ask, lambdas_ask, p0=p0, bounds=(0, np.inf), maxfev=5000)
                 A_ask_list.append(paramsA[0])
                 k_ask_list.append(paramsA[1])
-            except:
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Ask intensity fit failed: {e}")
                 A_ask_list.append(float('nan')); k_ask_list.append(float('nan'))
         else:
             A_ask_list.append(float('nan')); k_ask_list.append(float('nan'))

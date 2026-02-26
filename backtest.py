@@ -185,52 +185,39 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k_bid, k_ask, sigma
     pnl, x, q, spr_bid, spr_ask, r, r_a, r_b = jit_backtest_loop(s_values, buy_max_values, sell_min_values, gamma, k_bid, k_ask, sigma, fee, time_remaining)
     return {'pnl': pnl, 'x': x, 'q': q, 'spread_bid': spr_bid, 'spread_ask': spr_ask, 'r': r, 'r_a': r_a, 'r_b': r_b}
 
-def calculate_final_quotes(gamma, sigma, A_bid, k_bid, A_ask, k_ask, window_minutes, mid_price_df, ma_window, period_start, period_end, ticker, time_horizon_days):
+def calculate_final_quotes(gamma, sigma, A_bid, k_bid, A_ask, k_ask, window_minutes, mid_price_df, ma_window, period_start, period_end, ticker, time_horizon_days, q=1.0):
     """Calculate the final reservation price and quotes."""
     print("\n" + "-"*20)
     print("Calculating final parameters for current state...")
 
     s = mid_price_df.loc[:, 'mid_price'].iloc[-1]
-    
+
     # Use optimized horizon
     time_remaining = time_horizon_days
-    
-    q = 1.0  # Placeholder for current inventory
     window_hours = window_minutes / 60.0
 
-    # Dimensionless Logic Application for Final Quotes
-    # r = s * (1 - q * gamma * sigma^2 * T)
-    r = s * (1.0 - q * gamma * sigma**2 * time_remaining)
-    
-    # Spread (Pure Liquidity component)
-    # Bid Spread uses k_bid
-    term2_bid = (2.0 * s / gamma) * np.log(1.0 + gamma / (s * k_bid + 1e-9))
-    spread_base_bid = term2_bid
-    
-    # Ask Spread uses k_ask
-    term2_ask = (2.0 * s / gamma) * np.log(1.0 + gamma / (s * k_ask + 1e-9))
-    spread_base_ask = term2_ask
-    
+    r, r_b, r_a = utils.avellaneda_quotes(
+        float(s), float(gamma), float(sigma),
+        float(k_bid), float(k_ask), float(q), float(time_remaining),
+    )
+
+    delta_a = r_a - r
+    delta_b = r - r_b
+    gap = abs(r - float(s))
+
+    # Derive spread components for reporting
+    EPSILON = utils.EPSILON
+    spread_base_bid = (2.0 * float(s) / float(gamma)) * np.log(1.0 + float(gamma) / (float(s) * float(k_bid) + EPSILON))
+    spread_base_ask = (2.0 * float(s) / float(gamma)) * np.log(1.0 + float(gamma) / (float(s) * float(k_ask) + EPSILON))
     half_spread_bid = spread_base_bid / 2.0
     half_spread_ask = spread_base_ask / 2.0
-    
-    gap = abs(r - s)
-
-    if r >= s:
-        delta_a = half_spread_ask + gap
-        delta_b = half_spread_bid - gap
-    else:
-        delta_a = half_spread_ask - gap
-        delta_b = half_spread_bid + gap
-
-    r_a, r_b = r + delta_a, r - delta_b
 
     return {
         "ticker": ticker,
         "timestamp": pd.Timestamp.now().isoformat(),
         "market_data": {
-            "mid_price": float(s), 
-            "sigma": float(sigma), 
+            "mid_price": float(s),
+            "sigma": float(sigma),
             "A_bid": float(A_bid), "k_bid": float(k_bid),
             "A_ask": float(A_ask), "k_ask": float(k_ask)
         },
@@ -247,13 +234,13 @@ def calculate_final_quotes(gamma, sigma, A_bid, k_bid, A_ask, k_ask, window_minu
             "end": period_end.isoformat() if period_end is not None else None
         },
         "calculated_values": {
-            "reservation_price": float(r), 
-            "gap": float(gap), 
+            "reservation_price": float(r),
+            "gap": float(gap),
             "spread_base_bid": float(spread_base_bid), "half_spread_bid": float(half_spread_bid),
             "spread_base_ask": float(spread_base_ask), "half_spread_ask": float(half_spread_ask)
         },
         "limit_orders": {"ask_price": float(r_a), "bid_price": float(r_b), "delta_a": float(delta_a), "delta_b": float(delta_b),
-                         "delta_a_percent": (delta_a / s) * 100.0, "delta_b_percent": (delta_b / s) * 100.0}
+                         "delta_a_percent": (delta_a / float(s)) * 100.0, "delta_b_percent": (delta_b / float(s)) * 100.0}
     }
 
 if __name__ == "__main__":
