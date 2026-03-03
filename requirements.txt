@@ -1,0 +1,15 @@
+git+https://github.com/elliottech/lighter-python.git@b7fc10b288f317e9c974f318d8de7fcc5cc557e4
+python-dotenv==1.1.0
+numpy==2.3.5
+pandas==3.0.0
+scipy==1.17.0
+numba==0.63.1
+websockets==15.0.1
+requests==2.32.5
+eth-account==0.13.7
+fastparquet==2025.12.0
+pyarrow==23.0.1
+zstandard==0.24.0
+orjson==3.11.7
+sortedcontainers==2.4.0
+pytest==9.0.2

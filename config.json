@@ -1,0 +1,52 @@
+{
+    "CRYPTO_TICKERS": ["BTC"],
+    "trading": {
+        "leverage": 2,
+        "margin_mode": "cross",
+        "base_amount": 0.047,
+        "capital_usage_percent": 0.12,
+        "safety_margin_percent": 0.01,
+        "minimum_spread_percent": 0.005,
+        "spread_factor_level1": 2.0,
+        "order_timeout_seconds": 30.0,
+        "position_value_threshold_usd": 11.0,
+        "vol_obi": {
+            "window_steps": 6000,
+            "step_ns": 100000000,
+            "vol_to_half_spread": 32.0,
+            "min_half_spread_bps": 8.0,
+            "c1_ticks": 2.0,
+            "skew": 3.0,
+            "looking_depth": 0.025,
+            "min_warmup_samples": 100,
+            "max_position_dollar": 500.0,
+            "warmup_seconds": 600
+        },
+        "alpha": {
+            "source": "binance",
+            "stale_seconds": 5.0,
+            "window_size": 6000,
+            "min_samples": 150,
+            "looking_depth": 0.025
+        }
+    },
+    "performance": {
+        "min_loop_interval": 0.1,
+        "rate_limit_send_interval": 0.1,
+        "buffer_seconds": 5
+    },
+    "websocket": {
+        "ping_interval": 20,
+        "recv_timeout": 30.0,
+        "reconnect_base_delay": 5,
+        "reconnect_max_delay": 60
+    },
+    "safety": {
+        "stale_order_poller_interval_sec": 3.0,
+        "stale_order_debounce_count": 2,
+        "max_consecutive_order_rejections": 5,
+        "circuit_breaker_cooldown_sec": 60.0,
+        "order_reconcile_timeout_sec": 2.0,
+        "max_live_orders_per_market": 8
+    }
+}
