@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+venv/
+*.nbc
+*.nbi
+data/
+logs/
+*.parquet
+.pytest_cache/

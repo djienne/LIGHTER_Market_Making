@@ -1,0 +1,42 @@
+Lighter Account Types
+=====================
+Source: https://apidocs.lighter.xyz/docs/account-types
+
+=== STANDARD ACCOUNT (Default) ===
+
+Designed for retail and latency-insensitive traders.
+  Maker Fee:            0%
+  Taker Fee:            0%
+  Taker Latency:        300 ms
+  Maker/Cancel Latency: 200 ms
+
+=== PREMIUM ACCOUNT (Opt-in) ===
+
+Designed for high-frequency trading. 0ms maker/cancel latency.
+Base fees without LIT staking: 0.0040% maker / 0.0280% taker, 200ms taker latency.
+
+LIT Staking Discount Tiers:
+  Staked LIT  | Discount | Maker Fee | Taker Fee | Taker Latency
+  ------------|----------|-----------|-----------|---------------
+  0           | --       | 0.0040%   | 0.0280%   | 200 ms
+  1,000       | 2.5%     | 0.0039%   | 0.0273%   | 195 ms
+  3,000       | 5%       | 0.0038%   | 0.0266%   | 190 ms
+  10,000      | 10%      | 0.0036%   | 0.0252%   | 180 ms
+  30,000      | 15%      | 0.0034%   | 0.0238%   | 170 ms
+  100,000     | 20%      | 0.0032%   | 0.0224%   | 160 ms
+  300,000     | 25%      | 0.0030%   | 0.0210%   | 150 ms
+  500,000     | 30%      | 0.0028%   | 0.0196%   | 140 ms
+
+=== SWITCHING BETWEEN TIERS ===
+
+Use the /changeAccountTier endpoint. Requirements:
+  - No open positions
+  - No open orders
+  - At least 24 hours since the last tier change
+
+=== FEE COLLECTION ===
+
+Isolated margin: Fees deducted from the position itself; auto-transfers from
+cross margin if needed.
+Cross margin: Fees always deducted directly from available cross balance.
+Sub-accounts inherit the tier of their main L1 address.

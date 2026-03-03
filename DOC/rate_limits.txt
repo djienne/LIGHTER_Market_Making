@@ -1,0 +1,55 @@
+Lighter API Rate Limits
+=======================
+Source: https://apidocs.lighter.xyz/docs/rate-limits
+
+=== REST API LIMITS ===
+
+Premium Accounts: 24,000 weighted requests per rolling minute
+Standard Accounts: 60 requests per rolling minute
+
+Endpoint Weights:
+  Weight 6:     sendTx, sendTxBatch, nextNonce
+  Weight 50:    publicPools, txFromL1TxHash
+  Weight 100:   accountInactiveOrders, deposit/latest
+  Weight 150:   apikeys
+  Weight 300:   Most other endpoints (default)
+  Weight 500:   transferFeeInfo
+  Weight 600:   trades, recentTrades
+  Weight 3000:  changeAccountTier, tokens/*, setAccountMetadata,
+                notification/ack, createIntentAddress, fastwithdraw, referral/*
+
+=== EXPLORER API LIMITS ===
+
+Both Standard and Premium: 90 weighted requests per rolling minute
+Explorer endpoint weights: search = 3, accounts/* = 2, others = 1
+
+=== WEBSOCKET LIMITS (per IP) ===
+
+Connections:              100
+Max Connections/Minute:   80
+Subscriptions/Connection: 100
+Total Subscriptions:      1,000
+Max Messages/Minute:      200 (sendTx/sendBatchTx excluded from count)
+Max Inflight Messages:    50
+Unique Accounts:          10
+Connection Duration:      Automatically dropped after 24 hours
+
+=== TRANSACTION TYPE LIMITS (Standard Accounts Only) ===
+
+Default:                  40 requests/minute
+L2Withdraw:               2 requests/minute
+L2UpdateLeverage:         1 request/minute
+L2CreateSubAccount:       2 requests/minute
+L2CreatePublicPool:       2 requests/minute
+L2ChangePubKey:           2 requests/10 seconds
+L2Transfer:               1 request/minute
+
+=== RATE LIMIT VIOLATION BEHAVIOR ===
+
+Exceeding limits returns HTTP 429 Too Many Requests.
+Both REST and WebSocket connections share rate-limit enforcement.
+
+Cooldown periods:
+  Firewall:     60 seconds (static)
+  API Servers:  weightOfEndpoint / (totalWeight / 60)
+  Example: endpoint weight 300 -> ~750ms cooldown after exhausting weighted requests

@@ -1,0 +1,67 @@
+version: '3.8'
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.32.44.0/22
+services:
+  lighter-data-collector:
+    build: .
+    container_name: lighter-collector
+    restart: unless-stopped
+    volumes:
+      - ./:/app/
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_DIR=/app/logs
+    command: python gather_lighter_data.py
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f gather_lighter_data || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # -----------------------------------------------------------------------
+  # The market-maker service is commented out by default for safety.
+  # The data collector can run standalone to accumulate historical data
+  # (recommended for 1-2 days before enabling trading).
+  #
+  # To enable:
+  #   1. Uncomment the service block you need.
+  #   2. Ensure your .env file has the required keys (see CLAUDE.md).
+  #   3. Run `docker-compose up -d` to start the services.
+  # -----------------------------------------------------------------------
+
+#  market-maker:
+#    build: .
+#    container_name: market-maker
+#    restart: unless-stopped
+#    stop_signal: SIGINT
+#    working_dir: /app
+#    volumes:
+#      - ./:/app/
+#    env_file:
+#      - .env
+#    environment:
+#      - PYTHONUNBUFFERED=1
+#      - LOG_DIR=/app/logs
+#      - RESTART_SECONDS=5
+#    command: >
+#      sh -c "
+#        while true; do
+#          echo 'Starting market maker v2...';
+#          timeout 600 python market_maker_v2.py --symbol $$MARKET_SYMBOL;
+#          sleep $$RESTART_SECONDS;
+#        done
+#      "
+#    depends_on:
+#      - lighter-data-collector
