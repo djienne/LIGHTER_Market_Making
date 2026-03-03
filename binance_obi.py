@@ -191,6 +191,9 @@ class BinanceObiClient:
         if not bids_raw or not asks_raw:
             return
 
+        bids_raw = sorted(bids_raw, key=lambda x: float(x[0]), reverse=True)
+        asks_raw = sorted(asks_raw, key=lambda x: float(x[0]))
+
         try:
             best_bid = float(bids_raw[0][0])
             best_ask = float(asks_raw[0][0])

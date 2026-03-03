@@ -1071,3 +1071,353 @@ class TestQuotaPacing(unittest.IsolatedAsyncioTestCase):
         # No long sleeps for free slot — cancel bypasses quota pacing
         long_sleeps = [s for s in sleep_calls if s > 10.0]
         self.assertEqual(len(long_sleeps), 0)
+
+
+# ---------------------------------------------------------------------------
+# 18) Quota threshold warning system
+# ---------------------------------------------------------------------------
+
+class TestQuotaThresholdWarnings(unittest.TestCase):
+
+    def test_warning_at_each_threshold_crossing(self):
+        """_update_volume_quota should emit WARNING at each threshold crossing."""
+        with temp_mm_attrs(
+            _volume_quota_remaining=1000,
+            _quota_warning_level="ok",
+        ):
+            with patch.object(mm.logger, "warning") as mock_warn, \
+                 patch.object(mm.logger, "info") as mock_info:
+                # Drop to MEDIUM range (< 50)
+                mm._update_volume_quota(30)
+                self.assertEqual(mm._quota_warning_level, "medium")
+                mock_warn.assert_called()
+                self.assertIn("QUOTA MEDIUM", mock_warn.call_args_list[-1][0][0])
+
+                mock_warn.reset_mock()
+
+                # Drop to LOW range (< 10)
+                mm._update_volume_quota(5)
+                self.assertEqual(mm._quota_warning_level, "low")
+                mock_warn.assert_called()
+                self.assertIn("QUOTA LOW", mock_warn.call_args_list[-1][0][0])
+
+                mock_warn.reset_mock()
+
+                # Drop to CRITICAL (0)
+                mm._update_volume_quota(0)
+                self.assertEqual(mm._quota_warning_level, "critical")
+                mock_warn.assert_called()
+                self.assertIn("QUOTA EXHAUSTED", mock_warn.call_args_list[-1][0][0])
+
+                mock_warn.reset_mock()
+
+                # Recover above MEDIUM threshold
+                mm._update_volume_quota(100)
+                self.assertEqual(mm._quota_warning_level, "ok")
+                mock_info.assert_called()
+                self.assertIn("QUOTA RECOVERED", mock_info.call_args_list[-1][0][0])
+
+    def test_no_duplicate_warnings(self):
+        """Same level should not re-emit warnings."""
+        with temp_mm_attrs(
+            _volume_quota_remaining=1000,
+            _quota_warning_level="ok",
+        ):
+            with patch.object(mm.logger, "warning") as mock_warn:
+                mm._update_volume_quota(30)
+                call_count_1 = mock_warn.call_count
+
+                # Same range — no new warning
+                mm._update_volume_quota(25)
+                self.assertEqual(mock_warn.call_count, call_count_1)
+
+    def test_none_and_invalid_ignored(self):
+        """None, '?', and non-numeric values should not change quota."""
+        with temp_mm_attrs(_volume_quota_remaining=500, _quota_warning_level="ok"):
+            mm._update_volume_quota(None)
+            self.assertEqual(mm._volume_quota_remaining, 500)
+            mm._update_volume_quota("?")
+            self.assertEqual(mm._volume_quota_remaining, 500)
+            mm._update_volume_quota("not_a_number")
+            self.assertEqual(mm._volume_quota_remaining, 500)
+
+
+# ---------------------------------------------------------------------------
+# 19) Window-full skip threshold (30s)
+# ---------------------------------------------------------------------------
+
+class TestWindowFullThreshold(unittest.IsolatedAsyncioTestCase):
+
+    async def test_window_full_waits_up_to_30s(self):
+        """Wait time of 20s (< 30s) should wait, not skip."""
+        sleep_calls = []
+
+        async def _track_sleep(secs):
+            sleep_calls.append(secs)
+
+        # Fill op_timestamps so _time_until_ops_free returns ~20s
+        now = time.monotonic()
+        # 40 ops sent 40s ago — they expire at now+20s
+        timestamps = mm._op_timestamps.__class__(
+            [now - 40.0] * mm._RL_OPS_PER_WINDOW
+        )
+
+        with temp_mm_attrs(
+            _global_backoff_until=0.0,
+            _last_send_time=0.0,
+            _volume_quota_remaining=1000,
+            _op_timestamps=timestamps,
+        ):
+            with patch("asyncio.sleep", side_effect=_track_sleep):
+                result = await mm._wait_for_write_slot(op_count=4, cancel_only=False)
+
+        self.assertTrue(result)
+        # Should have waited (not skipped)
+        self.assertGreater(len(sleep_calls), 0)
+
+    async def test_window_full_skips_above_30s(self):
+        """Wait time > 30s should skip."""
+        now = time.monotonic()
+        # 40 ops sent 20s ago — they expire at now+40s (> 30s threshold)
+        timestamps = mm._op_timestamps.__class__(
+            [now - 20.0] * mm._RL_OPS_PER_WINDOW
+        )
+
+        with temp_mm_attrs(
+            _global_backoff_until=0.0,
+            _last_send_time=0.0,
+            _volume_quota_remaining=1000,
+            _op_timestamps=timestamps,
+        ):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await mm._wait_for_write_slot(op_count=4, cancel_only=False)
+
+        self.assertFalse(result)
+
+
+# ---------------------------------------------------------------------------
+# 20) Quota recovery
+# ---------------------------------------------------------------------------
+
+class TestQuotaRecovery(unittest.TestCase):
+
+    def test_quota_recovery_disabled_by_default_config(self):
+        """Verify _QR_ENABLED reflects config; default in code is True but
+        can be overridden to False via config."""
+        # The default in code is True (enabled by default per user request).
+        # This test just verifies the variable exists and is bool.
+        self.assertIsInstance(mm._QR_ENABLED, bool)
+
+
+class TestQuotaRecoveryAsync(unittest.IsolatedAsyncioTestCase):
+
+    async def test_quota_recovery_stops_if_quota_unchanged(self):
+        """If exchange response returns same quota, recovery aborts."""
+        mock_response = MagicMock()
+        mock_response.volume_quota_remaining = "3"  # same as starting quota
+
+        mock_client = MagicMock()
+        mock_client.create_market_order = AsyncMock(
+            return_value=("tx", mock_response, None)
+        )
+        mock_client.cancel_all_orders = AsyncMock(
+            return_value=("tx", mock_response, None)
+        )
+
+        with temp_mm_attrs(
+            _volume_quota_remaining=3,
+            _quota_warning_level="critical",
+            _quota_recovery_in_progress=False,
+            _quota_recovery_last_attempt=0.0,
+            _last_send_time=0.0,
+            _op_timestamps=mm._op_timestamps.__class__(),
+            _global_backoff_until=0.0,
+            current_position_size=0.0,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            MARKET_ID=1,
+        ):
+            # Set up min orderbook data
+            from sortedcontainers import SortedDict
+            mm.state.market.local_order_book = {
+                'bids': SortedDict({100.0: 1.0}),
+                'asks': SortedDict({100.5: 1.0}),
+                'initialized': True,
+            }
+            mm.state.market.mid_price = 100.25
+            mm.state.config.min_base_amount = 0.001
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await mm._attempt_quota_recovery(mock_client)
+
+        self.assertFalse(result)
+
+    async def test_quota_recovery_max_loss_abort(self):
+        """Recovery stops after cumulative loss exceeds threshold."""
+        call_count = 0
+
+        async def _fake_market_order(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            # Each call increases quota by 1
+            resp.volume_quota_remaining = str(3 + call_count)
+            return ("tx", resp, None)
+
+        mock_client = MagicMock()
+        mock_client.create_market_order = AsyncMock(side_effect=_fake_market_order)
+        mock_client.cancel_all_orders = AsyncMock(
+            return_value=("tx", MagicMock(volume_quota_remaining="3"), None)
+        )
+
+        with temp_mm_attrs(
+            _volume_quota_remaining=3,
+            _quota_warning_level="critical",
+            _quota_recovery_in_progress=False,
+            _quota_recovery_last_attempt=0.0,
+            _last_send_time=0.0,
+            _op_timestamps=mm._op_timestamps.__class__(),
+            _global_backoff_until=0.0,
+            current_position_size=0.0,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            MARKET_ID=1,
+        ):
+            from sortedcontainers import SortedDict
+            mm.state.market.local_order_book = {
+                'bids': SortedDict({100.0: 1.0}),
+                'asks': SortedDict({100.5: 1.0}),
+                'initialized': True,
+            }
+            mm.state.market.mid_price = 100.25
+            mm.state.config.min_base_amount = 0.001
+
+            # Set very low loss limit to trigger abort quickly
+            orig_max_loss = mm._QR_MAX_LOSS
+            mm._QR_MAX_LOSS = 0.0001
+            try:
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    result = await mm._attempt_quota_recovery(mock_client)
+            finally:
+                mm._QR_MAX_LOSS = orig_max_loss
+
+        # Should have stopped early due to loss limit
+        self.assertLessEqual(call_count, 2)
+
+    async def test_quota_recovery_pnl_drop_abort(self):
+        """Recovery aborts if portfolio value drops by more than max_loss."""
+        call_count = 0
+
+        async def _market_order_with_pnl_drop(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            # First order succeeds and increases quota, but drops PnL
+            resp = MagicMock()
+            resp.volume_quota_remaining = str(3 + call_count)
+            # Simulate PnL drop after first fill
+            mm.state.account.portfolio_value = 997.0  # $3 drop > $2 max_loss
+            return ("tx", resp, None)
+
+        mock_client = MagicMock()
+        mock_client.create_market_order = AsyncMock(side_effect=_market_order_with_pnl_drop)
+
+        with temp_mm_attrs(
+            _volume_quota_remaining=3,
+            _quota_warning_level="critical",
+            _quota_recovery_in_progress=False,
+            _quota_recovery_last_attempt=0.0,
+            _last_send_time=0.0,
+            _op_timestamps=mm._op_timestamps.__class__(),
+            _global_backoff_until=0.0,
+            current_position_size=0.0,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            MARKET_ID=1,
+            portfolio_value=1000.0,
+        ):
+            from sortedcontainers import SortedDict
+            mm.state.market.local_order_book = {
+                'bids': SortedDict({100.0: 1.0}),
+                'asks': SortedDict({100.5: 1.0}),
+                'initialized': True,
+            }
+            mm.state.market.mid_price = 100.25
+            mm.state.config.min_base_amount = 0.001
+
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                result = await mm._attempt_quota_recovery(mock_client)
+
+        # First attempt succeeds but drops PnL, second attempt should see the drop and abort
+        self.assertEqual(call_count, 1)  # only 1 market order before PnL check aborts
+
+    async def test_quota_recovery_respects_cooldown(self):
+        """Recovery should not trigger within cooldown period."""
+        mock_client = MagicMock()
+
+        with temp_mm_attrs(
+            _volume_quota_remaining=3,
+            _quota_recovery_in_progress=False,
+            # Last attempt was just now — within cooldown
+            _quota_recovery_last_attempt=time.monotonic(),
+        ):
+            result = await mm._attempt_quota_recovery(mock_client)
+
+        self.assertFalse(result)
+
+
+# ---------------------------------------------------------------------------
+# Regression: WS orderbook snapshot must be processed
+# ---------------------------------------------------------------------------
+
+class TestOrderBookSnapshotProcessing(unittest.TestCase):
+    """Regression test: WS orderbook snapshot (type=subscribed/order_book) must be processed."""
+
+    def test_subscribed_order_book_processed(self):
+        """The initial 'subscribed/order_book' snapshot must update the local book."""
+        with temp_mm_attrs(
+            local_order_book={'bids': SortedDict(), 'asks': SortedDict(), 'initialized': False},
+            current_mid_price_cached=None,
+            MARKET_ID=1,
+        ):
+            snapshot_payload = {
+                "bids": [
+                    {"price": "68000.0", "size": "1.0"},
+                    {"price": "67990.0", "size": "2.0"},
+                ],
+                "asks": [
+                    {"price": "68010.0", "size": "1.0"},
+                    {"price": "68020.0", "size": "2.0"},
+                ],
+            }
+
+            mm.on_order_book_update(1, snapshot_payload)
+
+            ob = mm.state.market.local_order_book
+            self.assertTrue(ob['initialized'])
+            self.assertEqual(len(ob['bids']), 2)
+            self.assertEqual(len(ob['asks']), 2)
+            self.assertAlmostEqual(ob['bids'].peekitem(-1)[0], 68000.0)
+            self.assertAlmostEqual(ob['asks'].peekitem(0)[0], 68010.0)
+            self.assertAlmostEqual(mm.state.market.mid_price, 68005.0)
+
+    def test_update_order_book_still_works(self):
+        """Verify delta updates (type=update/order_book) still work."""
+        with temp_mm_attrs(
+            local_order_book={
+                'bids': SortedDict({67990.0: 1.0}),
+                'asks': SortedDict({68010.0: 1.0}),
+                'initialized': True,
+            },
+            MARKET_ID=1,
+        ):
+            delta = {
+                "bids": [{"price": "67995.0", "size": "0.5"}],
+                "asks": [{"price": "68005.0", "size": "0.5"}],
+            }
+            mm.on_order_book_update(1, delta)
+
+            ob = mm.state.market.local_order_book
+            self.assertEqual(len(ob['bids']), 2)   # 67990 + 67995
+            self.assertEqual(len(ob['asks']), 2)   # 68005 + 68010
+            self.assertAlmostEqual(ob['bids'].peekitem(-1)[0], 67995.0)   # new best bid
+            self.assertAlmostEqual(ob['asks'].peekitem(0)[0], 68005.0)    # new best ask

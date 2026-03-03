@@ -106,6 +106,15 @@ MAX_LIVE_ORDERS_PER_MARKET = int(os.getenv(
     "MAX_LIVE_ORDERS_PER_MARKET",
     _safety.get("max_live_orders_per_market", 2)))
 
+# Quota recovery config
+_quota_recovery_cfg = _perf.get("quota_recovery", {})
+_QR_ENABLED = bool(_quota_recovery_cfg.get("enabled", True))
+_QR_TRIGGER = int(_quota_recovery_cfg.get("trigger_threshold", 5))
+_QR_TARGET = int(_quota_recovery_cfg.get("target_quota", 50))
+_QR_MAX_ATTEMPTS = int(_quota_recovery_cfg.get("max_attempts", 3))
+_QR_MAX_LOSS = float(_quota_recovery_cfg.get("max_loss_usd", 2.0))
+_QR_COOLDOWN = float(_quota_recovery_cfg.get("cooldown_seconds", 120))
+
 # WebSocket tuning
 WS_PING_INTERVAL = int(os.getenv(
     "WS_PING_INTERVAL",
@@ -791,10 +800,17 @@ _RL_BACKOFF_RESET_AFTER = 2      # consecutive successes before reset
 # State
 _op_timestamps: deque = deque()  # monotonic times of each op sent
 _last_send_time: float = 0.0
-_volume_quota_remaining: int = 1000
+_volume_quota_remaining: Optional[int] = None  # None = unknown until first API response
+_quota_warning_level: str = "ok"  # "ok" | "medium" | "low" | "critical"
 _consecutive_successes: int = 0
 _global_backoff_until: float = 0.0
 _global_backoff_consecutive: int = 0
+
+# Quota recovery state
+_quota_recovery_in_progress: bool = False
+_quota_recovery_last_attempt: float = 0.0  # monotonic time of last recovery
+_trading_start_time: float = 0.0  # set when warmup completes; recovery blocked until grace period elapses
+_QR_POST_WARMUP_GRACE: float = float(_quota_recovery_cfg.get("post_warmup_grace_seconds", 120))
 
 
 def _extract_order_index(order: dict) -> Optional[int]:
@@ -1234,11 +1250,11 @@ async def subscribe_to_market_data(market_id):
         state.market.ws_connection_healthy = True
 
     def _on_message(data):
-        msg_type = data.get("type")
-        if msg_type == "update/order_book":
+        msg_type = data.get("type", "")
+        if msg_type in ("update/order_book", "subscribed/order_book"):
             if 'order_book' in data:
                 on_order_book_update(market_id, data['order_book'])
-        elif msg_type == "update/trade":
+        elif msg_type in ("update/trade", "subscribed/trade"):
             if 'trades' in data:
                 on_trade_update(market_id, data['trades'])
 
@@ -1614,7 +1630,7 @@ def check_websocket_health():
     return True
 
 
-_CAPITAL_STALE_SECONDS = 60.0
+_CAPITAL_STALE_SECONDS = 3600.0  # user_stats WS is event-driven; updates only on balance changes
 
 
 def calculate_dynamic_base_amount(mid_price, capital=None):
@@ -1702,7 +1718,7 @@ def _time_until_ops_free(n: int) -> float:
 def _quota_pace_multiplier() -> float:
     """Return a pacing multiplier based on volume_quota_remaining.
     1.0 = full speed, higher = slower, inf = wait for free slot."""
-    if _volume_quota_remaining >= _RL_QUOTA_HIGH:
+    if _volume_quota_remaining is None or _volume_quota_remaining >= _RL_QUOTA_HIGH:
         return 1.0
     if _volume_quota_remaining >= _RL_QUOTA_MEDIUM:
         return 1.5
@@ -1721,13 +1737,27 @@ def _record_ops_sent(count: int) -> None:
 
 def _update_volume_quota(raw) -> None:
     """Parse volume_quota_remaining from an exchange response."""
-    global _volume_quota_remaining
+    global _volume_quota_remaining, _quota_warning_level
     if raw is None or raw == "?":
         return
     try:
-        _volume_quota_remaining = int(raw)
+        val = int(raw)
     except (TypeError, ValueError):
-        pass
+        return
+    _volume_quota_remaining = val
+
+    if val <= 0 and _quota_warning_level != "critical":
+        logger.warning("QUOTA EXHAUSTED (0 remaining) — free-slot pacing only (1 tx / 15s)")
+        _quota_warning_level = "critical"
+    elif 0 < val < _RL_QUOTA_LOW and _quota_warning_level not in ("critical", "low"):
+        logger.warning("QUOTA LOW: %d remaining (< %d) — 3x pacing", val, _RL_QUOTA_LOW)
+        _quota_warning_level = "low"
+    elif _RL_QUOTA_LOW <= val < _RL_QUOTA_MEDIUM and _quota_warning_level not in ("critical", "low", "medium"):
+        logger.warning("QUOTA MEDIUM: %d remaining (< %d) — 1.5x pacing", val, _RL_QUOTA_MEDIUM)
+        _quota_warning_level = "medium"
+    elif val >= _RL_QUOTA_MEDIUM and _quota_warning_level != "ok":
+        logger.info("QUOTA RECOVERED: %d remaining — full speed", val)
+        _quota_warning_level = "ok"
 
 
 async def _wait_for_write_slot(op_count: int = 4, cancel_only: bool = False) -> bool:
@@ -1749,17 +1779,19 @@ async def _wait_for_write_slot(op_count: int = 4, cancel_only: bool = False) -> 
             # Close to expiry — wait it out
             await asyncio.sleep(remaining)
         else:
+            logger.warning("RATE LIMIT: global backoff active (%.0fs remaining) — skipping cycle", remaining)
             return False
 
     # Phase 2: Sliding window capacity
     avail = _ops_available()
     if avail < op_count:
         wait_time = _time_until_ops_free(op_count)
-        if wait_time > 10.0:
-            logger.debug("Rate limiter: window full, need %.1fs (>10s), skipping", wait_time)
+        if wait_time > 30.0:
+            logger.warning("RATE LIMIT: window full (%d/%d ops), need %.1fs — skipping cycle",
+                           _prune_op_window(), _RL_OPS_PER_WINDOW, wait_time)
             return False
         if wait_time > 0:
-            logger.debug("Rate limiter: waiting %.1fs for %d ops in window", wait_time, op_count)
+            logger.warning("RATE LIMIT: window capacity low, waiting %.1fs for %d ops", wait_time, op_count)
             await asyncio.sleep(wait_time)
 
     # Phase 3: Minimum send-interval floor
@@ -1776,8 +1808,8 @@ async def _wait_for_write_slot(op_count: int = 4, cancel_only: bool = False) -> 
             since_last = time.monotonic() - _last_send_time
             if since_last < _RL_FREE_SLOT_INTERVAL:
                 wait_free = _RL_FREE_SLOT_INTERVAL - since_last
-                logger.debug("Rate limiter: quota low (%d), waiting %.1fs for free slot",
-                             _volume_quota_remaining, wait_free)
+                logger.warning("QUOTA: low (%d remaining), waiting %.1fs for free slot",
+                               _volume_quota_remaining, wait_free)
                 await asyncio.sleep(wait_free)
         elif mult > 1.0:
             # Slow down by stretching the interval
@@ -1816,7 +1848,14 @@ def _reset_global_backoff():
             logger.debug("SDK write succeeded (%d/%d for backoff reset)",
                          _consecutive_successes, _RL_BACKOFF_RESET_AFTER)
 
+def _is_quota_error(exc_or_msg) -> bool:
+    """Return True if the error is specifically a volume-quota exhaustion."""
+    msg = str(exc_or_msg).lower()
+    return "volume quota" in msg or ("quota" in msg and "not enough" in msg)
+
+
 async def cancel_all_orders(client, _retries_left: int = 3):
+    global _volume_quota_remaining
     try:
         async with _sdk_write_lock:
             try:
@@ -1830,19 +1869,169 @@ async def cancel_all_orders(client, _retries_left: int = 3):
                     time=0,
                 )
         if err:
-            if _is_transient_error(Exception(str(err))) and _retries_left > 0:
+            err_str = str(err)
+            if _is_quota_error(err_str):
+                logger.warning("cancel_all_orders: volume quota exhausted — skipping (no retry)")
+                _volume_quota_remaining = 0
+                client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+                return
+            if _is_transient_error(Exception(err_str)) and _retries_left > 0:
                 logger.warning(f"cancel_all_orders hit rate limit (will retry, {_retries_left} left): {err}")
                 await asyncio.sleep(_RL_BACKOFF_BASE)
                 return await cancel_all_orders(client, _retries_left - 1)
             logger.error(f"❌ Failed to cancel all orders: {err}")
         else:
             logger.info("🗑️ Cancelled all orders")
+            if response is not None:
+                _update_volume_quota(getattr(response, 'volume_quota_remaining', None))
     except Exception as e:
+        if _is_quota_error(e):
+            logger.warning("cancel_all_orders: volume quota exhausted — skipping (no retry)")
+            _volume_quota_remaining = 0
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+            return
         if _is_transient_error(e) and _retries_left > 0:
             logger.warning(f"cancel_all_orders hit rate limit (will retry, {_retries_left} left): {e}")
             await asyncio.sleep(_RL_BACKOFF_BASE)
             return await cancel_all_orders(client, _retries_left - 1)
         logger.error(f"❌ Failed to cancel orders: {e}", exc_info=True)
+
+
+async def _attempt_quota_recovery(client) -> bool:
+    """Send small IOC market orders to generate volume and recover quota.
+
+    Returns True if quota reached _QR_TARGET, False otherwise.
+    Safeguards: max attempts, max cumulative loss, PnL monitoring, verify quota increases.
+    """
+    global _quota_recovery_in_progress, _quota_recovery_last_attempt
+
+    # Guard: cooldown
+    if time.monotonic() - _quota_recovery_last_attempt < _QR_COOLDOWN:
+        return False
+    if _quota_recovery_in_progress:
+        return False
+    if _volume_quota_remaining is None:
+        return False  # can't recover if we don't know current quota
+
+    _quota_recovery_in_progress = True
+    _quota_recovery_last_attempt = time.monotonic()
+    cumulative_loss = 0.0
+
+    # Snapshot portfolio value before recovery to detect PnL drop
+    pv_before = state.account.portfolio_value
+
+    try:
+        logger.warning("QUOTA RECOVERY: starting (quota=%d, target=%d)",
+                       _volume_quota_remaining, _QR_TARGET)
+
+        # Refresh nonce to clear any corruption from prior 429s
+        client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+
+        for attempt in range(1, _QR_MAX_ATTEMPTS + 1):
+            # PnL safety check: abort if portfolio value dropped significantly
+            pv_now = state.account.portfolio_value
+            if pv_before is not None and pv_now is not None and pv_before > 0:
+                pnl_drop = pv_before - pv_now
+                if pnl_drop >= _QR_MAX_LOSS:
+                    logger.warning(
+                        "QUOTA RECOVERY: PnL drop $%.2f >= max_loss $%.2f, aborting",
+                        pnl_drop, _QR_MAX_LOSS)
+                    return _volume_quota_remaining >= _QR_TRIGGER
+
+            # Wait for free 15s slot (use 16s for safety margin)
+            since_last = time.monotonic() - _last_send_time
+            free_wait = _RL_FREE_SLOT_INTERVAL + 1.0  # 16s for safety
+            if since_last < free_wait:
+                wait = free_wait - since_last
+                logger.info("QUOTA RECOVERY: waiting %.1fs for free slot", wait)
+                await asyncio.sleep(wait)
+
+            # Determine order direction: reduce position if any, else buy
+            pos = state.account.position_size
+            is_ask = pos > EPSILON  # sell if long, buy if short/flat
+
+            # Use minimum order size
+            min_base = state.config.min_base_amount
+            tick = state.config.amount_tick_float
+            size = max(min_base, tick) if min_base > 0 else tick
+            if size <= 0:
+                logger.warning("QUOTA RECOVERY: cannot determine order size, aborting")
+                return False
+
+            # Get current prices
+            best_bid, best_ask = get_best_prices()
+            mid = state.market.mid_price
+            if not best_bid or not best_ask or not mid or mid <= 0:
+                logger.warning("QUOTA RECOVERY: no orderbook data, aborting")
+                return False
+
+            # IOC market order: use best price (crosses spread for immediate fill)
+            if is_ask:
+                price = best_bid  # sell at best bid
+            else:
+                price = best_ask  # buy at best ask
+
+            raw_price = _to_raw_price(price)
+            raw_size = _to_raw_amount(size)
+            order_id = next_client_order_index()
+
+            logger.info("QUOTA RECOVERY: attempt %d/%d — %s %.6f @ %.2f",
+                        attempt, _QR_MAX_ATTEMPTS,
+                        "SELL" if is_ask else "BUY", size, price)
+
+            old_quota = _volume_quota_remaining
+            try:
+                async with _sdk_write_lock:
+                    _record_ops_sent(1)
+                    tx, response, err = await client.create_market_order(
+                        market_index=state.config.market_id,
+                        client_order_index=order_id,
+                        base_amount=raw_size,
+                        avg_execution_price=raw_price,
+                        is_ask=is_ask,
+                    )
+
+                if err:
+                    logger.warning("QUOTA RECOVERY: order error: %s", err)
+                    return False
+
+                # Extract quota from response
+                if response is not None:
+                    _update_volume_quota(getattr(response, 'volume_quota_remaining', None))
+
+                logger.info("QUOTA RECOVERY: attempt %d — quota %d -> %d",
+                            attempt, old_quota, _volume_quota_remaining)
+
+                # Safety: verify quota actually increased
+                if _volume_quota_remaining <= old_quota:
+                    logger.warning("QUOTA RECOVERY: quota did not increase (%d -> %d), stopping",
+                                   old_quota, _volume_quota_remaining)
+                    return False
+
+                # Safety: track estimated cost (spread crossing + fees)
+                spread_cost = abs(best_ask - best_bid) * size * 0.5
+                fee_estimate = size * mid * 0.001  # ~10bps estimate
+                cumulative_loss += spread_cost + fee_estimate
+                if cumulative_loss >= _QR_MAX_LOSS:
+                    logger.warning("QUOTA RECOVERY: loss limit reached ($%.2f >= $%.2f), stopping",
+                                   cumulative_loss, _QR_MAX_LOSS)
+                    return _volume_quota_remaining >= _QR_TRIGGER  # partial success
+
+                # Check if target reached
+                if _volume_quota_remaining >= _QR_TARGET:
+                    logger.info("QUOTA RECOVERY: target reached (quota=%d), resuming",
+                                _volume_quota_remaining)
+                    return True
+
+            except Exception as e:
+                logger.warning("QUOTA RECOVERY: exception: %s", e, exc_info=True)
+                return False
+
+        logger.warning("QUOTA RECOVERY: max attempts reached (quota=%d)", _volume_quota_remaining)
+        return _volume_quota_remaining >= _QR_TRIGGER
+    finally:
+        _quota_recovery_in_progress = False
+
 
 # === TX WebSocket ===
 
@@ -1867,8 +2056,14 @@ class TxWebSocket:
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_INTERVAL,
             )
+            # Consume the initial "connected" message so send_batch doesn't read it
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=5.0)
+                init_msg = json.loads(raw)
+                logger.info("TxWebSocket connected to %s (init: %s)", self._url, init_msg.get("type", "?"))
+            except asyncio.TimeoutError:
+                logger.info("TxWebSocket connected to %s (no init message)", self._url)
             self._connected = True
-            logger.info("TxWebSocket connected to %s", self._url)
         except Exception as e:
             self._connected = False
             logger.warning("TxWebSocket connect failed: %s", e)
@@ -1906,24 +2101,36 @@ class TxWebSocket:
                 if not self.is_connected:
                     return None
 
+            # SDK sends tx_types/tx_infos as JSON-encoded strings
+            _tx_types_str = json.dumps(tx_types)
+            _tx_infos_str = json.dumps(tx_infos)
+            if isinstance(_tx_types_str, bytes):
+                _tx_types_str = _tx_types_str.decode()
+            if isinstance(_tx_infos_str, bytes):
+                _tx_infos_str = _tx_infos_str.decode()
             msg = {
                 "type": "jsonapi/sendtxbatch",
-                "tx_types": tx_types,
-                "tx_infos": tx_infos,
+                "data": {
+                    "tx_types": _tx_types_str,
+                    "tx_infos": _tx_infos_str,
+                },
             }
             try:
                 await self._ws.send(json.dumps(msg).decode())
-                # Read response — WS responses come on same connection
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
-                data = json.loads(raw)
-                # Skip ping/pong messages while waiting for response
-                attempts = 0
-                while data.get("type") == "ping" and attempts < 5:
-                    await self._ws.send('{"type":"pong"}')
+                # Read response — skip non-response messages (ping, connected, subscribed)
+                _skip_types = {"ping", "connected", "subscribed"}
+                for _ in range(10):
                     raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
                     data = json.loads(raw)
-                    attempts += 1
-                return data
+                    msg_type = data.get("type", "")
+                    if msg_type == "ping":
+                        await self._ws.send('{"type":"pong"}')
+                        continue
+                    if msg_type in _skip_types:
+                        continue
+                    return data
+                logger.warning("TxWebSocket: exhausted skip attempts waiting for batch response")
+                return data  # return last received
             except Exception as e:
                 logger.warning("TxWebSocket send failed (%s); marking disconnected", e)
                 self._connected = False
@@ -1991,10 +2198,46 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
     return ops
 
 
+async def _send_single_op_rest(client, tx_type: int, tx_info, op) -> bool:
+    """Send a single already-signed op via REST sendTx (qualifies for free 15s slot).
+
+    Returns True on success, False on error.
+    """
+    try:
+        resp = await client.send_tx(tx_type=tx_type, tx_info=tx_info)
+        quota_remaining = getattr(resp, 'volume_quota_remaining', None)
+        _update_volume_quota(quota_remaining)
+        logger.info(
+            "REST single-tx OK: %s %s[%d] (quota remaining: %s)",
+            op.action, op.side, op.level, quota_remaining,
+        )
+        _record_order_success()
+        if op.action != "cancel":
+            order_manager.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
+        return True
+    except Exception as e:
+        body = getattr(e, 'body', None) or getattr(e, 'reason', '')
+        logger.warning("REST single-tx error for %s %s[%d]: %s | body=%s",
+                       op.action, op.side, op.level, e, body)
+        if _is_quota_error(e):
+            _update_volume_quota(0)
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+        elif _is_transient_error(e):
+            _trigger_global_backoff()
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+        return False
+
+
 async def sign_and_send_batch(client, ops: list):
     """Sign all BatchOps locally, then send as a single send_tx_batch call."""
     if not ops:
         return
+
+    # Free-slot mode: when quota is 0, send only 1 op via REST sendTx
+    free_slot_mode = _volume_quota_remaining is not None and _volume_quota_remaining <= 0
+    if free_slot_mode:
+        ops = ops[:1]  # only first (highest priority) op
+        logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx")
 
     if logger.isEnabledFor(logging.INFO):
         ops_desc = ", ".join(f"{o.action} {o.side}[{o.level}] @{o.price}" for o in ops)
@@ -2076,6 +2319,20 @@ async def sign_and_send_batch(client, ops: list):
                 target_price=op.price, target_size=op.size,
             )
 
+    # Free-slot mode: send single op via REST sendTx (not batch)
+    if free_slot_mode and len(tx_types) == 1:
+        try:
+            async with _sdk_write_lock:
+                if time.monotonic() < _global_backoff_until:
+                    client.nonce_manager.acknowledge_failure(signed_nonces[0])
+                    return
+                _record_ops_sent(1)
+                await _send_single_op_rest(client, tx_types[0], tx_infos[0], signed_ops[0])
+        except Exception as e:
+            logger.error("Free-slot single send exception: %s", e, exc_info=True)
+            client.nonce_manager.acknowledge_failure(signed_nonces[0])
+        return
+
     try:
         async with _sdk_write_lock:
             if time.monotonic() < _global_backoff_until:
@@ -2092,9 +2349,19 @@ async def sign_and_send_batch(client, ops: list):
 
             if ws_resp is not None:
                 # Parse WS response
-                raw_code = ws_resp.get("code", ws_resp.get("status_code", 0))
+                logger.info("WS batch raw response: %s", ws_resp)
+                # Check for error envelope: {"error": {"code": ..., "message": ...}}
+                ws_error = ws_resp.get("error")
+                if isinstance(ws_error, dict):
+                    raw_code = ws_error.get("code", -1)
+                    message = str(ws_error.get("message", ""))
+                else:
+                    raw_code = ws_resp.get("code", ws_resp.get("status_code", 0))
+                    message = str(ws_resp.get("message", ""))
                 code = int(raw_code) if raw_code is not None else 0
-                message = str(ws_resp.get("message", ws_resp.get("error", "")))
+                # WS uses HTTP-style codes: 200 = success, 0 = success
+                if code == 200:
+                    code = 0
                 quota_remaining = ws_resp.get("volume_quota_remaining", "?")
                 send_method = "WS"
                 _update_volume_quota(quota_remaining)
@@ -2114,7 +2381,15 @@ async def sign_and_send_batch(client, ops: list):
                 "Batch response error (%s): code=%s message=%s (quota_remaining=%s)",
                 send_method, code, err_msg, quota_remaining,
             )
-            if "429" in err_lower or "too many" in err_lower or "quota" in err_lower:
+            if "quota" in err_lower:
+                # Volume quota exhausted — use free 15s slot pacing, not exponential backoff
+                _update_volume_quota(0)
+                logger.warning("Batch hit volume quota limit; switching to free-slot pacing (15s)")
+                for aki in signed_nonces:
+                    client.nonce_manager.acknowledge_failure(aki)
+                client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+                return
+            if "429" in err_lower or "too many" in err_lower:
                 logger.warning("Batch hit 429 rate limit; triggering global backoff")
                 _trigger_global_backoff()
                 for aki in signed_nonces:
@@ -2143,12 +2418,16 @@ async def sign_and_send_batch(client, ops: list):
                 order_manager.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
 
     except Exception as e:
-        logger.error("Batch send_tx_batch exception: %s", e, exc_info=True)
-        if _is_transient_error(e):
-            logger.warning("Batch transient error (429/nonce); triggering global backoff")
-            _trigger_global_backoff()
+        body = getattr(e, 'body', None) or getattr(e, 'reason', '')
+        logger.error("Batch send_tx_batch exception: %s | body=%s", e, body, exc_info=True)
+        if _is_quota_error(e) or _is_transient_error(e):
+            if _is_quota_error(e):
+                _update_volume_quota(0)
+            else:
+                _trigger_global_backoff()
             for aki in signed_nonces:
                 client.nonce_manager.acknowledge_failure(aki)
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
             return
         _record_order_rejection("batch:exception")
 
@@ -2225,10 +2504,19 @@ async def market_making_loop(client):
 
             if not _warmup_complete_logged:
                 _warmup_complete_logged = True
+                global _trading_start_time
+                _trading_start_time = time.monotonic()
                 _calc = state.vol_obi_state.calculator
                 vol_ready = (_calc is not None and _calc.warmed_up)
                 ba = state.binance_alpha
                 binance_ready = ba is None or ba.warmed_up
+                # Refresh capital timestamp — data is valid (no trading during warmup)
+                if state.account.available_capital is not None:
+                    state.account.last_capital_update = time.monotonic()
+                # Reconnect TxWebSocket (may have been dropped during warmup)
+                if _tx_ws is not None and not _tx_ws.is_connected:
+                    logger.info("Reconnecting TxWebSocket after warmup...")
+                    await _tx_ws.connect()
                 logger.info(
                     "Warmup complete (%.0fs). vol_obi ready=%s, binance_alpha ready=%s",
                     WARMUP_SECONDS, vol_ready, binance_ready,
@@ -2312,12 +2600,26 @@ async def market_making_loop(client):
                     bid_spread_pct = (snap_mid - buy_0) / snap_mid * 100 if snap_mid > 0 else 0
                     ask_spread_pct = (sell_0 - snap_mid) / snap_mid * 100 if snap_mid > 0 else 0
                     logger.info(
-                        "QUOTING | Position: %+.4f | Mid: $%.4f | Bid: $%.4f (-%.4f%%) | Ask: $%.4f (+%.4f%%)",
+                        "QUOTING | Position: %+.4f | Mid: $%.4f | Bid: $%.4f (-%.4f%%) | Ask: $%.4f (+%.4f%%) | Quota: %s",
                         snap_position, snap_mid, buy_0, bid_spread_pct, sell_0, ask_spread_pct,
+                        _volume_quota_remaining if _volume_quota_remaining is not None else "?",
                     )
             else:
                 if _log_debug:
                     logger.debug("Could not calculate quotes; skipping refresh.")
+
+            # Quota recovery: if enabled, critically low, NOT in cooldown, and past post-warmup grace
+            if (_QR_ENABLED
+                    and _volume_quota_remaining is not None
+                    and _volume_quota_remaining < _QR_TRIGGER
+                    and not _quota_recovery_in_progress
+                    and time.monotonic() - _quota_recovery_last_attempt >= _QR_COOLDOWN
+                    and time.monotonic() - _trading_start_time >= _QR_POST_WARMUP_GRACE):
+                recovered = await _attempt_quota_recovery(client)
+                if recovered:
+                    logger.info("Quota recovered, resuming normal operations")
+                await asyncio.sleep(MIN_LOOP_INTERVAL)
+                continue  # re-evaluate on next iteration
 
             # Batch all order operations into a single send_tx_batch call
             ops = collect_order_operations(level_prices, base_amount, _log_debug)
@@ -2562,10 +2864,28 @@ async def main():
         return
     logger.info("✅ Client connected successfully")
 
-    # Clean slate: cancel all at startup
-    await cancel_all_orders(client)
+    # Clean slate: cancel all at startup — but skip if no open orders
+    _startup_orders = await _fetch_account_active_orders(client)
+    if _startup_orders is None:
+        # Fetch failed — cancel unconditionally to be safe
+        logger.info("Could not fetch active orders; cancelling all as precaution")
+        await cancel_all_orders(client)
+    elif len(_startup_orders) > 0:
+        logger.info("Found %d open orders at startup — cancelling all", len(_startup_orders))
+        await cancel_all_orders(client)
+    else:
+        logger.info("No open orders at startup — skipping cancel_all (saves quota)")
+    # Record the send time so free-slot timer starts from here
+    global _last_send_time
+    _last_send_time = time.monotonic()
+    logger.info("Startup volume quota: %s remaining",
+                _volume_quota_remaining if _volume_quota_remaining is not None else "unknown")
+    if _volume_quota_remaining is not None and _volume_quota_remaining < _RL_QUOTA_MEDIUM:
+        logger.warning("LOW STARTUP QUOTA: only %d remaining — free-slot mode (1 op per 15s via REST)",
+                       _volume_quota_remaining)
+        # Refresh nonce (quota 429s can corrupt nonce state)
+        client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
     await asyncio.sleep(3)
-
 
     state.market.last_order_book_update = time.monotonic()
 

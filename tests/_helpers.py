@@ -36,6 +36,9 @@ _STATE_MAP = {
     '_op_timestamps':              lambda: (mm, '_op_timestamps'),
     '_volume_quota_remaining':     lambda: (mm, '_volume_quota_remaining'),
     '_consecutive_successes':      lambda: (mm, '_consecutive_successes'),
+    '_quota_warning_level':        lambda: (mm, '_quota_warning_level'),
+    '_quota_recovery_in_progress': lambda: (mm, '_quota_recovery_in_progress'),
+    '_quota_recovery_last_attempt':lambda: (mm, '_quota_recovery_last_attempt'),
 }
 
 
