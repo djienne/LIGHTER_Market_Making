@@ -3,6 +3,7 @@
     "trading": {
         "leverage": 2,
         "margin_mode": "cross",
+        "levels_per_side": 1,
         "base_amount": 0.0002,
         "capital_usage_percent": 0.12,
         "safety_margin_percent": 0.01,
@@ -10,12 +11,13 @@
         "spread_factor_level1": 2.0,
         "order_timeout_seconds": 30.0,
         "position_value_threshold_usd": 11.0,
+        "min_order_value_usd": 14.5,
         "vol_obi": {
             "window_steps": 6000,
             "step_ns": 100000000,
-            "vol_to_half_spread": 32.0,
+            "vol_to_half_spread": 48.0,
             "min_half_spread_bps": 8.0,
-            "c1_ticks": 2.0,
+            "c1_ticks": 20.0,
             "skew": 3.0,
             "looking_depth": 0.025,
             "min_warmup_samples": 100,
@@ -55,6 +57,6 @@
         "max_consecutive_order_rejections": 5,
         "circuit_breaker_cooldown_sec": 60.0,
         "order_reconcile_timeout_sec": 2.0,
-        "max_live_orders_per_market": 8
+        "max_live_orders_per_market": 2
     }
 }
