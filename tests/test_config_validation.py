@@ -60,65 +60,6 @@ class TestLoadConfigParams(unittest.TestCase):
         self.assertEqual(safety.get("max_consecutive_order_rejections", 5), 5)
 
 
-class TestGatherLighterDataConfig(unittest.TestCase):
-    """Tests for gather_lighter_data.py config loading functions."""
-
-    def test_load_full_config_valid(self):
-        """_load_full_config returns parsed dict on valid JSON."""
-        import gather_lighter_data as gd
-
-        cfg = {"CRYPTO_TICKERS": ["SOL"], "performance": {"buffer_seconds": 10}}
-        with patch.object(os.path, "exists", return_value=True):
-            with patch("builtins.open", unittest.mock.mock_open(read_data=json.dumps(cfg))):
-                result = gd._load_full_config()
-        self.assertEqual(result["CRYPTO_TICKERS"], ["SOL"])
-        self.assertEqual(result["performance"]["buffer_seconds"], 10)
-
-    def test_load_full_config_missing_file(self):
-        """_load_full_config returns empty dict when file doesn't exist."""
-        import gather_lighter_data as gd
-
-        with patch.object(os.path, "exists", return_value=False):
-            result = gd._load_full_config()
-        self.assertEqual(result, {})
-
-    def test_load_full_config_invalid_json(self):
-        """_load_full_config returns empty dict on JSON decode error."""
-        import gather_lighter_data as gd
-
-        with patch.object(os.path, "exists", return_value=True):
-            with patch("builtins.open", unittest.mock.mock_open(read_data="not json")):
-                result = gd._load_full_config()
-        self.assertEqual(result, {})
-
-    def test_load_config_returns_tickers(self):
-        """load_config should return the CRYPTO_TICKERS list."""
-        import gather_lighter_data as gd
-
-        with patch.object(gd, "_load_full_config", return_value={"CRYPTO_TICKERS": ["BTC", "ETH"]}):
-            result = gd.load_config()
-        self.assertEqual(result, ["BTC", "ETH"])
-
-    def test_load_config_missing_tickers_returns_defaults(self):
-        """load_config falls back to defaults when CRYPTO_TICKERS is absent."""
-        import gather_lighter_data as gd
-
-        with patch.object(gd, "_load_full_config", return_value={}):
-            result = gd.load_config()
-        # Should return the default tickers list
-        self.assertIsInstance(result, list)
-        self.assertTrue(len(result) > 0)
-
-    def test_load_config_invalid_tickers_returns_defaults(self):
-        """load_config falls back to defaults when CRYPTO_TICKERS is not a list."""
-        import gather_lighter_data as gd
-
-        with patch.object(gd, "_load_full_config", return_value={"CRYPTO_TICKERS": "BTC"}):
-            result = gd.load_config()
-        self.assertIsInstance(result, list)
-        self.assertTrue(len(result) > 0)
-
-
 class TestConfigKeyTypes(unittest.TestCase):
     """Verify that config values are used with correct types by market_maker_v2."""
 

@@ -1,0 +1,71 @@
+[package]
+name = "standx-orderbook"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance market maker for StandX perpetual futures exchange"
+authors = ["StandX Trading"]
+default-run = "standx-orderbook"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "parking_lot"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal precision for financial data
+rust_decimal = { version = "1.33", features = ["serde", "serde-with-str"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Lock-free data structures
+crossbeam-utils = "0.8"
+
+# URL parsing
+url = "2.5"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+
+# Cryptography for authentication
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+sha3 = "0.10"
+bs58 = "0.5"
+rand = "0.8"
+hex = "0.4"
+
+# JWT handling
+base64 = "0.21"
+
+# Fast float parsing (faster than std::str::parse)
+fast-float = "0.2"
+
+# Ordered floats for BTreeMap keys
+ordered-float = "4.0"
+
+# Environment variables
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

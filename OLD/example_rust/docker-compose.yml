@@ -1,0 +1,38 @@
+services:
+  # Production: real trading
+  bot:
+    build: .
+    container_name: standx-market-maker
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
+    stop_grace_period: 30s
+    deploy:
+      ressources:
+        limits:
+          cpus: '1.0'
+          memory: '300m'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Test: connection check, no orders
+  bot-test:
+    build: .
+    container_name: standx-market-maker-test
+    profiles:
+      - test
+    env_file: .env
+    volumes:
+      - ./config.test.json:/app/config.json:ro
+      - ./data:/app/data
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

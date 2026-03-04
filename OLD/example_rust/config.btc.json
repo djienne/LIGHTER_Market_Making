@@ -1,0 +1,47 @@
+{
+  "symbols": ["BTC-USD"],
+  "orderbook_levels": 20,
+  "history_minutes": 10,
+  "history_buffer_size": 100000,
+  "debug": true,
+  "verbose": false,
+  "stats_interval_secs": 30,
+  "websocket": {
+    "url": "wss://perps.standx.com/ws-stream/v1",
+    "api_url": "wss://perps.standx.com/ws-api/v1",
+    "reconnect_delay_secs": 5,
+    "max_reconnect_delay_secs": 60,
+    "connect_timeout_secs": 30,
+    "stale_timeout_secs": 60
+  },
+  "strategy": {
+    "min_order_qty_dollar": 10.0,
+    "step_ns": 100000000,
+    "window_steps": 6000,
+    "update_interval_steps": 1,
+    "vol_to_half_spread": 4.6,
+    "half_spread": 0.0,
+    "half_spread_bps": 0.0,
+    "min_half_spread_bps": 1.0,
+    "skew": 0.5,
+    "c1_ticks": 943.0,
+    "looking_depth": 0.025,
+    "order_levels": 2,
+    "spread_level_multiplier": 2.0
+  },
+  "order": {
+    "enabled": true,
+    "reprice_threshold_bps": 1.0,
+    "pending_timeout_secs": 30
+  },
+  "pnl_tracking": {
+    "enabled": true,
+    "poll_interval_secs": 60,
+    "csv_path": "wallet_history.csv"
+  },
+  "orderbook_sanity_check": {
+    "enabled": true,
+    "interval_secs": 2,
+    "drift_threshold_bps": 2.0
+  }
+}
