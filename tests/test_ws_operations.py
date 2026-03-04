@@ -308,6 +308,7 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=mock_tx_ws, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, [op])
 
@@ -326,6 +327,7 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, [op])
 
@@ -529,6 +531,7 @@ class TestSignAndSendBatchErrors(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, [op])
 
@@ -546,6 +549,7 @@ class TestSignAndSendBatchErrors(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, ops)
 
@@ -561,6 +565,7 @@ class TestSignAndSendBatchErrors(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             with patch.object(mm, "_trigger_global_backoff") as mock_backoff:
                 await mm.sign_and_send_batch(client, [op])
@@ -574,6 +579,7 @@ class TestSignAndSendBatchErrors(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, [op])
 
@@ -964,6 +970,7 @@ class TestBatchPartialSignFailure(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, [op1, op2])
 
@@ -995,6 +1002,7 @@ class TestBatchWsDisconnectedFallback(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=mock_tx_ws, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
         ):
             await mm.sign_and_send_batch(client, [op])
 

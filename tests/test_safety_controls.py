@@ -27,7 +27,8 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)
 
-    def test_reconcile_rebinds_single_remote_order_per_side(self):
+    def test_reconcile_cancels_untracked_remote_orders(self):
+        """Untracked remote orders are flagged as unknown (not rebound)."""
         original_risk = mm.RiskState(**vars(mm.state.risk))
         try:
             with temp_mm_attrs(
@@ -55,12 +56,12 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
                     },
                 ]
                 ok, unknown_ids = mm._reconcile_local_orders_with_remote_orders(remote, source="unit")
-                # Rebind indicates state drift was detected, so ok=False is expected.
                 self.assertFalse(ok)
-                self.assertEqual(mm.current_bid_order_id, 501)
-                self.assertEqual(mm.current_ask_order_id, 601)
-                self.assertAlmostEqual(mm.current_bid_price, 100.5)
-                self.assertAlmostEqual(mm.current_ask_price, 101.5)
+                # Orders should NOT be rebound — they should be unknown
+                self.assertIsNone(mm.state.orders.bid_order_ids[0])
+                self.assertIsNone(mm.state.orders.ask_order_ids[0])
+                # Both exchange order_indexes should be in unknown_ids for cancellation
+                self.assertEqual(unknown_ids, {501, 601})
         finally:
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)

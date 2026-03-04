@@ -1,0 +1,12 @@
+# Environment variables and secrets
+.env
+
+# Rust build artifacts
+target/
+
+# IDE
+.idea/
+.vscode/
+
+# Data files
+wallet_history.csv

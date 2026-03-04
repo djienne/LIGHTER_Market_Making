@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+
+# Secrets and credentials
+.env
+
+# Data files
+*.csv
+
+# Version control
+.git/
+.gitignore
+
+# Documentation
+*.md
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

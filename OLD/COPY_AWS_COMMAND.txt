@@ -1,0 +1,3 @@
+scp -i lighter.pem .\lighter_MM.zip ubuntu@54.95.246.213:/home/ubuntu/
+
+ssh -i lighter.pem ubuntu@54.95.246.213

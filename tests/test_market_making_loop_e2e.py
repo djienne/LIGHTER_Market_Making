@@ -279,7 +279,7 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
         async def _controlled_sleep(seconds):
             nonlocal cycle
             cycle += 1
-            if cycle >= 3:
+            if cycle >= 8:
                 raise KeyboardInterrupt
 
         try:
