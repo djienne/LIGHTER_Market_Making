@@ -72,16 +72,12 @@ BASE_AMOUNT = float(os.getenv(
 CAPITAL_USAGE_PERCENT = float(os.getenv(
     "CAPITAL_USAGE_PERCENT",
     _trading.get("capital_usage_percent", 0.12)))
-SAFETY_MARGIN_PERCENT = float(os.getenv(
-    "SAFETY_MARGIN_PERCENT",
-    _trading.get("safety_margin_percent", 0.01)))
 ORDER_TIMEOUT = float(os.getenv(
     "ORDER_TIMEOUT",
     _trading.get("order_timeout_seconds", 5.0)))
-MINIMUM_SPREAD_PERCENT = float(os.getenv(
-    "MINIMUM_SPREAD_PERCENT",
-    _trading.get("minimum_spread_percent", 0.005)))
-QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv("QUOTE_UPDATE_THRESHOLD_BPS", "10.0"))  # 10 bps
+DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv(
+    "DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS",
+    _trading.get("default_quote_update_threshold_bps", 10.0)))
 SPREAD_FACTOR_LEVEL1 = float(os.getenv(
     "SPREAD_FACTOR_LEVEL1",
     _trading.get("spread_factor_level1", 2.0)))
@@ -776,7 +772,7 @@ def _is_transient_error(exc: Exception) -> bool:
     """Return True for rate-limit (429) and nonce errors that should NOT
     trigger the circuit breaker — just a temporary backoff."""
     msg = str(exc).lower()
-    return "429" in msg or "too many" in msg or "quota" in msg or "invalid nonce" in msg
+    return "429" in msg or "too many" in msg or ("not enough" in msg and "quota" in msg) or "invalid nonce" in msg
 
 # ---------------------------------------------------------------------------
 # Adaptive rate limiter: sliding-window token bucket
@@ -1721,6 +1717,18 @@ def _quota_pace_multiplier() -> float:
     return float('inf')  # wait for free 15s slot
 
 
+def _adaptive_threshold_bps() -> float:
+    """Return quote update threshold (bps) scaled by quota pressure."""
+    base = DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS
+    if _volume_quota_remaining is None or _volume_quota_remaining >= _RL_QUOTA_HIGH:
+        return base          # >= 500: normal
+    if _volume_quota_remaining >= _RL_QUOTA_MEDIUM:
+        return base * 2.0    # 50-499: 2x
+    if _volume_quota_remaining >= _RL_QUOTA_LOW:
+        return base * 3.5    # 10-49: 3.5x
+    return base * 5.0        # 0-9: 5x
+
+
 def _record_ops_sent(count: int) -> None:
     """Record *count* operations sent at the current time."""
     global _last_send_time
@@ -1845,7 +1853,7 @@ def _reset_global_backoff():
 def _is_quota_error(exc_or_msg) -> bool:
     """Return True if the error is specifically a volume-quota exhaustion."""
     msg = str(exc_or_msg).lower()
-    return "volume quota" in msg or ("quota" in msg and "not enough" in msg)
+    return ("not enough" in msg and "quota" in msg) or ("quota" in msg and "exhausted" in msg)
 
 
 async def cancel_all_orders(client, _retries_left: int = 3):
@@ -2049,16 +2057,19 @@ class TxWebSocket:
         self._ws = None
         self._lock = asyncio.Lock()
         self._connected = False
+        self._recv_queue: asyncio.Queue = asyncio.Queue()
+        self._recv_task: Optional[asyncio.Task] = None
 
     async def connect(self) -> None:
         """Establish (or re-establish) the WS connection."""
+        await self._stop_recv_loop()
         try:
             self._ws = await websockets.connect(
                 self._url,
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_INTERVAL,
             )
-            # Consume the initial "connected" message so send_batch doesn't read it
+            # Consume the initial "connected" message so recv_loop doesn't queue it
             try:
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=5.0)
                 init_msg = json.loads(raw)
@@ -2066,6 +2077,14 @@ class TxWebSocket:
             except asyncio.TimeoutError:
                 logger.info("TxWebSocket connected to %s (no init message)", self._url)
             self._connected = True
+            # Drain stale messages from previous connection
+            while not self._recv_queue.empty():
+                try:
+                    self._recv_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            # Start background recv loop
+            self._recv_task = asyncio.create_task(self._recv_loop())
         except Exception as e:
             self._connected = False
             logger.warning("TxWebSocket connect failed: %s", e)
@@ -2073,6 +2092,7 @@ class TxWebSocket:
     async def close(self) -> None:
         """Close the WS connection."""
         self._connected = False
+        await self._stop_recv_loop()
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -2088,6 +2108,41 @@ class TxWebSocket:
             return self._ws.state.name == "OPEN"
         except Exception:
             return False
+
+    async def _recv_loop(self) -> None:
+        """Background task: read from WS, respond to app-level pings, queue responses."""
+        _info_types = {"connected", "subscribed"}
+        try:
+            while True:
+                raw = await self._ws.recv()
+                data = json.loads(raw)
+                msg_type = data.get("type", "")
+                if msg_type == "ping":
+                    try:
+                        await self._ws.send('{"type":"pong"}')
+                    except Exception:
+                        break
+                elif msg_type in _info_types:
+                    pass  # drop informational messages
+                else:
+                    await self._recv_queue.put(data)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("TxWebSocket _recv_loop exited: %s", e)
+        # Connection lost — signal any waiting send_batch()
+        self._connected = False
+        await self._recv_queue.put(None)
+
+    async def _stop_recv_loop(self) -> None:
+        """Cancel the background recv task if running."""
+        if self._recv_task is not None:
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._recv_task = None
 
     async def send_batch(self, tx_types: list, tx_infos: list) -> Optional[dict]:
         """Send a transaction batch via WS and return the parsed response.
@@ -2110,34 +2165,47 @@ class TxWebSocket:
                 _tx_types_str = _tx_types_str.decode()
             if isinstance(_tx_infos_str, bytes):
                 _tx_infos_str = _tx_infos_str.decode()
-            msg = {
+            msg_str = json.dumps({
                 "type": "jsonapi/sendtxbatch",
                 "data": {
                     "tx_types": _tx_types_str,
                     "tx_infos": _tx_infos_str,
                 },
-            }
+            })
+            if isinstance(msg_str, bytes):
+                msg_str = msg_str.decode()
+
+            async def _send_and_recv() -> Optional[dict]:
+                """Send batch message and read response from recv queue."""
+                await self._ws.send(msg_str)
+                resp = await asyncio.wait_for(self._recv_queue.get(), timeout=10.0)
+                if resp is None:
+                    # Sentinel — connection lost
+                    return None
+                return resp
+
             try:
-                await self._ws.send(json.dumps(msg).decode())
-                # Read response — skip non-response messages (ping, connected, subscribed)
-                _skip_types = {"ping", "connected", "subscribed"}
-                for _ in range(10):
-                    raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
-                    data = json.loads(raw)
-                    msg_type = data.get("type", "")
-                    if msg_type == "ping":
-                        await self._ws.send('{"type":"pong"}')
-                        continue
-                    if msg_type in _skip_types:
-                        continue
-                    return data
-                logger.warning("TxWebSocket: exhausted skip attempts waiting for batch response")
-                return data  # return last received
+                resp = await _send_and_recv()
+                if resp is not None:
+                    return resp
+                # Connection was lost (sentinel) — reconnect and retry once
+                logger.warning("TxWebSocket connection lost; reconnecting and retrying once")
+                await self.connect()
+                if not self.is_connected:
+                    return None
+                return await _send_and_recv()
             except Exception as e:
-                logger.warning("TxWebSocket send failed (%s); marking disconnected", e)
+                logger.warning("TxWebSocket send failed (%s); reconnecting and retrying once", e)
                 self._connected = False
-                self._ws = None
-                return None
+                try:
+                    await self.connect()
+                    if not self.is_connected:
+                        return None
+                    return await _send_and_recv()
+                except Exception as e2:
+                    logger.warning("TxWebSocket retry also failed (%s); falling back to REST", e2)
+                    self._connected = False
+                    return None
 
 
 # Module-level TxWebSocket instance (initialized in main())
@@ -2171,15 +2239,16 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
 
             if existing_id is not None and existing_price is not None:
                 change_bps = price_change_bps(existing_price, new_price)
-                if change_bps <= QUOTE_UPDATE_THRESHOLD_BPS:
+                effective_threshold = _adaptive_threshold_bps()
+                if change_bps <= effective_threshold:
                     order_manager.mark_status(
                         side, SideStatus.LIVE, level=level,
                         target_price=new_price, target_size=new_size,
                     )
                     if _log_debug:
                         logger.debug(
-                            "Keeping %s[%d]: change %.2f bps <= %.2f",
-                            side, level, change_bps, QUOTE_UPDATE_THRESHOLD_BPS,
+                            "Keeping %s[%d]: change %.2f bps <= %.2f (adaptive)",
+                            side, level, change_bps, effective_threshold,
                         )
                     continue
                 # Price moved enough — modify existing order
@@ -2395,6 +2464,9 @@ async def sign_and_send_batch(client, ops: list):
                 quota_remaining = resp.volume_quota_remaining
                 send_method = "REST"
                 _update_volume_quota(quota_remaining)
+                # Normalize REST code like WS: 200 = success
+                if code == 200:
+                    code = 0
 
         if code != 0:
             err_msg = message or f"code={code}"
@@ -2403,7 +2475,7 @@ async def sign_and_send_batch(client, ops: list):
                 "Batch response error (%s): code=%s message=%s (quota_remaining=%s)",
                 send_method, code, err_msg, quota_remaining,
             )
-            if "quota" in err_lower:
+            if "quota" in err_lower and "remained" not in err_lower and "didn't use" not in err_lower:
                 # Volume quota exhausted — use free 15s slot pacing, not exponential backoff
                 _update_volume_quota(0)
                 logger.warning("Batch hit volume quota limit; switching to free-slot pacing (15s)")
@@ -2622,9 +2694,10 @@ async def market_making_loop(client):
                     bid_spread_pct = (snap_mid - buy_0) / snap_mid * 100 if snap_mid > 0 else 0
                     ask_spread_pct = (sell_0 - snap_mid) / snap_mid * 100 if snap_mid > 0 else 0
                     logger.info(
-                        "QUOTING | Position: %+.4f | Mid: $%.4f | Bid: $%.4f (-%.4f%%) | Ask: $%.4f (+%.4f%%) | Quota: %s",
+                        "QUOTING | Position: %+.4f | Mid: $%.4f | Bid: $%.4f (-%.4f%%) | Ask: $%.4f (+%.4f%%) | Quota: %s | Thr: %.0fbp",
                         snap_position, snap_mid, buy_0, bid_spread_pct, sell_0, ask_spread_pct,
                         _volume_quota_remaining if _volume_quota_remaining is not None else "?",
+                        _adaptive_threshold_bps(),
                     )
             else:
                 if _log_debug:

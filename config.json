@@ -1,13 +1,12 @@
 {
-    "CRYPTO_TICKERS": ["BTC"],
     "trading": {
         "leverage": 2,
         "margin_mode": "cross",
         "levels_per_side": 1,
         "base_amount": 0.0002,
         "capital_usage_percent": 0.12,
-        "safety_margin_percent": 0.01,
-        "minimum_spread_percent": 0.005,
+        "default_quote_update_threshold_bps": 10.0,
+        "_comment_threshold": "base value at full quota; adaptive system widens under quota pressure",
         "spread_factor_level1": 2.0,
         "order_timeout_seconds": 30.0,
         "position_value_threshold_usd": 11.0,
@@ -35,19 +34,20 @@
     "performance": {
         "min_loop_interval": 0.1,
         "rate_limit_send_interval": 0.1,
-        "buffer_seconds": 5,
         "quota_recovery": {
             "enabled": true,
             "trigger_threshold": 5,
             "target_quota": 50,
             "max_attempts": 3,
             "max_loss_usd": 2.0,
-            "cooldown_seconds": 120
+            "cooldown_seconds": 120,
+            "post_warmup_grace_seconds": 120
         }
     },
     "websocket": {
         "ping_interval": 20,
         "recv_timeout": 30.0,
+        "account_recv_timeout": 300.0,
         "reconnect_base_delay": 5,
         "reconnect_max_delay": 60
     },
