@@ -60,6 +60,7 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", _trading.get("margin_mode", "cross"))
 POSITION_VALUE_THRESHOLD_USD = float(os.getenv(
     "POSITION_VALUE_THRESHOLD_USD",
     _trading.get("position_value_threshold_usd", 15.0)))
+MIN_ORDER_VALUE_USD = float(_trading.get("min_order_value_usd", 14.5))
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -80,7 +81,7 @@ ORDER_TIMEOUT = float(os.getenv(
 MINIMUM_SPREAD_PERCENT = float(os.getenv(
     "MINIMUM_SPREAD_PERCENT",
     _trading.get("minimum_spread_percent", 0.005)))
-QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv("QUOTE_UPDATE_THRESHOLD_BPS", "5.0"))  # 5 bps
+QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv("QUOTE_UPDATE_THRESHOLD_BPS", "10.0"))  # 10 bps
 SPREAD_FACTOR_LEVEL1 = float(os.getenv(
     "SPREAD_FACTOR_LEVEL1",
     _trading.get("spread_factor_level1", 2.0)))
@@ -311,7 +312,7 @@ for _sub_logger_name in ('binance_obi', 'vol_obi', 'ws_manager', 'orderbook_sani
 # =========================
 # State objects
 # =========================
-NUM_LEVELS = 2  # number of order levels per side
+NUM_LEVELS = int(_trading.get("levels_per_side", 2))  # number of order levels per side
 
 
 @dataclass
@@ -1015,26 +1016,13 @@ def _reconcile_local_orders_with_remote_orders(
             mismatch_reasons.append(f"missing_local_ask[{lvl}]:{ask_id}")
             order_manager.clear_live("sell", lvl)
 
-    side_orders: dict[str, list[dict]] = {"buy": [], "sell": []}
-    for order in remote_orders:
-        is_ask = _extract_order_is_ask(order)
-        if is_ask is None:
-            continue
-        side_orders["sell" if is_ask else "buy"].append(order)
-
-    # Rebind untracked remote orders to empty local slots (best-effort)
-    for side_key, id_list in [("buy", orders.bid_order_ids), ("sell", orders.ask_order_ids)]:
-        empty_slots = [lvl for lvl in range(NUM_LEVELS) if id_list[lvl] is None]
-        tracked = {oid for oid in id_list if oid is not None}
-        untracked = [o for o in side_orders[side_key]
-                     if _extract_client_order_index(o) not in tracked]
-        for slot, order in zip(empty_slots, untracked):
-            cid = _extract_client_order_index(order)
-            price = _extract_order_price(order)
-            size = _extract_order_size(order)
-            if cid is not None and price is not None and size is not None:
-                mismatch_reasons.append(f"rebind_{side_key}[{slot}]:{cid}")
-                order_manager.bind_live(side_key, cid, price, size, level=slot)
+    # NOTE: We intentionally do NOT rebind untracked remote orders to empty
+    # local slots.  Rebinding creates a race condition: if the main loop has
+    # already prepared a "create" op for the empty slot (between
+    # collect_order_operations and sign_and_send_batch), the rebound order
+    # becomes orphaned on the exchange.  Instead, untracked orders fall through
+    # to the unknown_live_ids check and get cancelled; the main loop will
+    # recreate what's needed on its next iteration.
 
     tracked_ids = {
         oid
@@ -1676,6 +1664,12 @@ def calculate_dynamic_base_amount(mid_price, capital=None):
             if state.config.amount_tick_float > 0:
                 size = math.ceil(size / state.config.amount_tick_float) * state.config.amount_tick_float
 
+        # Enforce minimum order value for quota generation (each $7 volume = +1 quota point)
+        if MIN_ORDER_VALUE_USD > 0 and size * mid_price < MIN_ORDER_VALUE_USD:
+            size = MIN_ORDER_VALUE_USD / mid_price
+            if state.config.amount_tick_float > 0:
+                size = math.ceil(size / state.config.amount_tick_float) * state.config.amount_tick_float
+
         state.account._cached_base_amount = size
         state.account._cached_base_amount_inputs = cache_key
         return size
@@ -1871,9 +1865,13 @@ async def cancel_all_orders(client, _retries_left: int = 3):
         if err:
             err_str = str(err)
             if _is_quota_error(err_str):
-                logger.warning("cancel_all_orders: volume quota exhausted — skipping (no retry)")
                 _volume_quota_remaining = 0
                 client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+                if _retries_left > 0:
+                    logger.warning("cancel_all_orders: quota exhausted — waiting 16s for free slot then retrying (%d left)", _retries_left)
+                    await asyncio.sleep(16)
+                    return await cancel_all_orders(client, _retries_left - 1)
+                logger.warning("cancel_all_orders: quota exhausted — no retries left, skipping")
                 return
             if _is_transient_error(Exception(err_str)) and _retries_left > 0:
                 logger.warning(f"cancel_all_orders hit rate limit (will retry, {_retries_left} left): {err}")
@@ -1886,9 +1884,13 @@ async def cancel_all_orders(client, _retries_left: int = 3):
                 _update_volume_quota(getattr(response, 'volume_quota_remaining', None))
     except Exception as e:
         if _is_quota_error(e):
-            logger.warning("cancel_all_orders: volume quota exhausted — skipping (no retry)")
             _volume_quota_remaining = 0
             client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+            if _retries_left > 0:
+                logger.warning("cancel_all_orders: quota exhausted — waiting 16s for free slot then retrying (%d left)", _retries_left)
+                await asyncio.sleep(16)
+                return await cancel_all_orders(client, _retries_left - 1)
+            logger.warning("cancel_all_orders: quota exhausted — no retries left, skipping")
             return
         if _is_transient_error(e) and _retries_left > 0:
             logger.warning(f"cancel_all_orders hit rate limit (will retry, {_retries_left} left): {e}")
@@ -2238,6 +2240,26 @@ async def sign_and_send_batch(client, ops: list):
     if free_slot_mode:
         ops = ops[:1]  # only first (highest priority) op
         logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx")
+
+    # Safety: drop create ops whose slot got filled since collect_order_operations
+    # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
+    # orphaning the order that now occupies the slot.
+    orders = state.orders
+    safe_ops = []
+    for op in ops:
+        if op.action == "create":
+            slot_id = (orders.bid_order_ids[op.level] if op.side == "buy"
+                       else orders.ask_order_ids[op.level])
+            if slot_id is not None:
+                logger.warning(
+                    "Dropping stale create %s[%d]: slot already has order %d",
+                    op.side, op.level, slot_id,
+                )
+                continue
+        safe_ops.append(op)
+    ops = safe_ops
+    if not ops:
+        return
 
     if logger.isEnabledFor(logging.INFO):
         ops_desc = ", ".join(f"{o.action} {o.side}[{o.level}] @{o.price}" for o in ops)
