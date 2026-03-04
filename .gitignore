@@ -8,3 +8,7 @@ data/
 logs/
 *.parquet
 .pytest_cache/
+*.pem
+*.zip
+bot.log
+lighter_data/
