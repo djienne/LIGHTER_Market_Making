@@ -2,7 +2,7 @@
 
 Automated two-sided market maker for [Lighter](https://lighter.xyz) perpetual futures. Spread width is driven by realized volatility, and an order-book imbalance (OBI) signal computed from Binance's order book serves as the alpha factor to bias quotes ahead of anticipated moves. Inventory skew tilts quotes to mean-revert position toward zero.
 
-Affiliate link: [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees (100% kickback with this link).
+Affiliate link to support this project: [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees (100% kickback with this link).
 
 ## Quick Start
 
@@ -169,3 +169,4 @@ pytest tests/ -v
 ## Risk Warning
 
 This is experimental trading software. It will likely lose money and is not competitive with professional market makers. Always start with small amounts and understand the risks of automated trading.
+
