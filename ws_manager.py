@@ -87,16 +87,43 @@ async def ws_subscribe(
                 backoff = reconnect_base  # reset on successful connect
 
                 while True:
-                    # Check if an external caller requested a reconnect
-                    if reconnect_event is not None and reconnect_event.is_set():
-                        reconnect_event.clear()
-                        logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
-                        if on_disconnect:
-                            on_disconnect()
-                        break
-
+                    recv_task = asyncio.create_task(ws.recv())
+                    event_task = None
+                    wait_set = {recv_task}
+                    if reconnect_event is not None:
+                        event_task = asyncio.create_task(reconnect_event.wait())
+                        wait_set.add(event_task)
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
+                        done, pending = await asyncio.wait(
+                            wait_set,
+                            timeout=recv_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in pending:
+                            task.cancel()
+                        for task in pending:
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+
+                        if not done:
+                            logger.warning(
+                                f"{label} WebSocket watchdog triggered "
+                                f"(no data for {recv_timeout}s). Reconnecting..."
+                            )
+                            if on_disconnect:
+                                on_disconnect()
+                            break
+
+                        if event_task is not None and event_task in done and reconnect_event.is_set():
+                            reconnect_event.clear()
+                            logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
+                            if on_disconnect:
+                                on_disconnect()
+                            break
+
+                        message = recv_task.result()
                         try:
                             data = _loads(message)
                             msg_type = data.get("type")
@@ -110,14 +137,14 @@ async def ws_subscribe(
                         except (ValueError, TypeError):
                             logger.warning(f"Failed to decode JSON from {label}: {message}")
 
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            f"{label} WebSocket watchdog triggered "
-                            f"(no data for {recv_timeout}s). Reconnecting..."
-                        )
-                        if on_disconnect:
-                            on_disconnect()
-                        break
+                    finally:
+                        for task in (recv_task, event_task):
+                            if task is not None and not task.done():
+                                task.cancel()
+                                try:
+                                    await task
+                                except asyncio.CancelledError:
+                                    pass
 
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
             logger.info(f"{label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")

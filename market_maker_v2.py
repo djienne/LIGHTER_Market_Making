@@ -78,6 +78,7 @@ ORDER_TIMEOUT = float(os.getenv(
 DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv(
     "DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS",
     _trading.get("default_quote_update_threshold_bps", 10.0)))
+QUOTE_UPDATE_THRESHOLD_BPS = DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS  # backward-compatible alias
 SPREAD_FACTOR_LEVEL1 = float(os.getenv(
     "SPREAD_FACTOR_LEVEL1",
     _trading.get("spread_factor_level1", 2.0)))
@@ -856,14 +857,9 @@ def _update_id_mapping_from_orders(orders: list[dict]) -> None:
         _client_to_exchange_id.update(to_keep)
 
 
-def _resolve_exchange_id(client_id: int) -> int:
-    """Look up exchange order_index for a client_order_index.
-
-    Falls back to the input value itself (safe because exchange order_index
-    values are small sequential ints and never collide with client_order_index
-    which are derived from time.time_ns() % 2^48).
-    """
-    return _client_to_exchange_id.get(client_id, client_id)
+def _resolve_exchange_id(client_id: int) -> Optional[int]:
+    """Look up exchange order_index for a client_order_index."""
+    return _client_to_exchange_id.get(client_id)
 
 
 def _extract_order_is_ask(order: dict) -> Optional[bool]:
@@ -910,6 +906,72 @@ def _extract_order_size(order: dict) -> Optional[float]:
         return size if size > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _has_exchange_id(client_id: Optional[int]) -> bool:
+    return client_id is not None and client_id in _client_to_exchange_id
+
+
+def _size_change_requires_update(existing_size: Optional[float], new_size: Optional[float]) -> bool:
+    if new_size is None:
+        return False
+    if existing_size is None:
+        return True
+    tick = state.config.amount_tick_float
+    tolerance = tick if tick > 0 else EPSILON
+    return abs(existing_size - new_size) >= max(tolerance, EPSILON)
+
+
+def _sync_tracked_order_from_remote(side: str, level: int, order: dict) -> None:
+    cid = _extract_client_order_index(order)
+    if cid is None:
+        return
+
+    is_ask = _extract_order_is_ask(order)
+    if side == "buy" and is_ask is True:
+        return
+    if side == "sell" and is_ask is False:
+        return
+
+    if side == "buy":
+        current_price = state.orders.bid_prices[level]
+        current_size = state.orders.bid_sizes[level]
+    else:
+        current_price = state.orders.ask_prices[level]
+        current_size = state.orders.ask_sizes[level]
+
+    price = _extract_order_price(order)
+    size = _extract_order_size(order)
+    if price is None:
+        price = current_price
+    if size is None:
+        size = current_size
+    if price is None or size is None:
+        order_manager.mark_status(side, SideStatus.LIVE, level=level)
+        return
+    order_manager.bind_live(side, cid, price, size, level=level)
+
+
+def _refresh_local_orders_from_remote_orders(remote_orders: list[dict]) -> None:
+    remote_by_client: dict[int, dict] = {}
+    for order in remote_orders:
+        cid = _extract_client_order_index(order)
+        if cid is not None:
+            remote_by_client[cid] = order
+
+    orders = state.orders
+    for level in range(NUM_LEVELS):
+        bid_id = orders.bid_order_ids[level]
+        if bid_id is not None and bid_id in remote_by_client:
+            _sync_tracked_order_from_remote("buy", level, remote_by_client[bid_id])
+        ask_id = orders.ask_order_ids[level]
+        if ask_id is not None and ask_id in remote_by_client:
+            _sync_tracked_order_from_remote("sell", level, remote_by_client[ask_id])
+
+
+def _has_live_local_orders() -> bool:
+    orders = state.orders
+    return any(oid is not None for oid in (*orders.bid_order_ids, *orders.ask_order_ids))
 
 
 def _orders_to_live_client_id_set(orders: list[dict]) -> set[int]:
@@ -1011,6 +1073,8 @@ def _reconcile_local_orders_with_remote_orders(
         if ask_id is not None and ask_id not in live_client_ids:
             mismatch_reasons.append(f"missing_local_ask[{lvl}]:{ask_id}")
             order_manager.clear_live("sell", lvl)
+
+    _refresh_local_orders_from_remote_orders(remote_orders)
 
     # NOTE: We intentionally do NOT rebind untracked remote orders to empty
     # local slots.  Rebinding creates a race condition: if the main loop has
@@ -1448,15 +1512,15 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
             # --- SNAPSHOT (first message after subscribe) ---
             _account_orders_ws_ready = True
             _account_orders_ws_connected.set()
+            live_orders = [o for o in raw if o.get("status", "open") in LIVE]
             active_client_ids: set[int] = set()
-            for o in raw:
-                if o.get("status", "open") in LIVE:
-                    cid = o.get("client_order_index")
-                    if cid is not None:
-                        try:
-                            active_client_ids.add(int(cid))
-                        except (TypeError, ValueError):
-                            pass
+            for o in live_orders:
+                cid = o.get("client_order_index")
+                if cid is not None:
+                    try:
+                        active_client_ids.add(int(cid))
+                    except (TypeError, ValueError):
+                        pass
             logger.info("account_orders WS ready (snapshot) — %d live orders for market %d",
                         len(active_client_ids), market_id)
 
@@ -1472,6 +1536,7 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
                     logger.info("Ask[%d] %d not in WS snapshot — clearing", lvl, ask_id)
                     order_manager.clear_live("sell", lvl)
 
+            _refresh_local_orders_from_remote_orders(live_orders)
             risk_controller.mark_reconcile(ok=True, reason="account_orders_ws_snapshot")
             return
 
@@ -1480,6 +1545,7 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
         # Do NOT assume absence means cancellation (the message only
         # contains the changed order, not all orders).
         orders = state.orders
+        live_orders = []
         for o in raw:
             cid_raw = o.get("client_order_index")
             if cid_raw is None:
@@ -1512,6 +1578,11 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
                             evt2.set()
                     except (TypeError, ValueError):
                         pass
+            else:
+                live_orders.append(o)
+
+        if live_orders:
+            _refresh_local_orders_from_remote_orders(live_orders)
 
         # Account-orders feed is authoritative for "what is still alive".
         risk_controller.mark_reconcile(ok=True, reason="account_orders_ws")
@@ -1719,7 +1790,7 @@ def _quota_pace_multiplier() -> float:
 
 def _adaptive_threshold_bps() -> float:
     """Return quote update threshold (bps) scaled by quota pressure."""
-    base = DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS
+    base = QUOTE_UPDATE_THRESHOLD_BPS
     if _volume_quota_remaining is None or _volume_quota_remaining >= _RL_QUOTA_HIGH:
         return base          # >= 500: normal
     if _volume_quota_remaining >= _RL_QUOTA_MEDIUM:
@@ -2220,6 +2291,7 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
     """
     ops = []
     orders = state.orders
+    effective_threshold = _adaptive_threshold_bps()
     for level, (buy_price, sell_price) in enumerate(level_prices):
         for is_buy, new_price in [(True, buy_price), (False, sell_price)]:
             side = "buy" if is_buy else "sell"
@@ -2233,26 +2305,46 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
             if is_buy:
                 existing_id = orders.bid_order_ids[level]
                 existing_price = orders.bid_prices[level]
+                existing_size = orders.bid_sizes[level]
             else:
                 existing_id = orders.ask_order_ids[level]
                 existing_price = orders.ask_prices[level]
+                existing_size = orders.ask_sizes[level]
 
-            if existing_id is not None and existing_price is not None:
-                change_bps = price_change_bps(existing_price, new_price)
-                effective_threshold = _adaptive_threshold_bps()
-                if change_bps <= effective_threshold:
+            if existing_id is not None:
+                if not _has_exchange_id(existing_id):
                     order_manager.mark_status(
                         side, SideStatus.LIVE, level=level,
                         target_price=new_price, target_size=new_size,
                     )
                     if _log_debug:
                         logger.debug(
-                            "Keeping %s[%d]: change %.2f bps <= %.2f (adaptive)",
+                            "Keeping %s[%d]: awaiting exchange order_index for client id %d",
+                            side, level, existing_id,
+                        )
+                    continue
+                change_bps = price_change_bps(existing_price, new_price)
+                size_changed = _size_change_requires_update(existing_size, new_size)
+                needs_modify = existing_price is None or change_bps > effective_threshold or size_changed
+                if not needs_modify:
+                    order_manager.mark_status(
+                        side, SideStatus.LIVE, level=level,
+                        target_price=new_price, target_size=new_size,
+                    )
+                    if _log_debug:
+                        logger.debug(
+                            "Keeping %s[%d]: price %.2f bps <= %.2f and size unchanged",
                             side, level, change_bps, effective_threshold,
                         )
                     continue
-                # Price moved enough — modify existing order
                 exchange_id = _resolve_exchange_id(existing_id)
+                if exchange_id is None:
+                    if _log_debug:
+                        logger.debug(
+                            "Keeping %s[%d]: exchange order_index missing for client id %d",
+                            side, level, existing_id,
+                        )
+                    continue
                 ops.append(BatchOp(
                     side=side, level=level, action="modify",
                     price=new_price, size=new_size,
@@ -2330,9 +2422,9 @@ async def sign_and_send_batch(client, ops: list):
     if not ops:
         return
 
-    if logger.isEnabledFor(logging.INFO):
+    if logger.isEnabledFor(logging.DEBUG):
         ops_desc = ", ".join(f"{o.action} {o.side}[{o.level}] @{o.price}" for o in ops)
-        logger.info("Batch preparing %d ops: %s", len(ops), ops_desc)
+        logger.debug("Batch preparing %d ops: %s", len(ops), ops_desc)
 
     market_index = state.config.market_id
     tx_types = []
@@ -2440,7 +2532,7 @@ async def sign_and_send_batch(client, ops: list):
 
             if ws_resp is not None:
                 # Parse WS response
-                logger.info("WS batch raw response: %s", ws_resp)
+                logger.debug("WS batch raw response: %s", ws_resp)
                 # Check for error envelope: {"error": {"code": ..., "message": ...}}
                 ws_error = ws_resp.get("error")
                 if isinstance(ws_error, dict):
@@ -2627,28 +2719,35 @@ async def market_making_loop(client):
                         ask_id = state.orders.ask_order_ids[lvl]
                         if bid_id is not None:
                             exchange_id = _resolve_exchange_id(bid_id)
-                            cancel_ops.append(BatchOp(
-                                side="buy", level=lvl, action="cancel",
-                                price=0, size=0,
-                                order_id=bid_id, exchange_id=exchange_id,
-                            ))
+                            if exchange_id is not None:
+                                cancel_ops.append(BatchOp(
+                                    side="buy", level=lvl, action="cancel",
+                                    price=0, size=0,
+                                    order_id=bid_id, exchange_id=exchange_id,
+                                ))
                         if ask_id is not None:
                             exchange_id = _resolve_exchange_id(ask_id)
-                            cancel_ops.append(BatchOp(
-                                side="sell", level=lvl, action="cancel",
-                                price=0, size=0,
-                                order_id=ask_id, exchange_id=exchange_id,
-                            ))
+                            if exchange_id is not None:
+                                cancel_ops.append(BatchOp(
+                                    side="sell", level=lvl, action="cancel",
+                                    price=0, size=0,
+                                    order_id=ask_id, exchange_id=exchange_id,
+                                ))
                     if cancel_ops:
                         if await _wait_for_write_slot(op_count=len(cancel_ops), cancel_only=True):
                             await sign_and_send_batch(client, cancel_ops)
-                    order_manager.clear_all()
-                    # Verify orders are actually gone on exchange
+                    elif _has_live_local_orders():
+                        logger.info("Pause cleanup waiting for exchange order ids before sending cancels.")
+
+                    reconcile_ok = False
                     try:
-                        await reconcile_orders_with_exchange(client, source="pause_cancel_verify")
+                        reconcile_ok = await reconcile_orders_with_exchange(client, source="pause_cancel_verify")
                     except Exception as exc:
                         logger.error("Post-pause reconciliation failed: %s", exc)
-                    risk_controller.pause_cancel_done = True
+                    if reconcile_ok and not _has_live_local_orders():
+                        risk_controller.pause_cancel_done = True
+                    else:
+                        logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 

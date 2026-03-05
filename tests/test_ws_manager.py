@@ -229,6 +229,41 @@ class TestWsSubscribe(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(on_disconnect.call_count, 1)
 
     @patch("ws_manager.websockets.connect")
+    async def test_reconnect_event_interrupts_blocked_recv(self, mock_connect):
+        reconnect_event = asyncio.Event()
+        connect_count = 0
+        on_disconnect = MagicMock()
+
+        def _connect_counter(*a, **kw):
+            nonlocal connect_count
+            connect_count += 1
+            return _FakeConnectCM(_make_mock_ws([]))
+
+        mock_connect.side_effect = _connect_counter
+
+        task = asyncio.create_task(
+            ws_manager.ws_subscribe(
+                channels=[],
+                label="test",
+                on_message=MagicMock(),
+                on_disconnect=on_disconnect,
+                reconnect_event=reconnect_event,
+                recv_timeout=5.0,
+                reconnect_base=0.01,
+                reconnect_max=0.02,
+            )
+        )
+        await asyncio.sleep(0.05)
+        reconnect_event.set()
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertGreaterEqual(connect_count, 2)
+        self.assertGreaterEqual(on_disconnect.call_count, 1)
+
+    @patch("ws_manager.websockets.connect")
     async def test_backoff_increases_on_repeated_failures(self, mock_connect):
         """Verify backoff doubles on consecutive failures (capped at reconnect_max)."""
         mock_connect.side_effect = Exception("connection refused")

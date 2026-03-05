@@ -173,6 +173,8 @@ class TestOrderbookUpdateDuringLifecycle(unittest.IsolatedAsyncioTestCase):
             with temp_mm_attrs(
                 MARKET_ID=1, _PRICE_TICK_FLOAT=0.1, _AMOUNT_TICK_FLOAT=0.00001,
                 _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+                current_bid_order_id=None, current_bid_price=None, current_bid_size=None,
+                current_ask_order_id=None, current_ask_price=None, current_ask_size=None,
             ):
                 await mm.sign_and_send_batch(client, [op])
 

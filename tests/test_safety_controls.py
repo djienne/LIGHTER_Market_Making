@@ -136,7 +136,8 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
         async def _interrupt_sleep(_seconds):
             raise KeyboardInterrupt
 
-        async def _noop_reconcile(*a, **kw):
+        async def _clear_on_reconcile(*a, **kw):
+            mm.order_manager.clear_all()
             return True
 
         async def _mock_wait_for_write(op_count=4, cancel_only=False):
@@ -159,9 +160,11 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
                 WARMUP_SECONDS=0,
             ):
                 mm.state.risk.pause_cancel_done = False
+                mm._client_to_exchange_id[101] = 1001
+                mm._client_to_exchange_id[202] = 2002
 
                 with patch.object(mm, "sign_and_send_batch", side_effect=_record_batch), \
-                     patch.object(mm, "reconcile_orders_with_exchange", side_effect=_noop_reconcile), \
+                     patch.object(mm, "reconcile_orders_with_exchange", side_effect=_clear_on_reconcile), \
                      patch.object(mm, "_wait_for_write_slot", side_effect=_mock_wait_for_write), \
                      patch.object(mm, "check_websocket_health", return_value=True), \
                      patch.object(mm.risk_controller, "maybe_recover", return_value=False), \
@@ -178,6 +181,59 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
             self.assertIn(101, cancel_ids)
             self.assertIn(202, cancel_ids)
             self.assertTrue(mm.state.risk.pause_cancel_done)
+        finally:
+            mm.state.risk = original_risk
+            mm.risk_controller = mm.RiskController(mm.state.risk)
+
+    async def test_market_making_loop_paused_retries_when_reconcile_fails(self):
+        original_risk = mm.RiskState(**vars(mm.state.risk))
+        batch_calls = []
+
+        async def _record_batch(_client, ops):
+            batch_calls.append(ops)
+
+        async def _interrupt_sleep(_seconds):
+            raise KeyboardInterrupt
+
+        async def _failed_reconcile(*a, **kw):
+            return False
+
+        async def _mock_wait_for_write(op_count=4, cancel_only=False):
+            return True
+
+        client = DummyClient()
+
+        try:
+            with temp_mm_attrs(
+                current_bid_order_id=101,
+                current_ask_order_id=202,
+                current_bid_price=100.0,
+                current_ask_price=101.0,
+                current_bid_size=0.1,
+                current_ask_size=0.1,
+                _PRICE_TICK_FLOAT=0.01,
+                _AMOUNT_TICK_FLOAT=0.001,
+                MARKET_ID=1,
+                MIN_LOOP_INTERVAL=0.0,
+                WARMUP_SECONDS=0,
+            ):
+                mm.state.risk.pause_cancel_done = False
+                mm._client_to_exchange_id[101] = 1001
+                mm._client_to_exchange_id[202] = 2002
+
+                with patch.object(mm, "sign_and_send_batch", side_effect=_record_batch), \
+                     patch.object(mm, "reconcile_orders_with_exchange", side_effect=_failed_reconcile), \
+                     patch.object(mm, "_wait_for_write_slot", side_effect=_mock_wait_for_write), \
+                     patch.object(mm, "check_websocket_health", return_value=True), \
+                     patch.object(mm.risk_controller, "maybe_recover", return_value=False), \
+                     patch.object(mm.risk_controller, "is_paused", return_value=True), \
+                     patch.object(mm.asyncio, "sleep", side_effect=_interrupt_sleep):
+                    with self.assertRaises(KeyboardInterrupt):
+                        await mm.market_making_loop(client)
+                self.assertEqual(len(batch_calls), 1)
+                self.assertFalse(mm.state.risk.pause_cancel_done)
+                self.assertEqual(mm.current_bid_order_id, 101)
+                self.assertEqual(mm.current_ask_order_id, 202)
         finally:
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)
