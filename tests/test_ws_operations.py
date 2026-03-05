@@ -687,7 +687,7 @@ class TestCollectOrderOperations(unittest.TestCase):
             MARKET_ID=1,
             _PRICE_TICK_FLOAT=0.01,
             _AMOUNT_TICK_FLOAT=0.001,
-            QUOTE_UPDATE_THRESHOLD_BPS=5.0,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=5.0,
         ):
             # Clear all order slots
             for lvl in range(mm.NUM_LEVELS):
@@ -710,12 +710,14 @@ class TestCollectOrderOperations(unittest.TestCase):
             MARKET_ID=1,
             _PRICE_TICK_FLOAT=0.01,
             _AMOUNT_TICK_FLOAT=0.001,
-            QUOTE_UPDATE_THRESHOLD_BPS=0.0,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=0.0,
         ):
             mm.state.orders.bid_order_ids[0] = 42
             mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 1.0
             mm.state.orders.ask_order_ids[0] = None
             mm.state.orders.ask_prices[0] = None
+            mm._client_to_exchange_id[42] = 420
 
             level_prices = [(105.0, 106.0)]
             ops = mm.collect_order_operations(level_prices, base_amount=1.0)
@@ -734,12 +736,16 @@ class TestCollectOrderOperations(unittest.TestCase):
             MARKET_ID=1,
             _PRICE_TICK_FLOAT=0.01,
             _AMOUNT_TICK_FLOAT=0.001,
-            QUOTE_UPDATE_THRESHOLD_BPS=100.0,  # 100 bps = 1%
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=100.0,  # 100 bps = 1%
         ):
             mm.state.orders.bid_order_ids[0] = 42
             mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 1.0
             mm.state.orders.ask_order_ids[0] = 43
             mm.state.orders.ask_prices[0] = 101.0
+            mm.state.orders.ask_sizes[0] = 1.0
+            mm._client_to_exchange_id[42] = 420
+            mm._client_to_exchange_id[43] = 430
 
             # Small price change: 0.01% < 1% threshold
             level_prices = [(100.005, 101.005)]
@@ -747,18 +753,62 @@ class TestCollectOrderOperations(unittest.TestCase):
 
             self.assertEqual(len(ops), 0)
 
+    def test_collect_modifies_when_size_changes(self):
+        """Existing order with unchanged price but different size -> modify op."""
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=100.0,
+        ):
+            mm.state.orders.bid_order_ids[0] = 42
+            mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 0.5
+            mm._client_to_exchange_id[42] = 420
+
+            ops = mm.collect_order_operations([(100.0, 101.0)], base_amount=1.0)
+
+            self.assertEqual(len(ops), 2)
+            modify_ops = [o for o in ops if o.action == "modify"]
+            self.assertEqual(len(modify_ops), 1)
+            self.assertEqual(modify_ops[0].side, "buy")
+            self.assertAlmostEqual(modify_ops[0].size, 1.0)
+
+    def test_collect_waits_for_exchange_id_before_modifying(self):
+        """Tracked orders without exchange order_index should not emit modify yet."""
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=0.0,
+        ):
+            mm.state.orders.bid_order_ids[0] = 42
+            mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 1.0
+            mm.state.orders.ask_order_ids[0] = None
+            mm.state.orders.ask_prices[0] = None
+            mm.state.orders.ask_sizes[0] = None
+
+            ops = mm.collect_order_operations([(105.0, 106.0)], base_amount=1.0)
+
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(ops[0].action, "create")
+            self.assertEqual(ops[0].side, "sell")
+
     def test_collect_handles_none_order_id(self):
         """order_id=None on a level -> create op."""
         with temp_mm_attrs(
             MARKET_ID=1,
             _PRICE_TICK_FLOAT=0.01,
             _AMOUNT_TICK_FLOAT=0.001,
-            QUOTE_UPDATE_THRESHOLD_BPS=5.0,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=5.0,
         ):
             mm.state.orders.bid_order_ids[0] = None
             mm.state.orders.bid_prices[0] = None
             mm.state.orders.ask_order_ids[0] = 99
             mm.state.orders.ask_prices[0] = 101.0
+            mm.state.orders.ask_sizes[0] = 1.0
+            mm._client_to_exchange_id[99] = 990
 
             level_prices = [(100.0, 101.0)]
             ops = mm.collect_order_operations(level_prices, base_amount=1.0)
@@ -792,7 +842,7 @@ class TestWaitForWriteSlot(unittest.IsolatedAsyncioTestCase):
 class TestAccountOrdersSnapshot(unittest.TestCase):
 
     def test_account_orders_snapshot_rebinds_orders(self):
-        """First WS message (snapshot) rebinds local order state."""
+        """First WS message (snapshot) keeps live orders and refreshes fields."""
         original_orders = mm.OrderState(**vars(mm.state.orders))
         original_risk = mm.RiskState(**vars(mm.state.risk))
         saved_ready = mm._account_orders_ws_ready
@@ -811,7 +861,14 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
             ):
                 # Snapshot says only ask 200 is alive
                 data = {"orders": {"1": [
-                    {"client_order_index": 200, "order_index": 9999, "status": "open"}
+                    {
+                        "client_order_index": 200,
+                        "order_index": 9999,
+                        "status": "open",
+                        "is_ask": True,
+                        "price": "52.5",
+                        "remaining_base_amount": "0.25",
+                    }
                 ]}}
                 mm.on_account_orders_update(account_id=1, market_id=1, data=data)
 
@@ -821,6 +878,8 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
                 self.assertIsNone(mm.state.orders.bid_order_ids[0])
                 # Ask 200 in snapshot -> kept
                 self.assertEqual(mm.state.orders.ask_order_ids[0], 200)
+                self.assertAlmostEqual(mm.state.orders.ask_prices[0], 52.5)
+                self.assertAlmostEqual(mm.state.orders.ask_sizes[0], 0.25)
         finally:
             mm.state.orders = original_orders
             mm.state.risk = original_risk
@@ -868,6 +927,44 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
             mm.risk_controller = mm.RiskController(mm.state.risk)
             mm.order_manager = mm.OrderManager(mm.state.order_manager)
             mm._order_cancel_events.pop(300, None)
+
+    def test_incremental_update_refreshes_partial_fill_size(self):
+        """Incremental live update should refresh remaining size for tracked orders."""
+        original_orders = mm.OrderState(**vars(mm.state.orders))
+        original_risk = mm.RiskState(**vars(mm.state.risk))
+        saved_ready = mm._account_orders_ws_ready
+
+        try:
+            mm._account_orders_ws_ready = True
+
+            with temp_mm_attrs(
+                MARKET_ID=1,
+                current_bid_order_id=300,
+                current_bid_price=50.0,
+                current_bid_size=1.0,
+            ):
+                data = {"orders": {"1": [
+                    {
+                        "client_order_index": 300,
+                        "order_index": 8888,
+                        "status": "partial_filled",
+                        "is_ask": False,
+                        "price": "50.5",
+                        "remaining_base_amount": "0.25",
+                    }
+                ]}}
+                mm.on_account_orders_update(account_id=1, market_id=1, data=data)
+
+                self.assertEqual(mm.state.orders.bid_order_ids[0], 300)
+                self.assertAlmostEqual(mm.state.orders.bid_prices[0], 50.5)
+                self.assertAlmostEqual(mm.state.orders.bid_sizes[0], 0.25)
+                self.assertEqual(mm._client_to_exchange_id[300], 8888)
+        finally:
+            mm.state.orders = original_orders
+            mm.state.risk = original_risk
+            mm._account_orders_ws_ready = saved_ready
+            mm.risk_controller = mm.RiskController(mm.state.risk)
+            mm.order_manager = mm.OrderManager(mm.state.order_manager)
 
 
 # ---------------------------------------------------------------------------

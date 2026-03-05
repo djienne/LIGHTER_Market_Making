@@ -61,6 +61,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 raise KeyboardInterrupt
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 MARKET_ID=1,
                 _PRICE_TICK_FLOAT=0.1,
@@ -118,6 +120,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 raise KeyboardInterrupt
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 MARKET_ID=1,
                 _PRICE_TICK_FLOAT=0.1,
@@ -160,6 +164,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 raise KeyboardInterrupt
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 MARKET_ID=1,
                 _PRICE_TICK_FLOAT=0.1,
@@ -203,6 +209,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 raise KeyboardInterrupt
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 ws_connection_healthy=False,
                 current_mid_price_cached=50000.0,
@@ -238,6 +246,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 raise KeyboardInterrupt
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 MARKET_ID=1,
                 _PRICE_TICK_FLOAT=0.1,
@@ -283,6 +293,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 raise KeyboardInterrupt
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 MARKET_ID=1,
                 _PRICE_TICK_FLOAT=0.1,
@@ -317,6 +329,12 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                     call_count[0] += 1
                     # Shift mid_price each cycle so price changes exceed threshold
                     mm.state.market.mid_price = 50000.0 + call_count[0] * 100
+                    bid_id = mm.state.orders.bid_order_ids[0]
+                    ask_id = mm.state.orders.ask_order_ids[0]
+                    if bid_id is not None and bid_id not in mm._client_to_exchange_id:
+                        mm._client_to_exchange_id[bid_id] = 1000
+                    if ask_id is not None and ask_id not in mm._client_to_exchange_id:
+                        mm._client_to_exchange_id[ask_id] = 2000
                     await asyncio.sleep(0)
 
                 with patch.object(mm.asyncio, "wait_for", side_effect=_cycle_wait_for):
@@ -354,6 +372,8 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("boom")
 
         try:
+            mm.state.risk = mm.RiskState()
+            mm.risk_controller = mm.RiskController(mm.state.risk)
             with temp_mm_attrs(
                 MARKET_ID=1,
                 _PRICE_TICK_FLOAT=0.1,
