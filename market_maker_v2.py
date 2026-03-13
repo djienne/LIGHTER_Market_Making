@@ -281,7 +281,7 @@ _sdk_write_lock = asyncio.Lock()
 
 _WS_AUTH_TOKEN_TTL = int(os.getenv(
     "WS_AUTH_TOKEN_TTL",
-    _ws.get("auth_token_ttl", 8 * 60)))   # seconds — refresh before 10-min server-side expiry
+    _ws.get("auth_token_ttl", 9 * 60)))   # seconds — refresh before 10-min server-side expiry
 _account_orders_ws_ready = False
 _account_orders_ws_connected = asyncio.Event()
 RECONCILER_SLOW_INTERVAL_SEC = 60.0
@@ -814,6 +814,7 @@ _quota_warning_level: str = "ok"  # "ok" | "medium" | "low" | "critical"
 _consecutive_successes: int = 0
 _global_backoff_until: float = 0.0
 _global_backoff_consecutive: int = 0
+_last_backoff_trigger_time: float = 0.0
 
 # Quota recovery state
 _quota_recovery_in_progress: bool = False
@@ -1663,7 +1664,13 @@ async def subscribe_to_account_orders(client, market_id: int, account_id: int) -
                 await inner
             except asyncio.CancelledError:
                 pass
-            logger.info("account_orders: refreshing auth token (8-min TTL)")
+            logger.info("account_orders: refreshing auth token (%d-min TTL)",
+                        _WS_AUTH_TOKEN_TTL // 60)
+            # Reconcile to catch any updates lost during token refresh
+            try:
+                await reconcile_orders_with_exchange(client, source="token_refresh")
+            except Exception as exc:
+                logger.warning("Post-token-refresh reconciliation failed: %s", exc)
             # Loop → regenerate token
         except asyncio.CancelledError:
             inner.cancel()
@@ -1924,9 +1931,10 @@ async def _wait_for_write_slot(op_count: int = 4, cancel_only: bool = False) -> 
 def _trigger_global_backoff():
     """Set a global cooldown after hitting 429. Escalates with consecutive failures.
     Reduced: 15s -> 30s -> 60s -> 120s max."""
-    global _global_backoff_until, _global_backoff_consecutive, _consecutive_successes
+    global _global_backoff_until, _global_backoff_consecutive, _consecutive_successes, _last_backoff_trigger_time
     _global_backoff_consecutive += 1
     _consecutive_successes = 0
+    _last_backoff_trigger_time = time.monotonic()
     duration = min(_RL_BACKOFF_BASE * (2 ** (_global_backoff_consecutive - 1)), _RL_BACKOFF_MAX)
     _global_backoff_until = time.monotonic() + duration
     logger.warning("429 rate limit — global backoff for %.0fs (attempt #%d)",
@@ -1935,10 +1943,17 @@ def _trigger_global_backoff():
 
 def _reset_global_backoff():
     """After a successful write, require N consecutive successes before
-    resetting escalation counter."""
+    resetting escalation counter. Auto-resets after 5 minutes without a 429."""
     global _global_backoff_consecutive, _consecutive_successes
     _consecutive_successes += 1
     if _global_backoff_consecutive > 0:
+        # Time-based decay: auto-reset if no 429 for 5 minutes
+        if _last_backoff_trigger_time > 0 and time.monotonic() - _last_backoff_trigger_time > 300.0:
+            logger.info("Backoff auto-reset: no 429 for 5+ minutes (was level %d)",
+                        _global_backoff_consecutive)
+            _global_backoff_consecutive = 0
+            _consecutive_successes = 0
+            return
         if _consecutive_successes >= _RL_BACKOFF_RESET_AFTER:
             logger.info("SDK write succeeded — resetting backoff after %d consecutive successes "
                         "(was %d)", _consecutive_successes, _global_backoff_consecutive)
@@ -2101,6 +2116,7 @@ async def _attempt_quota_recovery(client) -> bool:
 
                 if err:
                     logger.warning("QUOTA RECOVERY: order error: %s", err)
+                    client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
                     return False
 
                 # Extract quota from response
@@ -2353,16 +2369,32 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
 
             if existing_id is not None:
                 if not _has_exchange_id(existing_id):
-                    order_manager.mark_status(
-                        side, SideStatus.LIVE, level=level,
-                        target_price=new_price, target_size=new_size,
-                    )
-                    if _log_debug:
-                        logger.debug(
-                            "Keeping %s[%d]: awaiting exchange order_index for client id %d",
-                            side, level, existing_id,
+                    # Timeout stale PLACING orders (no exchange confirmation after 30s)
+                    lc = order_manager.lifecycle(side, level)
+                    if lc.status == SideStatus.PLACING and lc.updated_at > 0:
+                        age = time.monotonic() - lc.updated_at
+                        if age > 30.0:
+                            logger.warning(
+                                "Order %s[%d] stuck in PLACING for %.0fs — clearing stale slot",
+                                side, level, age,
+                            )
+                            order_manager.clear_live(side, level)
+                            # Fall through to create a new order below
+                            if is_buy:
+                                existing_id = orders.bid_order_ids[level]
+                            else:
+                                existing_id = orders.ask_order_ids[level]
+                    if existing_id is not None and not _has_exchange_id(existing_id):
+                        order_manager.mark_status(
+                            side, SideStatus.LIVE, level=level,
+                            target_price=new_price, target_size=new_size,
                         )
-                    continue
+                        if _log_debug:
+                            logger.debug(
+                                "Keeping %s[%d]: awaiting exchange order_index for client id %d",
+                                side, level, existing_id,
+                            )
+                        continue
                 change_bps = price_change_bps(existing_price, new_price)
                 size_changed = _size_change_requires_update(existing_size, new_size)
                 needs_modify = existing_price is None or change_bps > effective_threshold or size_changed
@@ -2424,9 +2456,11 @@ async def _send_single_op_rest(client, tx_type: int, tx_info, op) -> bool:
                        op.action, op.side, op.level, e, body)
         if _is_quota_error(e):
             _update_volume_quota(0)
+            client.nonce_manager.acknowledge_failure(API_KEY_INDEX)
             client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
         elif _is_transient_error(e):
             _trigger_global_backoff()
+            client.nonce_manager.acknowledge_failure(API_KEY_INDEX)
             client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
         return False
 
@@ -2781,7 +2815,21 @@ async def market_making_loop(client):
 
             if risk_controller.is_paused():
                 if not risk_controller.pause_cancel_done:
-                    logger.warning("Trading is paused (%s); cancelling local live orders.", state.risk.pause_reason)
+                    _pause_attempts = getattr(risk_controller, '_pause_cleanup_attempts', 0) + 1
+                    risk_controller._pause_cleanup_attempts = _pause_attempts
+                    logger.warning("Trading is paused (%s); cancelling local live orders (attempt %d).",
+                                   state.risk.pause_reason, _pause_attempts)
+
+                    # Force-clear stuck PLACING orders after 5 retries
+                    if _pause_attempts > 5 and _has_live_local_orders():
+                        logger.warning("Pause cleanup stuck after %d attempts — force-clearing PLACING orders",
+                                       _pause_attempts)
+                        for lvl in range(NUM_LEVELS):
+                            for side_name in ("buy", "sell"):
+                                lc = order_manager.lifecycle(side_name, lvl)
+                                if lc.status == SideStatus.PLACING:
+                                    order_manager.clear_live(side_name, lvl)
+
                     cancel_ops = []
                     for lvl in range(NUM_LEVELS):
                         bid_id = state.orders.bid_order_ids[lvl]
@@ -2815,6 +2863,7 @@ async def market_making_loop(client):
                         logger.error("Post-pause reconciliation failed: %s", exc)
                     if reconcile_ok and not _has_live_local_orders():
                         risk_controller.pause_cancel_done = True
+                        risk_controller._pause_cleanup_attempts = 0
                     else:
                         logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
@@ -2879,6 +2928,11 @@ async def market_making_loop(client):
                 elif _log_debug:
                     logger.debug("Could not calculate quotes; skipping refresh.")
 
+            # Warn if quota is stuck at 0 with no sends for a long time
+            if (_volume_quota_remaining is not None and _volume_quota_remaining <= 0
+                    and time.monotonic() - _last_send_time > 300):
+                logger.warning("Quota stuck at 0 for >5min with no sends — may need manual restart")
+
             # Quota recovery: if enabled, critically low, NOT in cooldown, and past post-warmup grace
             if (_QR_ENABLED
                     and _volume_quota_remaining is not None
@@ -2891,6 +2945,11 @@ async def market_making_loop(client):
                     logger.info("Quota recovered, resuming normal operations")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue  # re-evaluate on next iteration
+
+            # Yield to quota recovery — don't compete for the free slot
+            if _quota_recovery_in_progress:
+                await asyncio.sleep(MIN_LOOP_INTERVAL)
+                continue
 
             # Batch all order operations into a single send_tx_batch call
             ops = collect_order_operations(level_prices, base_amount, _log_debug)
