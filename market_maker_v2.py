@@ -861,9 +861,18 @@ def _update_id_mapping_from_orders(orders: list[dict]) -> None:
                 _client_to_exchange_id[int(cid)] = int(eid)
         except (TypeError, ValueError):
             continue
-    # Prevent unbounded growth
+    # Prevent unbounded growth — always preserve currently tracked orders
     if len(_client_to_exchange_id) > 200:
-        to_keep = dict(sorted(_client_to_exchange_id.items())[-100:])
+        live_ids = set()
+        orders = state.orders
+        for lvl in range(NUM_LEVELS):
+            for oid in (orders.bid_order_ids[lvl], orders.ask_order_ids[lvl]):
+                if oid is not None:
+                    live_ids.add(oid)
+        to_keep = {k: v for k, v in _client_to_exchange_id.items() if k in live_ids}
+        remaining = {k: v for k, v in sorted(_client_to_exchange_id.items())[-100:]
+                     if k not in to_keep}
+        to_keep.update(remaining)
         _client_to_exchange_id.clear()
         _client_to_exchange_id.update(to_keep)
 
@@ -1535,17 +1544,24 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
             logger.info("account_orders WS ready (snapshot) — %d live orders for market %d",
                         len(active_client_ids), market_id)
 
-            # Authoritative: clear any local orders not in the snapshot
+            # Authoritative: clear any local orders not in the snapshot,
+            # but protect orders in PLACING state (may be in-flight)
             orders = state.orders
             for lvl in range(NUM_LEVELS):
                 bid_id = orders.bid_order_ids[lvl]
                 if bid_id is not None and bid_id not in active_client_ids:
-                    logger.info("Bid[%d] %d not in WS snapshot — clearing", lvl, bid_id)
-                    order_manager.clear_live("buy", lvl)
+                    if order_manager.lifecycle("buy", lvl).status == SideStatus.PLACING:
+                        logger.info("Bid[%d] %d not in snapshot but PLACING — keeping", lvl, bid_id)
+                    else:
+                        logger.info("Bid[%d] %d not in WS snapshot — clearing", lvl, bid_id)
+                        order_manager.clear_live("buy", lvl)
                 ask_id = orders.ask_order_ids[lvl]
                 if ask_id is not None and ask_id not in active_client_ids:
-                    logger.info("Ask[%d] %d not in WS snapshot — clearing", lvl, ask_id)
-                    order_manager.clear_live("sell", lvl)
+                    if order_manager.lifecycle("sell", lvl).status == SideStatus.PLACING:
+                        logger.info("Ask[%d] %d not in snapshot but PLACING — keeping", lvl, ask_id)
+                    else:
+                        logger.info("Ask[%d] %d not in WS snapshot — clearing", lvl, ask_id)
+                        order_manager.clear_live("sell", lvl)
 
             _refresh_local_orders_from_remote_orders(live_orders)
             risk_controller.mark_reconcile(ok=True, reason="account_orders_ws_snapshot")
@@ -2308,8 +2324,8 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
             side = "buy" if is_buy else "sell"
             new_size = base_amount
 
-            if new_price is None or new_size is None:
-                # Cancel any live order on this suppressed side
+            if new_price is None:
+                # Position limit suppressed this side — cancel any live order
                 if is_buy:
                     existing_id = orders.bid_order_ids[level]
                 else:
@@ -2323,7 +2339,7 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
                             order_id=existing_id, exchange_id=exchange_id,
                         ))
                 continue
-            if new_price <= 0 or new_size <= 0:
+            if new_size is None or new_size <= 0 or new_price <= 0:
                 continue
 
             if is_buy:
@@ -2423,8 +2439,20 @@ async def sign_and_send_batch(client, ops: list):
     # Free-slot mode: when quota is 0, send only 1 op via REST sendTx
     free_slot_mode = _volume_quota_remaining is not None and _volume_quota_remaining <= 0
     if free_slot_mode:
-        ops = ops[:1]  # only first (highest priority) op
-        logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx")
+        # Prioritize: cancels first, then position-reducing side
+        pos = state.account.position_size
+        def _free_slot_priority(op):
+            if op.action == "cancel":
+                return 0
+            if pos > 0 and op.side == "sell":
+                return 1  # long → prefer sell to reduce
+            if pos < 0 and op.side == "buy":
+                return 1  # short → prefer buy to reduce
+            return 2
+        ops = sorted(ops, key=_free_slot_priority)
+        ops = ops[:1]
+        logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx (%s %s)",
+                    ops[0].action, ops[0].side)
 
     # Safety: drop create ops whose slot got filled since collect_order_operations
     # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
@@ -2868,7 +2896,10 @@ async def market_making_loop(client):
             ops = collect_order_operations(level_prices, base_amount, _log_debug)
             if ops:
                 if time.monotonic() < _global_backoff_until:
-                    pass  # in backoff — existing orders stay live
+                    remaining = _global_backoff_until - time.monotonic()
+                    if remaining > 0:
+                        await asyncio.sleep(min(remaining, 1.0))
+                    continue  # skip order ops during backoff
                 elif await _wait_for_write_slot(
                     op_count=len(ops),
                     cancel_only=all(o.action == "cancel" for o in ops),

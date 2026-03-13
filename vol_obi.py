@@ -18,13 +18,13 @@ logger = logging.getLogger(__name__)
 class RollingStats:
     """Fixed-capacity ring buffer with O(1) incremental mean / std / zscore.
 
-    Uses population variance: Var = E[X²] - E[X]² (matching Rust rolling.rs).
+    Uses Welford's online algorithm for numerically stable variance.
     Caches mean and std on every push() so zscore() is a single division.
     """
 
     __slots__ = (
         '_buffer', '_capacity', '_write_pos', '_count',
-        '_sum', '_sum_sq', '_cached_mean', '_cached_std',
+        '_sum', '_m2', '_cached_mean', '_cached_std',
     )
 
     def __init__(self, capacity: int):
@@ -34,7 +34,7 @@ class RollingStats:
         self._write_pos = 0
         self._count = 0
         self._sum = 0.0
-        self._sum_sq = 0.0
+        self._m2 = 0.0  # sum of squared differences from mean (Welford)
         self._cached_mean = 0.0
         self._cached_std = 0.0
 
@@ -43,35 +43,36 @@ class RollingStats:
     def push(self, value: float) -> None:
         idx = self._write_pos % self._capacity
 
-        # Evict oldest value if buffer is full
+        # Evict oldest value if buffer is full (reverse Welford update)
         if self._count >= self._capacity:
             old = self._buffer[idx]
+            n = self._count
+            old_mean = self._cached_mean
+            new_mean = old_mean + (old_mean - old) / (n - 1) if n > 1 else 0.0
+            self._m2 -= (old - old_mean) * (old - new_mean)
+            self._m2 = max(0.0, self._m2)
             self._sum -= old
-            self._sum_sq -= old * old
+            self._count -= 1
+            self._cached_mean = new_mean
 
+        # Add new value (forward Welford update)
         self._buffer[idx] = value
         self._sum += value
-        self._sum_sq += value * value
+        self._count += 1
         self._write_pos += 1
-
-        if self._count < self._capacity:
-            self._count += 1
-
-        # Refresh cached statistics
         n = self._count
-        if n >= 2:
-            self._cached_mean = self._sum / n
-            mean_sq = self._sum_sq / n
-            self._cached_std = max(0.0, mean_sq - self._cached_mean * self._cached_mean) ** 0.5
-        elif n == 1:
-            self._cached_mean = self._sum
-            self._cached_std = 0.0
+        old_mean = self._cached_mean
+        new_mean = self._sum / n
+        self._m2 += (value - old_mean) * (value - new_mean)
+        self._m2 = max(0.0, self._m2)
+        self._cached_mean = new_mean
+        self._cached_std = (self._m2 / n) ** 0.5 if n >= 2 else 0.0
 
     def clear(self) -> None:
         self._write_pos = 0
         self._count = 0
         self._sum = 0.0
-        self._sum_sq = 0.0
+        self._m2 = 0.0
         self._cached_mean = 0.0
         self._cached_std = 0.0
 
@@ -265,6 +266,10 @@ class VolObiCalculator:
         # -- Snap to tick grid  (Rust obi.rs:bid_prices[level]) --
         bid_price = math.floor(raw_bid / tick) * tick   # [DOLLARS]
         ask_price = math.ceil(raw_ask / tick) * tick     # [DOLLARS]
+
+        # Guard: never return crossed quotes
+        if bid_price >= ask_price:
+            return None, None
 
         return bid_price, ask_price
 
