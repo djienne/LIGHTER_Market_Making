@@ -56,8 +56,8 @@ tests/                   Unit tests (pytest)
 ## How It Works
 
 ### Spread Model (vol_obi)
-- **RollingStats** maintains a ring buffer of mid-price samples and computes rolling volatility in O(1).
-- **VolObiCalculator** combines volatility with order-book imbalance (OBI) to produce skewed bid/ask half-spreads. Spreads widen with volatility and shift toward the heavier side of the book.
+- **RollingStats** maintains a ring buffer of mid-price samples and computes rolling volatility in O(1) using Welford's online algorithm for numerical stability.
+- **VolObiCalculator** combines volatility with order-book imbalance (OBI) to produce skewed bid/ask half-spreads. Spreads widen with volatility and shift toward the heavier side of the book. A crossed-quote guard ensures bid < ask after tick rounding.
 
 ### Alpha Signal (Binance)
 A background WebSocket streams Binance Futures depth data. The OBI signal biases quotes before they hit Lighter. Stale signals (>5s) are discarded.
@@ -81,9 +81,11 @@ The maximum position size is computed dynamically each loop iteration from live 
 
 ### Safety Controls
 - **Orderbook sanity**: periodic REST snapshots cross-checked against WS book
-- **Stale order poller**: reconciles local vs exchange order state
-- **Circuit breaker**: pauses trading after consecutive rejections
+- **Stale order poller**: reconciles local vs exchange order state; PLACING orders timeout after 30s
+- **Circuit breaker**: pauses trading after consecutive rejections; force-clears stuck orders after 5 retries
 - **Max live orders**: caps open orders per market
+- **Adaptive backoff**: exponential 429 backoff (15s→120s) with 5-minute time-based auto-decay
+- **Nonce safety**: `acknowledge_failure` + `hard_refresh_nonce` on all error paths
 
 ## config.json Reference
 
@@ -164,7 +166,7 @@ The maximum position size is computed dynamically each loop iteration from live 
 ## Tests
 
 ```bash
-source venv/activate
+source venv/bin/activate
 pytest tests/ -v
 ```
 
