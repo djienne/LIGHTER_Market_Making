@@ -1026,9 +1026,14 @@ class TestRestartWebsocketPreservesOrders(unittest.IsolatedAsyncioTestCase):
 class TestIdMappingTrim(unittest.TestCase):
 
     def test_id_mapping_trims_at_threshold(self):
-        """Insert 201 entries -> map trims to 100."""
+        """Insert 201 entries -> map trims to ~100 (plus any live order IDs)."""
         saved = dict(mm._client_to_exchange_id)
+        saved_bids = list(mm.state.orders.bid_order_ids)
+        saved_asks = list(mm.state.orders.ask_order_ids)
         mm._client_to_exchange_id.clear()
+        for i in range(mm.NUM_LEVELS):
+            mm.state.orders.bid_order_ids[i] = None
+            mm.state.orders.ask_order_ids[i] = None
         try:
             orders = [
                 {"client_order_index": i, "order_index": i + 10000}
@@ -1039,6 +1044,9 @@ class TestIdMappingTrim(unittest.TestCase):
         finally:
             mm._client_to_exchange_id.clear()
             mm._client_to_exchange_id.update(saved)
+            for i in range(mm.NUM_LEVELS):
+                mm.state.orders.bid_order_ids[i] = saved_bids[i]
+                mm.state.orders.ask_order_ids[i] = saved_asks[i]
 
 
 # ---------------------------------------------------------------------------
