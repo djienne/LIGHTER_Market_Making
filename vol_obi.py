@@ -309,3 +309,7 @@ class VolObiCalculator:
         self._alpha_override = None
         self._warmed_up = False
         self._total_samples = 0
+
+    def set_max_position_dollar(self, value: float) -> None:
+        """Update the max position dollar limit at runtime."""
+        self._max_position_dollar = max(0.0, value)

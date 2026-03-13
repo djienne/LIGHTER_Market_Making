@@ -38,6 +38,9 @@ class _VolObiStub:
     def set_alpha_override(self, _):
         pass
 
+    def set_max_position_dollar(self, _):
+        pass
+
 
 class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
     """Full mocked loop: WS healthy -> quote -> refresh both sides."""
