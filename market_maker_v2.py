@@ -255,8 +255,6 @@ VOL_OBI_LOOKING_DEPTH = float(os.getenv(
     "VOL_OBI_LOOKING_DEPTH", _vol_obi_cfg.get("looking_depth", 0.025)))
 VOL_OBI_MIN_WARMUP_SAMPLES = int(os.getenv(
     "VOL_OBI_MIN_WARMUP_SAMPLES", _vol_obi_cfg.get("min_warmup_samples", 100)))
-VOL_OBI_MAX_POSITION_DOLLAR = float(os.getenv(
-    "VOL_OBI_MAX_POSITION_DOLLAR", _vol_obi_cfg.get("max_position_dollar", 500.0)))
 WARMUP_SECONDS = float(os.getenv(
     "WARMUP_SECONDS", _vol_obi_cfg.get("warmup_seconds", 600)))
 
@@ -628,6 +626,19 @@ def get_position_value_usd(position_size: float, mid_price: Optional[float]) -> 
     if mid_price is None:
         return 0.0
     return abs(position_size) * mid_price
+
+
+def _dynamic_max_position_dollar(mid_price: float, capital: float = None, base_amount: float = None) -> float:
+    """Compute max position dollar from live capital, leverage, and order size."""
+    if capital is None:
+        capital = state.account.available_capital
+    if capital is None or capital <= 0 or mid_price is None or mid_price <= 0:
+        return 0.0  # Can't compute — suppress all quoting (safe default)
+    raw = capital * LEVERAGE
+    if base_amount is not None and base_amount > 0:
+        order_usd = base_amount * mid_price
+        raw -= 2.0 * order_usd  # room for both-side orders
+    return max(0.0, raw * 0.9)  # 10% safety margin
 
 
 def position_label(position_size: float) -> str:
@@ -2298,6 +2309,19 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
             new_size = base_amount
 
             if new_price is None or new_size is None:
+                # Cancel any live order on this suppressed side
+                if is_buy:
+                    existing_id = orders.bid_order_ids[level]
+                else:
+                    existing_id = orders.ask_order_ids[level]
+                if existing_id is not None:
+                    exchange_id = _resolve_exchange_id(existing_id)
+                    if exchange_id is not None:
+                        ops.append(BatchOp(
+                            side=side, level=level, action="cancel",
+                            price=0, size=0,
+                            order_id=existing_id, exchange_id=exchange_id,
+                        ))
                 continue
             if new_price <= 0 or new_size <= 0:
                 continue
@@ -2618,31 +2642,48 @@ async def sign_and_send_batch(client, ops: list):
         _record_order_rejection("batch:exception")
 
 
-def calculate_order_prices(mid_price, position_size=0.0):
+def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amount=None):
     """Calculate bid/ask prices for all order levels.
 
     Returns a list of ``NUM_LEVELS`` ``(buy_price, sell_price)`` tuples.
     Level 0 is the tight (base) spread from vol_obi; level 1+ widen the
     spread by ``SPREAD_FACTOR_LEVEL1``.
+
+    When position value exceeds the dynamic max, the side that would
+    *increase* exposure is suppressed (set to ``None``).
     """
     none_levels = [(None, None)] * NUM_LEVELS
     calc = state.vol_obi_state.calculator
     if calc is not None and calc.warmed_up:
         try:
             buy_0, sell_0 = calc.quote(mid_price, position_size)
-            if buy_0 is None or sell_0 is None:
+            if buy_0 is None and sell_0 is None:
                 return none_levels
+
+            # Hard position limit: suppress side that would increase exposure
+            max_pos_usd = _dynamic_max_position_dollar(mid_price, capital, base_amount)
+            if max_pos_usd > 0:
+                pos_value_usd = abs(position_size) * mid_price
+                if pos_value_usd >= max_pos_usd:
+                    if position_size > 0:
+                        buy_0 = None  # Long at limit — suppress buys
+                    elif position_size < 0:
+                        sell_0 = None  # Short at limit — suppress sells
+                    if buy_0 is None and sell_0 is None:
+                        return none_levels
+
             levels = [(buy_0, sell_0)]
             # Derive wider levels by scaling the spread from mid
-            bid_depth = mid_price - buy_0
-            ask_depth = sell_0 - mid_price
+            bid_depth = (mid_price - buy_0) if buy_0 is not None else None
+            ask_depth = (sell_0 - mid_price) if sell_0 is not None else None
             tick = state.config.price_tick_float
             for lvl in range(1, NUM_LEVELS):
                 factor = SPREAD_FACTOR_LEVEL1 ** lvl
-                raw_bid = mid_price - bid_depth * factor
-                raw_ask = mid_price + ask_depth * factor
-                if tick > 0:
+                raw_bid = (mid_price - bid_depth * factor) if bid_depth is not None else None
+                raw_ask = (mid_price + ask_depth * factor) if ask_depth is not None else None
+                if raw_bid is not None and tick > 0:
                     raw_bid = math.floor(raw_bid / tick) * tick
+                if raw_ask is not None and tick > 0:
                     raw_ask = math.ceil(raw_ask / tick) * tick
                 levels.append((raw_bid, raw_ask))
             return levels
@@ -2781,25 +2822,33 @@ async def market_making_loop(client):
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
+            # Update vol_obi skew normalization to match dynamic position limit
+            _max_pos = _dynamic_max_position_dollar(snap_mid, snap_capital, base_amount)
+            calc = state.vol_obi_state.calculator
+            if calc is not None and _max_pos > 0:
+                calc.set_max_position_dollar(_max_pos)
+
             level_prices = calculate_order_prices(
-                snap_mid, position_size=snap_position)
+                snap_mid, position_size=snap_position,
+                capital=snap_capital, base_amount=base_amount)
 
             # Log level-0 quote (rate-limited to once every 10s)
             buy_0, sell_0 = level_prices[0]
-            if buy_0 is not None and sell_0 is not None:
-                _now_mono = time.monotonic()
-                if _log_info and _now_mono - _last_quote_log_time >= 10.0:
-                    _last_quote_log_time = _now_mono
-                    bid_spread_pct = (snap_mid - buy_0) / snap_mid * 100 if snap_mid > 0 else 0
-                    ask_spread_pct = (sell_0 - snap_mid) / snap_mid * 100 if snap_mid > 0 else 0
+            _now_mono = time.monotonic()
+            if _log_info and _now_mono - _last_quote_log_time >= 10.0:
+                _last_quote_log_time = _now_mono
+                if buy_0 is not None or sell_0 is not None:
+                    bid_str = f"${buy_0:.4f} (-{(snap_mid - buy_0) / snap_mid * 100:.4f}%)" if buy_0 is not None else "LIMIT"
+                    ask_str = f"${sell_0:.4f} (+{(sell_0 - snap_mid) / snap_mid * 100:.4f}%)" if sell_0 is not None else "LIMIT"
+                    mode = "1-sided" if (buy_0 is None or sell_0 is None) else "2-sided"
                     logger.info(
-                        "QUOTING | Position: %+.4f | Mid: $%.4f | Bid: $%.4f (-%.4f%%) | Ask: $%.4f (+%.4f%%) | Quota: %s | Thr: %.0fbp",
-                        snap_position, snap_mid, buy_0, bid_spread_pct, sell_0, ask_spread_pct,
+                        "QUOTING (%s) | Pos: %+.4f | Mid: $%.4f | Bid: %s | Ask: %s | MaxPos: $%.0f | Quota: %s | Thr: %.0fbp",
+                        mode, snap_position, snap_mid, bid_str, ask_str,
+                        _max_pos,
                         _volume_quota_remaining if _volume_quota_remaining is not None else "?",
                         _adaptive_threshold_bps(),
                     )
-            else:
-                if _log_debug:
+                elif _log_debug:
                     logger.debug("Could not calculate quotes; skipping refresh.")
 
             # Quota recovery: if enabled, critically low, NOT in cooldown, and past post-warmup grace
@@ -3008,7 +3057,7 @@ async def main():
         skew=VOL_OBI_SKEW,
         looking_depth=VOL_OBI_LOOKING_DEPTH,
         min_warmup_samples=VOL_OBI_MIN_WARMUP_SAMPLES,
-        max_position_dollar=VOL_OBI_MAX_POSITION_DOLLAR,
+        max_position_dollar=500.0,  # placeholder; updated dynamically each loop
     )
     logger.info(
         "📈 Spread mode: vol_obi (Volatility + OBI) | "

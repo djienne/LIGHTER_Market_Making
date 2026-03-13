@@ -76,6 +76,9 @@ This conserves quota when it's scarce by only requoting on larger price moves.
 ### Quota Recovery
 When quota drops below threshold, the bot can execute small IOC market orders via the free 15-second slot to generate fill volume and rebuild quota.
 
+### Dynamic Position Limit
+The maximum position size is computed dynamically each loop iteration from live account data: `(available_capital * leverage - 2 * order_value) * 0.9`. When position value reaches this limit, the side that would increase exposure is suppressed (buy orders suppressed when long at limit, sell orders suppressed when short at limit) and any existing orders on that side are canceled. The vol_obi skew normalization stays in sync with this dynamic limit.
+
 ### Safety Controls
 - **Orderbook sanity**: periodic REST snapshots cross-checked against WS book
 - **Stale order poller**: reconciles local vs exchange order state
@@ -109,7 +112,6 @@ When quota drops below threshold, the bot can execute small IOC market orders vi
 | `skew` | `3.0` | Global skew scaling factor |
 | `looking_depth` | `0.025` | Book depth fraction for OBI |
 | `min_warmup_samples` | `100` | Samples before live quoting |
-| `max_position_dollar` | `500.0` | Position cap for inventory skew |
 | `warmup_seconds` | `600` | Warmup period (10 minutes) |
 
 ### `trading.alpha`

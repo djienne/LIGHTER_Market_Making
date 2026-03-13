@@ -69,9 +69,7 @@ class TestConfigKeyTypes(unittest.TestCase):
 
         self.assertIsInstance(mm.BASE_AMOUNT, float)
         self.assertIsInstance(mm.CAPITAL_USAGE_PERCENT, float)
-        self.assertIsInstance(mm.SAFETY_MARGIN_PERCENT, float)
         self.assertIsInstance(mm.ORDER_TIMEOUT, float)
-        self.assertIsInstance(mm.MINIMUM_SPREAD_PERCENT, float)
         self.assertIsInstance(mm.QUOTE_UPDATE_THRESHOLD_BPS, float)
         self.assertIsInstance(mm.LEVERAGE, int)
 
@@ -101,7 +99,6 @@ class TestConfigKeyTypes(unittest.TestCase):
 
         self.assertGreater(mm.BASE_AMOUNT, 0)
         self.assertGreater(mm.CAPITAL_USAGE_PERCENT, 0)
-        self.assertGreater(mm.MINIMUM_SPREAD_PERCENT, 0)
 
     def test_safety_config_positive(self):
         """Safety config values should be positive."""

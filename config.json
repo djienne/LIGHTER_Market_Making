@@ -20,7 +20,6 @@
             "skew": 3.0,
             "looking_depth": 0.025,
             "min_warmup_samples": 100,
-            "max_position_dollar": 500.0,
             "warmup_seconds": 600
         },
         "alpha": {
