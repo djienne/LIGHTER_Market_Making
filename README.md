@@ -8,6 +8,11 @@ Affiliate link to support this project: [Trade on Lighter](https://app.lighter.x
 
 ### Prerequisites
 - Python 3.13+ (venv recommended)
+- C compiler and Python dev headers — required to build the Cython extension
+  - Debian/Ubuntu: `sudo apt install build-essential python3-dev`
+  - macOS: `xcode-select --install`
+  - Windows (MinGW — recommended): install [MinGW-w64](https://www.mingw-w64.org/) (or via [WinLibs](https://winlibs.com/)), add its `bin/` to `PATH`, then build with `python setup_cython.py build_ext --inplace --compiler=mingw32`
+  - Windows (MSVC — alternative): install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload
 - Lighter API credentials (private key, public key, account index, API key index)
 
 ### Installation
@@ -15,7 +20,10 @@ Affiliate link to support this project: [Trade on Lighter](https://app.lighter.x
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+python setup_cython.py build_ext --inplace
 ```
+
+The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -march=native -ffast-math` for ~30x faster order book and spread computation. The bot works without it (pure-Python fallback) but the extension is strongly recommended for production.
 
 ### Configuration
 
@@ -42,6 +50,8 @@ Always use `-u` for unbuffered log output. Logs are written to stdout and `logs/
 ```
 market_maker_v2.py       Main market-making loop
 vol_obi.py               VolObiCalculator + RollingStats spread model
+_vol_obi_fast.pyx        Cython extension (RollingStats, VolObiCalculator, CBookSide)
+setup_cython.py          Build script for the Cython extension
 binance_obi.py           Binance Futures OBI alpha signal
 orderbook.py             Local order book update logic
 orderbook_sanity.py      WS vs REST book cross-check
