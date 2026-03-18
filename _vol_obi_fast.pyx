@@ -253,7 +253,7 @@ cdef class RollingStats:
     # -- C-level hot methods (called from VolObiCalculator with zero dispatch) --
 
     cdef inline void c_push(self, double value) noexcept nogil:
-        cdef int idx = self._write_pos % self._capacity
+        cdef int idx = self._write_pos
         cdef int n
         cdef double old, old_mean, new_mean
 
@@ -278,6 +278,8 @@ cdef class RollingStats:
         self._sum += value
         self._count += 1
         self._write_pos += 1
+        if self._write_pos >= self._capacity:
+            self._write_pos = 0
         n = self._count
         old_mean = self._cached_mean
         new_mean = self._sum / n
