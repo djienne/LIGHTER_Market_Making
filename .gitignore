@@ -12,3 +12,6 @@ logs/
 *.zip
 bot.log
 lighter_data/
+*.so
+_vol_obi_fast.c
+build/

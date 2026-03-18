@@ -21,7 +21,10 @@ import argparse
 import requests
 import sys as _sys
 import types as _types
-from sortedcontainers import SortedDict
+try:
+    from _vol_obi_fast import CBookSide as _BookSide
+except ImportError:
+    from sortedcontainers import SortedDict as _BookSide
 import websockets
 from utils import EPSILON, get_market_details_async, load_config_params
 from adjust_leverage import adjust_leverage
@@ -327,7 +330,7 @@ class MarketState:
     last_order_book_update: float = 0.0
     ws_connection_healthy: bool = False
     local_order_book: dict = field(default_factory=lambda: {
-        'bids': SortedDict(), 'asks': SortedDict(), 'initialized': False
+        'bids': _BookSide(), 'asks': _BookSide(), 'initialized': False
     })
     last_mid_price: Optional[float] = None
     ticker_best_bid: Optional[float] = None
@@ -1257,7 +1260,7 @@ def on_order_book_update(market_id, payload):
                 # NOT here. In-connection snapshots (server refreshes) should not discard
                 # accumulated volatility/OBI data.
 
-            # Calculate mid price using SortedDict O(1) peek
+            # Calculate mid price using O(1) peek
             state.market.ws_connection_healthy = True
             state.market.last_order_book_update = time.monotonic()
 
