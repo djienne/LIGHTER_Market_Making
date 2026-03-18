@@ -5,6 +5,12 @@ from sortedcontainers import SortedDict
 
 from vol_obi import RollingStats, VolObiCalculator
 
+try:
+    from _vol_obi_fast import CBookSide
+    _HAS_CBOOKSIDE = True
+except ImportError:
+    _HAS_CBOOKSIDE = False
+
 
 # ---------------------------------------------------------------------------
 # RollingStats tests
@@ -235,3 +241,105 @@ class TestVolObiCalculator(unittest.TestCase):
         # After reset + warm-up, alpha should be Lighter-computed, not 5.0
         _warm_up_calculator(calc, mid=3000.0, spread=0.2)
         self.assertNotAlmostEqual(calc.alpha, 5.0)
+
+
+# ---------------------------------------------------------------------------
+# VolObiCalculator tests with CBookSide (fast path)
+# ---------------------------------------------------------------------------
+
+def _make_book_c(bid_price, ask_price, bid_size=1.0, ask_size=1.0):
+    """Create CBookSide bid/ask books for testing the C fast path."""
+    bids = CBookSide({bid_price: bid_size})
+    asks = CBookSide({ask_price: ask_size})
+    return bids, asks
+
+
+def _warm_up_calculator_c(calc, mid=3000.0, spread=0.1, n=None):
+    """Feed enough updates to warm up using CBookSide books."""
+    if n is None:
+        n = calc._min_warmup_samples + 10
+    for i in range(n):
+        offset = spread * (0.5 if i % 2 == 0 else -0.5)
+        m = mid + offset
+        bids, asks = _make_book_c(m - 0.05, m + 0.05)
+        calc.on_book_update(m, bids, asks)
+
+
+@unittest.skipUnless(_HAS_CBOOKSIDE, "CBookSide not available")
+class TestVolObiCalculatorCBookSide(unittest.TestCase):
+    """Re-run key VolObiCalculator tests with CBookSide to verify C fast path."""
+
+    def _make_calc(self, tick_size=0.01, **kw):
+        defaults = dict(
+            window_steps=200,
+            step_ns=100_000_000,
+            vol_to_half_spread=0.8,
+            min_half_spread_bps=2.0,
+            c1_ticks=160.0,
+            c1=0.0,
+            skew=1.0,
+            looking_depth=0.025,
+            min_warmup_samples=50,
+            max_position_dollar=500.0,
+        )
+        defaults.update(kw)
+        return VolObiCalculator(tick_size=tick_size, **defaults)
+
+    def test_warmup_produces_quotes(self):
+        calc = self._make_calc()
+        _warm_up_calculator_c(calc, mid=3000.0, spread=0.2)
+        self.assertTrue(calc.warmed_up)
+        bid, ask = calc.quote(3000.0, 0.0)
+        self.assertIsNotNone(bid)
+        self.assertIsNotNone(ask)
+        self.assertLess(bid, 3000.0)
+        self.assertGreater(ask, 3000.0)
+
+    def test_position_skew_long(self):
+        calc = self._make_calc(min_half_spread_bps=0.0, tick_size=0.001)
+        _warm_up_calculator_c(calc, mid=3000.0, spread=0.5)
+        bid_neutral, ask_neutral = calc.quote(3000.0, 0.0)
+        bid_long, ask_long = calc.quote(3000.0, 0.15)
+        self.assertLess(bid_long, bid_neutral)
+        self.assertLess(ask_long, ask_neutral)
+
+    def test_position_skew_short(self):
+        calc = self._make_calc(min_half_spread_bps=0.0, tick_size=0.001)
+        _warm_up_calculator_c(calc, mid=3000.0, spread=0.5)
+        bid_neutral, ask_neutral = calc.quote(3000.0, 0.0)
+        bid_short, ask_short = calc.quote(3000.0, -0.15)
+        self.assertGreater(bid_short, bid_neutral)
+        self.assertGreater(ask_short, ask_neutral)
+
+    def test_numeric_equivalence_with_sorteddict(self):
+        """CBookSide and SortedDict paths must produce identical results."""
+        calc_c = self._make_calc(min_half_spread_bps=0.0, tick_size=0.001)
+        calc_s = self._make_calc(min_half_spread_bps=0.0, tick_size=0.001)
+
+        mid = 3000.0
+        for i in range(70):
+            offset = 0.3 * (0.5 if i % 2 == 0 else -0.5)
+            m = mid + offset
+            bids_c, asks_c = _make_book_c(m - 0.05, m + 0.05)
+            bids_s, asks_s = _make_book(m - 0.05, m + 0.05)
+            calc_c.on_book_update(m, bids_c, asks_c)
+            calc_s.on_book_update(m, bids_s, asks_s)
+
+        self.assertAlmostEqual(calc_c.volatility, calc_s.volatility, places=12)
+        self.assertAlmostEqual(calc_c.alpha, calc_s.alpha, places=12)
+
+        bid_c, ask_c = calc_c.quote(mid, 0.01)
+        bid_s, ask_s = calc_s.quote(mid, 0.01)
+        self.assertAlmostEqual(bid_c, bid_s, places=12)
+        self.assertAlmostEqual(ask_c, ask_s, places=12)
+
+    def test_alpha_override_injection(self):
+        calc = self._make_calc()
+        _warm_up_calculator_c(calc, mid=3000.0, spread=0.2)
+        calc.set_alpha_override(3.0)
+        bids, asks = _make_book_c(2999.95, 3000.05)
+        calc.on_book_update(3000.0, bids, asks)
+        self.assertAlmostEqual(calc.alpha, 3.0)
+        calc.set_alpha_override(None)
+        calc.on_book_update(3000.0, bids, asks)
+        self.assertNotAlmostEqual(calc.alpha, 3.0)
