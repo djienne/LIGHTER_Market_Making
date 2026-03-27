@@ -402,16 +402,20 @@ class DryRunEngine:
         self._total_volume += fill_size * fill_price
 
         # Capital impact: margin adjustment + realized PnL
-        reducing = self._is_reducing(sim.side, old_pos)
-        if reducing:
-            # Release margin at the *entry* price (what was originally locked)
-            # and credit the realized PnL separately.
-            margin_release = fill_size * self._entry_price_before / self._leverage
+        # On a position flip (e.g. long 0.5 → sell 1.0), only reduce_qty
+        # releases margin; the excess opens the opposite side and consumes margin.
+        if self._is_reducing(sim.side, old_pos):
+            reduce_qty = min(fill_size, abs(old_pos))
+            excess = fill_size - reduce_qty
+            # Release margin for the closing portion + credit realized PnL
+            margin_release = reduce_qty * self._entry_price_before / self._leverage
             self._state.account.available_capital += margin_release + realized_delta
+            # Consume margin for the flipping portion (new opposite position)
+            if excess > 1e-12:
+                self._state.account.available_capital -= excess * fill_price / self._leverage
         else:
-            # Consume margin for new/increased position
-            margin_consumed = fill_size * fill_price / self._leverage
-            self._state.account.available_capital -= margin_consumed
+            # Purely increasing position
+            self._state.account.available_capital -= fill_size * fill_price / self._leverage
 
         # Keep portfolio_value in sync: initial portfolio + realized + unrealized
         self._state.account.portfolio_value = (
@@ -522,6 +526,10 @@ class DryRunEngine:
         if now - self._last_summary < self._log_interval:
             return
         self._last_summary = now
+        # Refresh mark-to-market portfolio value (unrealized changes with mid)
+        self._state.account.portfolio_value = (
+            self._initial_portfolio_value + self._realized_pnl + self.unrealized_pnl
+        )
         mid = self._state.market.mid_price or 0.0
         self._log.info(
             "DRY-RUN SUMMARY | pos=%.6f | entry=$%.2f | mid=$%.2f | "

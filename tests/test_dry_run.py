@@ -573,6 +573,102 @@ class TestBugFixes(unittest.TestCase):
             self.assertAlmostEqual(mm.state.account.portfolio_value, 1005.0)
 
 
+    def test_position_flip_margin_accounting(self):
+        """Bug 7: flip from long to short must split margin correctly."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_ask_order_id=None,
+            current_bid_price=None, current_ask_price=None,
+            current_bid_size=None, current_ask_size=None,
+            _PRICE_TICK_FLOAT=0.1, available_capital=1000.0,
+            portfolio_value=1000.0, current_position_size=0.0,
+            current_mid_price_cached=102.0,
+        ):
+            engine = _make_engine(leverage=2)
+
+            # Buy 0.5 @ 100: margin = 0.5*100/2 = 25, capital = 975
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 2.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(mm.state.account.available_capital, 975.0)
+            self.assertAlmostEqual(engine._position, 0.5)
+
+            # Sell 1.0 @ 102: closes 0.5 long + opens 0.5 short
+            # Close 0.5: release margin 0.5*100/2=25, PnL=0.5*(102-100)=1
+            # Open 0.5 short: consume margin 0.5*102/2=25.5
+            # capital = 975 + 25 + 1 - 25.5 = 975.5
+            self._run(engine.process_batch([
+                mm.BatchOp("sell", 0, "create", 102.0, 1.0, 2, 0),
+            ]))
+            bids, asks = _book({102.0: 2.0}, {103.0: 1.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, -0.5)
+            self.assertAlmostEqual(engine._realized_pnl, 1.0)
+            self.assertAlmostEqual(mm.state.account.available_capital, 975.5)
+
+    def test_portfolio_value_updates_between_fills(self):
+        """Bug 8: portfolio_value must refresh on maybe_log_summary."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, portfolio_value=1000.0,
+            current_position_size=0.0, current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine(leverage=2, log_interval=0)
+            engine.capture_initial_state()
+
+            # Buy 1 @ 100
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 2.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(mm.state.account.portfolio_value, 1000.0)
+
+            # Mid moves to 110 — no fill, just summary
+            mm.state.market.mid_price = 110.0
+            engine.maybe_log_summary()
+
+            # portfolio should now reflect unrealized = 1*(110-100) = 10
+            self.assertAlmostEqual(mm.state.account.portfolio_value, 1010.0)
+
+    def test_corrupt_state_seeds_default_capital(self):
+        """Bug 9: corrupt state file must not leave capital at zero."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "state.json")
+            # Write corrupt JSON
+            with open(state_path, "w") as f:
+                f.write("{bad json")
+
+            with temp_mm_attrs(
+                available_capital=None, portfolio_value=None,
+                current_position_size=0.0, current_mid_price_cached=100.0,
+            ):
+                # load_state should fail and return None
+                loaded = DryRunEngine.load_state(
+                    state_path,
+                    state=mm.state,
+                    order_manager=mm.order_manager,
+                    client_to_exchange_id=mm._client_to_exchange_id,
+                    leverage=2,
+                    logger=mm.logger,
+                    sim_latency_s=0,
+                )
+                self.assertIsNone(loaded)
+
+                # Simulate what main() does: seed defaults before fresh engine
+                if mm.state.account.available_capital is None:
+                    mm.state.account.available_capital = 1000.0
+                    mm.state.account.portfolio_value = 1000.0
+                    mm.state.account.position_size = 0.0
+
+                engine = _make_engine()
+                engine.capture_initial_state()
+                self.assertAlmostEqual(engine._initial_capital, 1000.0)
+                self.assertAlmostEqual(engine._initial_portfolio_value, 1000.0)
+
+
 class TestSimulatedLatency(unittest.TestCase):
     """Test the sim_latency_s feature."""
 

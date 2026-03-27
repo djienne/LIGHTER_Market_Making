@@ -3376,6 +3376,12 @@ async def main():
                     state_path=_dr_state_path,
                 )
             if _dry_run_engine is None:
+                # Seed defaults if load_state failed on corrupt file
+                if state.account.available_capital is None:
+                    state.account.available_capital = _dr_default_capital
+                    state.account.portfolio_value = _dr_default_capital
+                    state.account.position_size = 0.0
+                    logger.warning("DRY-RUN: state load failed — using default $%.2f", _dr_default_capital)
                 _dry_run_engine = DryRunEngine(
                     state=state,
                     order_manager=order_manager,
