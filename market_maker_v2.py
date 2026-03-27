@@ -2863,21 +2863,31 @@ async def market_making_loop(client):
                                     order_id=ask_id, exchange_id=exchange_id,
                                 ))
                     if cancel_ops:
-                        if await _wait_for_write_slot(op_count=len(cancel_ops), cancel_only=True):
+                        if _dry_run_engine is not None:
+                            await _dry_run_engine.process_batch(cancel_ops)
+                        elif await _wait_for_write_slot(op_count=len(cancel_ops), cancel_only=True):
                             await sign_and_send_batch(client, cancel_ops)
                     elif _has_live_local_orders():
                         logger.info("Pause cleanup waiting for exchange order ids before sending cancels.")
 
-                    reconcile_ok = False
-                    try:
-                        reconcile_ok = await reconcile_orders_with_exchange(client, source="pause_cancel_verify")
-                    except Exception as exc:
-                        logger.error("Post-pause reconciliation failed: %s", exc)
-                    if reconcile_ok and not _has_live_local_orders():
-                        risk_controller.pause_cancel_done = True
-                        risk_controller._pause_cleanup_attempts = 0
+                    if DRY_RUN:
+                        # No exchange to reconcile; just check local state
+                        if not _has_live_local_orders():
+                            risk_controller.pause_cancel_done = True
+                            risk_controller._pause_cleanup_attempts = 0
+                        else:
+                            logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
                     else:
-                        logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
+                        reconcile_ok = False
+                        try:
+                            reconcile_ok = await reconcile_orders_with_exchange(client, source="pause_cancel_verify")
+                        except Exception as exc:
+                            logger.error("Post-pause reconciliation failed: %s", exc)
+                        if reconcile_ok and not _has_live_local_orders():
+                            risk_controller.pause_cancel_done = True
+                            risk_controller._pause_cleanup_attempts = 0
+                        else:
+                            logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
