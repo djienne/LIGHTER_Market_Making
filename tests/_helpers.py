@@ -49,6 +49,8 @@ def temp_mm_attrs(**overrides):
     # Save and clear the ID mapping to prevent cross-test pollution
     saved_id_mapping = dict(mm._client_to_exchange_id)
     mm._client_to_exchange_id.clear()
+    # Always save/restore local_order_book to prevent cross-test leaks
+    saved_ob = mm.state.market.local_order_book
 
     for name, value in overrides.items():
         if name in _STATE_MAP:
@@ -75,6 +77,7 @@ def temp_mm_attrs(**overrides):
                 setattr(obj, attr, orig)
         mm._client_to_exchange_id.clear()
         mm._client_to_exchange_id.update(saved_id_mapping)
+        mm.state.market.local_order_book = saved_ob
 
 
 @contextmanager
