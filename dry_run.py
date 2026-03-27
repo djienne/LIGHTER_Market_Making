@@ -37,6 +37,13 @@ class SimulatedOrder:
     eligible_at: float = 0.0        # not fillable until this monotonic time (create/modify latency)
     pending_cancel_at: float = 0.0  # if >0, order removed after this time (cancel latency)
     _prev_by_price: dict = field(default_factory=dict)  # per-price liquidity seen on last check (for delta-fill)
+    _arrival_checked: bool = False   # POST_ONLY recheck done at simulated arrival time
+    _queue_ts: float = 0.0          # monotonic timestamp for same-price FIFO priority
+    # Pending modify: old price remains fillable while the modify is in-flight.
+    # When eligible_at expires, the pending price is promoted to the live price.
+    _pending_price: Optional[float] = None
+    _pending_size: Optional[float] = None
+    _pending_prev_by_price: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +287,9 @@ class DryRunEngine:
             created_at=now,
             synthetic_exchange_id=eid,
             eligible_at=now + self._sim_latency,
+            _queue_ts=now,
+            # No in-flight window → submit-time check is sufficient
+            _arrival_checked=(self._sim_latency <= 0),
         )
 
         # Snapshot current qualifying depth so first fill check after
@@ -313,11 +323,71 @@ class DryRunEngine:
         if sim is None:
             self._log.warning("DRY-RUN MODIFY: cid=%d not found", op.order_id)
             return
+
+        # POST_ONLY check for the new price — on rejection, keep old order live
+        ob = self._state.market.local_order_book
+        if op.side == "buy":
+            asks = ob.get('asks')
+            if asks and len(asks) > 0 and asks.peekitem(0)[0] <= op.price:
+                self._log.info(
+                    "DRY-RUN REJECT-MODIFY %s L%d: @ $%.2f -> $%.2f "
+                    "(POST_ONLY: best_ask $%.2f <= new price; old order kept)",
+                    op.side.upper(), op.level, sim.price, op.price,
+                    asks.peekitem(0)[0],
+                )
+                return  # old order stays live at old price
+        else:
+            bids = ob.get('bids')
+            if bids and len(bids) > 0 and bids.peekitem(-1)[0] >= op.price:
+                self._log.info(
+                    "DRY-RUN REJECT-MODIFY %s L%d: @ $%.2f -> $%.2f "
+                    "(POST_ONLY: best_bid $%.2f >= new price; old order kept)",
+                    op.side.upper(), op.level, sim.price, op.price,
+                    bids.peekitem(-1)[0],
+                )
+                return  # old order stays live at old price
+
         old_price = sim.price
-        sim.price = op.price
-        sim.size = op.size
-        sim.eligible_at = time.monotonic() + self._sim_latency
-        sim._prev_by_price = {}  # repriced order is fresh for fill accounting
+        now = time.monotonic()
+
+        # Snapshot qualifying depth for the NEW price
+        new_snapshot: dict = {}
+        if op.side == "buy":
+            asks = ob.get('asks')
+            if asks:
+                for ask_price, ask_size in asks.items():
+                    if ask_price > op.price:
+                        break
+                    new_snapshot[ask_price] = ask_size
+        else:
+            bids = ob.get('bids')
+            if bids:
+                for bid_price in reversed(bids):
+                    if bid_price < op.price:
+                        break
+                    new_snapshot[bid_price] = bids[bid_price]
+
+        if self._sim_latency <= 0:
+            # No latency: switch immediately
+            sim.price = op.price
+            sim.size = op.size
+            sim._prev_by_price = new_snapshot
+            sim._arrival_checked = True
+            sim._queue_ts = now
+            sim._pending_price = None
+            sim._pending_size = None
+            sim._pending_prev_by_price = None
+        else:
+            # Latency > 0: old price stays fillable while modify is in-flight.
+            # Store new price as pending; promoted in check_fills when eligible.
+            # NOTE: don't reset _arrival_checked — the old price was already
+            # validated. The new price gets its own arrival check in check_fills
+            # when the pending modify is promoted.
+            sim._pending_price = op.price
+            sim._pending_size = op.size
+            sim._pending_prev_by_price = new_snapshot
+            sim.eligible_at = now + self._sim_latency
+
         self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
 
         self._log.info(
@@ -358,22 +428,80 @@ class DryRunEngine:
         buy_consumed = 0.0
         sell_consumed = 0.0
 
-        # Snapshot and sort by price priority: most aggressive orders fill first.
-        # Buys: higher price = more aggressive; Sells: lower price = more aggressive.
+        # Sort by price priority (most aggressive first), FIFO at equal price.
         orders = list(self._live_orders.values())
-        orders.sort(key=lambda s: (-s.price if s.side == "buy" else s.price))
+        orders.sort(key=lambda s: (-s.price if s.side == "buy" else s.price, s._queue_ts))
 
         for sim in orders:
-            # Skip orders still in-flight (create/modify latency)
-            if now < sim.eligible_at:
-                # Still process matured cancels for in-flight orders
+            # --- Promote pending modify when latency expires ---
+            if sim._pending_price is not None and now >= sim.eligible_at:
+                # POST_ONLY arrival check on the NEW price
+                rejected = False
+                if sim.side == "buy" and asks and len(asks) > 0:
+                    if asks.peekitem(0)[0] <= sim._pending_price:
+                        self._log.info(
+                            "DRY-RUN REJECT-MODIFY-AT-ARRIVAL %s L%d @ $%.2f "
+                            "(book crossed; old order kept at $%.2f)",
+                            sim.side.upper(), sim.level, sim._pending_price, sim.price,
+                        )
+                        rejected = True
+                elif sim.side == "sell" and bids and len(bids) > 0:
+                    if bids.peekitem(-1)[0] >= sim._pending_price:
+                        self._log.info(
+                            "DRY-RUN REJECT-MODIFY-AT-ARRIVAL %s L%d @ $%.2f "
+                            "(book crossed; old order kept at $%.2f)",
+                            sim.side.upper(), sim.level, sim._pending_price, sim.price,
+                        )
+                        rejected = True
+                if rejected:
+                    # Clear pending state, keep old order live
+                    sim._pending_price = None
+                    sim._pending_size = None
+                    sim._pending_prev_by_price = None
+                else:
+                    # Promote: switch to new price
+                    sim.price = sim._pending_price
+                    sim.size = sim._pending_size
+                    sim._prev_by_price = sim._pending_prev_by_price or {}
+                    sim._queue_ts = now  # refreshed for FIFO
+                    sim._pending_price = None
+                    sim._pending_size = None
+                    sim._pending_prev_by_price = None
+
+            # --- Skip orders in-flight for CREATE (not pending-modify) ---
+            if now < sim.eligible_at and sim._pending_price is None:
+                # Pure create in-flight: not fillable yet
                 if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
                     self._live_orders.pop(sim.client_order_id, None)
                     self._om.clear_live(sim.side, sim.level)
                 continue
 
-            # Check fills FIRST — order is live and fillable even during
-            # the cancel latency window (cancel is still in-transit).
+            # POST_ONLY recheck at simulated arrival time (for creates)
+            if not sim._arrival_checked:
+                sim._arrival_checked = True
+                if sim.side == "buy" and asks and len(asks) > 0:
+                    if asks.peekitem(0)[0] <= sim.price:
+                        self._log.info(
+                            "DRY-RUN REJECT-AT-ARRIVAL %s L%d @ $%.2f "
+                            "(book crossed during latency)",
+                            sim.side.upper(), sim.level, sim.price,
+                        )
+                        self._live_orders.pop(sim.client_order_id, None)
+                        self._om.clear_live(sim.side, sim.level)
+                        continue
+                elif sim.side == "sell" and bids and len(bids) > 0:
+                    if bids.peekitem(-1)[0] >= sim.price:
+                        self._log.info(
+                            "DRY-RUN REJECT-AT-ARRIVAL %s L%d @ $%.2f "
+                            "(book crossed during latency)",
+                            sim.side.upper(), sim.level, sim.price,
+                        )
+                        self._live_orders.pop(sim.client_order_id, None)
+                        self._om.clear_live(sim.side, sim.level)
+                        continue
+
+            # Check fills at current (possibly old) price.
+            # Orders with a pending modify are still fillable at the old price.
             if sim.side == "buy":
                 fill, buy_consumed = self._check_buy_fill(sim, asks, buy_consumed)
             else:

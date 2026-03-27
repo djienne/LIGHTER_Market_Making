@@ -740,8 +740,9 @@ class TestSimulatedLatency(unittest.TestCase):
                 mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
             ]))
 
-            # Manually expire latency (deterministic, no sleep)
+            # Manually expire latency + arrival check (deterministic)
             engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
 
             bids, asks = _book({99.0: 1.0}, {100.0: 2.0})
             engine.check_fills(bids, asks)
@@ -789,8 +790,9 @@ class TestSimulatedLatency(unittest.TestCase):
             self._run(engine.process_batch([
                 mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
             ]))
-            # Make it eligible (past create latency)
+            # Make it eligible (past create latency + arrival check)
             engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
 
             # Submit cancel — still in-flight for 10s
             self._run(engine.process_batch([
@@ -817,6 +819,7 @@ class TestSimulatedLatency(unittest.TestCase):
                 mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
             ]))
             engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
 
             self._run(engine.process_batch([
                 mm.BatchOp("buy", 0, "cancel", 0.0, 0.0, 1,
@@ -846,6 +849,7 @@ class TestSimulatedLatency(unittest.TestCase):
                 mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
             ]))
             engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
 
             # Submit cancel
             self._run(engine.process_batch([
@@ -976,6 +980,225 @@ class TestPostOnlyReject(unittest.TestCase):
             engine.check_fills(bids, asks)
             self.assertAlmostEqual(engine._position, 0.5)
             self.assertEqual(engine._fill_count, 1)
+
+
+class TestArrivalTimeReject(unittest.TestCase):
+    """POST_ONLY recheck at simulated arrival time (eligible_at expiry)."""
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_create_rejected_at_arrival_buy(self):
+        """Buy non-marketable at submit, but book crosses during latency → reject."""
+        # At submit: best_ask $101 > price $100 → accepted
+        ob = {'bids': SortedDict({98.0: 1.0}), 'asks': SortedDict({101.0: 2.0})}
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+            local_order_book=ob,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            self.assertIn(1, engine._live_orders)
+
+            # Expire latency — book now has ask at $100 (crossed)
+            engine._live_orders[1].eligible_at = 0
+            bids, asks = _book({98.0: 1.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # Should be rejected at arrival, not filled
+            self.assertNotIn(1, engine._live_orders)
+            self.assertEqual(engine._fill_count, 0)
+            self.assertAlmostEqual(engine._position, 0.0)
+
+    def test_create_rejected_at_arrival_sell(self):
+        """Sell non-marketable at submit, but book crosses during latency → reject."""
+        ob = {'bids': SortedDict({99.0: 1.0}), 'asks': SortedDict({102.0: 2.0})}
+        with temp_mm_attrs(
+            current_ask_order_id=None, current_ask_price=None,
+            current_ask_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+            local_order_book=ob,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            self._run(engine.process_batch([
+                mm.BatchOp("sell", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            self.assertIn(1, engine._live_orders)
+
+            # Expire latency — bid now at $100 (crossed)
+            engine._live_orders[1].eligible_at = 0
+            bids, asks = _book({100.0: 2.0}, {102.0: 1.0})
+            engine.check_fills(bids, asks)
+
+            self.assertNotIn(1, engine._live_orders)
+            self.assertEqual(engine._fill_count, 0)
+
+    def test_create_passes_arrival_if_book_clear(self):
+        """Non-marketable at both submit and arrival → fills normally."""
+        ob = {'bids': SortedDict({98.0: 1.0}), 'asks': SortedDict({101.0: 2.0})}
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+            local_order_book=ob,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            engine._live_orders[1].eligible_at = 0
+
+            # Book still not crossed at arrival (best_ask $101 > $100)
+            bids, asks = _book({98.0: 1.0}, {101.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # Arrival check passes, no fill (ask $101 > price $100)
+            self.assertIn(1, engine._live_orders)
+            self.assertEqual(engine._fill_count, 0)
+
+            # Now ask drops to $100 — should fill (new depth)
+            bids, asks = _book({98.0: 1.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.5)
+
+    def test_modify_rejected_keeps_old_order(self):
+        """Modify to marketable price is rejected; old order stays live."""
+        ob = {'bids': SortedDict({98.0: 1.0}), 'asks': SortedDict({99.0: 2.0})}
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+            local_order_book=ob,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            # Create at $97 (non-marketable, best_ask $99)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 97.0, 0.5, 1, 0),
+            ]))
+            engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
+
+            # Modify to $100 — best_ask $99 <= $100 → rejected
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "modify", 100.0, 0.5, 1,
+                           mm._client_to_exchange_id[1]),
+            ]))
+            # Old order stays live at original price
+            self.assertIn(1, engine._live_orders)
+            self.assertAlmostEqual(engine._live_orders[1].price, 97.0)
+
+
+class TestModifyLatency(unittest.TestCase):
+    """Old price stays fillable during modify latency."""
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_old_price_fillable_during_modify(self):
+        """Order at old price should fill while modify is in-flight."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            # Create buy at $100
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
+
+            # Modify to $101 — goes into pending state (10s latency)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "modify", 101.0, 0.5, 1,
+                           mm._client_to_exchange_id[1]),
+            ]))
+
+            # Order should still be at old price ($100), pending $101
+            self.assertIn(1, engine._live_orders)
+            self.assertAlmostEqual(engine._live_orders[1].price, 100.0)
+            self.assertAlmostEqual(engine._live_orders[1]._pending_price, 101.0)
+
+            # Ask at $100 crosses old price — should fill at $100
+            bids, asks = _book({99.0: 1.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            self.assertAlmostEqual(engine._position, 0.5)
+            self.assertEqual(engine._fill_count, 1)
+
+    def test_modify_promotes_after_latency(self):
+        """Pending modify switches to new price when latency expires."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
+
+            # Modify to $101
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "modify", 101.0, 0.5, 1,
+                           mm._client_to_exchange_id[1]),
+            ]))
+
+            # Expire modify latency
+            engine._live_orders[1].eligible_at = 0
+
+            # Check fills — should promote to $101
+            bids, asks = _book({99.0: 1.0}, {102.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # Price should now be $101, pending cleared
+            self.assertAlmostEqual(engine._live_orders[1].price, 101.0)
+            self.assertIsNone(engine._live_orders[1]._pending_price)
+
+    def test_fifo_at_equal_price(self):
+        """At equal price, older order fills first (FIFO)."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+            # Order 1 at $100 (created first)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            # Order 2 at $100 (created second, later queue_ts)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 1, "create", 100.0, 0.5, 2, 0),
+            ]))
+
+            # Only 0.6 available — order 1 (older) should fill first (0.5),
+            # order 2 gets remainder (0.1)
+            bids, asks = _book({99.0: 1.0}, {100.0: 0.6})
+            engine.check_fills(bids, asks)
+
+            self.assertAlmostEqual(engine._position, 0.6, places=5)
+            # Order 1 fully filled
+            self.assertNotIn(1, engine._live_orders)
+            # Order 2 partially filled (0.1 of 0.5)
+            self.assertIn(2, engine._live_orders)
+            self.assertAlmostEqual(engine._live_orders[2].size, 0.4, places=5)
 
 
 class TestPricePriority(unittest.TestCase):

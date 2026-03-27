@@ -62,8 +62,9 @@ Fill logic follows POST_ONLY maker semantics with **delta-fill** to avoid double
 
 Order operations simulate exchange latency (default **50ms**, tunable):
 
-- **Create/Modify**: order is not eligible for fills until `eligible_at = now + latency`. This simulates the order being in-flight to the exchange.
-- **Cancel**: order remains live and fillable during the latency window. After the delay, the order is removed. This simulates the real behavior where a cancel is in-transit and the order could still be hit.
+- **Create**: order is not eligible for fills until `eligible_at = now + latency`. At the moment the order becomes eligible (simulated arrival), a **POST_ONLY recheck** is performed against the live book. If the book has crossed the order price during the latency window, the order is rejected — matching the exchange behavior where a POST_ONLY order arriving into a crossed book is rejected, not filled.
+- **Modify**: the **old price remains fillable** while the modify is in-flight, because the exchange keeps the old order live until the modify lands. When the modify latency expires, the new price is promoted with a POST_ONLY arrival check. If the new price would cross the book, the modify is rejected and the old order stays live at the old price. A rejected modify at submit time also keeps the old order (matching live behavior where a failed modify doesn't cancel the existing order).
+- **Cancel**: order remains live and fillable during the latency window. After the delay, the order is removed. This simulates the real behavior where a cancel is in-transit and the order could still be hit. Fills are checked before cancel processing in the same tick.
 
 To tune latency, modify the `sim_latency_s` parameter in `main()` where `DryRunEngine` is initialized:
 
