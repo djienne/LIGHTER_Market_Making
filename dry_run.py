@@ -129,29 +129,30 @@ class DryRunEngine:
     # Persistence
     # ------------------------------------------------------------------
 
-    def save_state(self) -> None:
-        """Atomically write engine state to JSON (tmp + rename).
+    def _build_save_data(self) -> dict:
+        """Capture all wallet fields into a dict.
 
-        Thread-safe: the lock serializes concurrent calls from the main
-        thread (shutdown) and run_in_executor workers (periodic flush).
-        State is captured inside the lock so the last writer always
-        persists the most recent values.
+        Call on the event-loop thread so the snapshot is atomic w.r.t.
+        ``_process_fill`` (which also runs on the event-loop thread).
         """
+        return {
+            "available_capital": self._state.account.available_capital,
+            "portfolio_value": self._state.account.portfolio_value,
+            "position": self._position,
+            "entry_vwap": self._entry_vwap,
+            "realized_pnl": self._realized_pnl,
+            "fill_count": self._fill_count,
+            "total_volume": self._total_volume,
+            "initial_capital": self._initial_capital,
+            "initial_portfolio_value": self._initial_portfolio_value,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _write_save_data(self, data: dict) -> None:
+        """Write a pre-captured data dict to disk (thread-safe)."""
         if self._state_path is None:
             return
         with self._save_lock:
-            data = {
-                "available_capital": self._state.account.available_capital,
-                "portfolio_value": self._state.account.portfolio_value,
-                "position": self._position,
-                "entry_vwap": self._entry_vwap,
-                "realized_pnl": self._realized_pnl,
-                "fill_count": self._fill_count,
-                "total_volume": self._total_volume,
-                "initial_capital": self._initial_capital,
-                "initial_portfolio_value": self._initial_portfolio_value,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
             try:
                 dir_name = os.path.dirname(self._state_path) or "."
                 fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
@@ -160,6 +161,10 @@ class DryRunEngine:
                 os.replace(tmp, self._state_path)
             except OSError as exc:
                 self._log.warning("DRY-RUN: failed to save state: %s", exc)
+
+    def save_state(self) -> None:
+        """Atomically write engine state to JSON (tmp + rename)."""
+        self._write_save_data(self._build_save_data())
 
     @classmethod
     def load_state(
@@ -575,11 +580,22 @@ class DryRunEngine:
             self._trade_logger.flush()
 
     def _flush_to_disk_async(self) -> None:
-        """Submit disk flush to the thread-pool executor (non-blocking)."""
+        """Snapshot state on the event-loop thread, then dispatch I/O to executor.
+
+        Capturing the data dict here (on the same thread as ``_process_fill``)
+        guarantees the snapshot is internally consistent — no fill can
+        interleave between field reads.
+        """
         try:
             import asyncio
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, self._flush_to_disk_sync)
+            data = self._build_save_data()  # atomic w.r.t. _process_fill
+            tl = self._trade_logger
+            def _write():
+                self._write_save_data(data)
+                if tl is not None:
+                    tl.flush()
+            loop.run_in_executor(None, _write)
         except RuntimeError:
             # No running loop (e.g. during tests) — flush synchronously
             self._flush_to_disk_sync()

@@ -39,6 +39,7 @@ class TradeLogger:
         self._symbol = symbol
         self._buffer: list[list] = []
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._ensure_header()
 
     @property
@@ -49,9 +50,10 @@ class TradeLogger:
         """Write CSV header if file doesn't exist or is empty."""
         if os.path.exists(self._path) and os.path.getsize(self._path) > 0:
             return
-        with open(self._path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(_HEADER)
+        with self._write_lock:
+            with open(self._path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(_HEADER)
 
     # ------------------------------------------------------------------
     # Hot-path: in-memory only
@@ -93,7 +95,11 @@ class TradeLogger:
     # ------------------------------------------------------------------
 
     def flush(self) -> None:
-        """Write buffered rows to disk."""
+        """Write buffered rows to disk.
+
+        On write failure, rows are prepended back into the buffer so
+        they can be retried on the next flush.
+        """
         with self._lock:
             if not self._buffer:
                 return
@@ -102,13 +108,20 @@ class TradeLogger:
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerows(rows)
-        with open(self._path, "a", newline="") as f:
-            f.write(buf.getvalue())
+        try:
+            with self._write_lock:
+                with open(self._path, "a", newline="") as f:
+                    f.write(buf.getvalue())
+        except OSError:
+            with self._lock:
+                self._buffer[:0] = rows  # prepend for retry
+            raise
 
     def clear(self) -> None:
         """Delete the trade log and reset (used on capital reset)."""
         with self._lock:
             self._buffer.clear()
-        if os.path.exists(self._path):
-            os.remove(self._path)
+        with self._write_lock:
+            if os.path.exists(self._path):
+                os.remove(self._path)
         self._ensure_header()
