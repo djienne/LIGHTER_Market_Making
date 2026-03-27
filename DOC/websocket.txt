@@ -1,11 +1,24 @@
 WebSocket
 This page will help you get started with zkLighter WebSocket server.
+Last updated: 2026-03-27
+
+=== KNOWN CHANGES (audit notes) ===
+- Batch tx limit may now be 15 (was 50) -- verify before relying on 50
+- Clients must send at least one frame every 2 minutes (keepalive)
+- Server supports permessage-deflate compression
+===
 
 Connection
 Mainnet URL: wss://mainnet.zklighter.elliot.ai/stream
 Testnet URL: wss://testnet.zklighter.elliot.ai/stream
 
 Append ?readonly=true to connect in read-only mode (no transaction sending).
+
+Keepalive: Clients must send at least one frame (ping, pong, or message)
+every 2 minutes or the connection will be dropped.
+
+Compression: The server supports permessage-deflate WebSocket compression.
+Clients may negotiate this in the initial handshake for reduced bandwidth.
 
 Rate limits apply per IP address and per L1 address.
 
@@ -30,7 +43,8 @@ The tx_type options can be found in the SignerClient file, while tx_info can be 
 Example: ws_send_tx.py
 
 Send Batch Tx
-You can send batch transactions to execute up to 50 transactions in a single message.
+You can send batch transactions to execute up to 15 transactions in a single message.
+(NOTE: Previously documented as 50. Reduced to 15 -- verify against live API.)
 
 JSON
 

@@ -78,7 +78,7 @@ class TradeLogger:
             ts,
             self._symbol,
             side,
-            f"{price:.2f}",
+            f"{price:.10g}",
             f"{size:.6f}",
             level,
             f"{position_after:.6f}",

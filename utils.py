@@ -86,9 +86,8 @@ def load_config_params():
             return json.load(f)
     except FileNotFoundError:
         return {}
-    except json.JSONDecodeError:
-        print("Error decoding config.json")
-        return {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"FATAL: config.json has invalid JSON: {e}") from e
 
 def get_market_details(symbol: str) -> Tuple[Optional[int], float, Optional[float]]:
     return asyncio.run(get_market_details_async(symbol))

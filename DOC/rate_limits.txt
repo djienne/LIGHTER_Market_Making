@@ -1,22 +1,43 @@
 Lighter API Rate Limits
 =======================
 Source: https://apidocs.lighter.xyz/docs/rate-limits
+Last updated: 2026-03-27
 
 === REST API LIMITS ===
 
 Premium Accounts: 24,000 weighted requests per rolling minute
 Standard Accounts: 60 requests per rolling minute
 
+Note: When premium weighted limits divided by endpoint weight fall below
+standard limits, the stricter limit applies.
+
 Endpoint Weights:
-  Weight 6:     sendTx, sendTxBatch, nextNonce
-  Weight 50:    publicPools, txFromL1TxHash
-  Weight 100:   accountInactiveOrders, deposit/latest
-  Weight 150:   apikeys
-  Weight 300:   Most other endpoints (default)
-  Weight 500:   transferFeeInfo
-  Weight 600:   trades, recentTrades
-  Weight 3000:  changeAccountTier, tokens/*, setAccountMetadata,
-                notification/ack, createIntentAddress, fastwithdraw, referral/*
+  Weight 6:       sendTx, sendTxBatch, nextNonce
+  Weight 50:      publicPools, txFromL1TxHash
+  Weight 100:     accountInactiveOrders, deposit/latest
+  Weight 150:     apikeys
+  Weight 300:     Most other endpoints (default)
+  Weight 500:     transferFeeInfo
+  Weight 600:     trades, recentTrades
+  Weight 3,000:   changeAccountTier, tokens, tokens/revoke, setAccountMetadata,
+                  notification/ack, createIntentAddress, fastwithdraw, referral/*
+  Weight 23,000:  tokens/create
+
+=== PREMIUM sendTx/sendTxBatch PER-MINUTE SCALING ===
+
+Premium accounts get separate, scaled sendTx/sendTxBatch limits based on
+LIT stake (fee credits also count as staked LIT):
+
+  Staked LIT  | sendTx & sendTxBatch / min
+  ------------|---------------------------
+  0           | 4,000
+  1,000       | 5,000
+  3,000       | 6,000
+  10,000      | 7,000
+  30,000      | 8,000
+  100,000     | 12,000
+  300,000     | 24,000
+  500,000     | 40,000
 
 === EXPLORER API LIMITS ===
 
@@ -34,20 +55,25 @@ Max Inflight Messages:    50
 Unique Accounts:          10
 Connection Duration:      Automatically dropped after 24 hours
 
-=== TRANSACTION TYPE LIMITS (Standard Accounts Only) ===
+=== TRANSACTION TYPE LIMITS ===
 
-Default:                  40 requests/minute
-L2Withdraw:               2 requests/minute
-L2UpdateLeverage:         1 request/minute
-L2CreateSubAccount:       2 requests/minute
-L2CreatePublicPool:       2 requests/minute
-L2ChangePubKey:           2 requests/10 seconds
-L2Transfer:               1 request/minute
+These limits apply per user regardless of account tier:
+
+  Default:                40 requests/minute
+  L2Withdraw:             2 requests/minute
+  L2UpdateLeverage:       40 requests/minute
+  L2CreateSubAccount:     2 requests/minute
+  L2CreatePublicPool:     2 requests/minute
+  L2ChangePubKey:         300 requests/minute
+  L2Transfer:             120 requests/minute
+  L2MintShares:           1 request/15 seconds
+  L2UnstakeAssets:        1 request/15 seconds
 
 === RATE LIMIT VIOLATION BEHAVIOR ===
 
 Exceeding limits returns HTTP 429 Too Many Requests.
 Both REST and WebSocket connections share rate-limit enforcement.
+Potential WebSocket disconnection on violation.
 
 Cooldown periods:
   Firewall:     60 seconds (static)

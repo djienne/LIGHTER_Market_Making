@@ -49,7 +49,8 @@ def temp_mm_attrs(**overrides):
     # Save and clear the ID mapping to prevent cross-test pollution
     saved_id_mapping = dict(mm._client_to_exchange_id)
     mm._client_to_exchange_id.clear()
-    # Always save/restore local_order_book to prevent cross-test leaks
+    # Save/restore local_order_book by replacing with a fresh empty book on teardown.
+    # Cannot deepcopy because CBookSide (Cython) doesn't support __reduce__.
     saved_ob = mm.state.market.local_order_book
 
     for name, value in overrides.items():
@@ -77,7 +78,16 @@ def temp_mm_attrs(**overrides):
                 setattr(obj, attr, orig)
         mm._client_to_exchange_id.clear()
         mm._client_to_exchange_id.update(saved_id_mapping)
-        mm.state.market.local_order_book = saved_ob
+        # Restore original if it was replaced, or reset to fresh empty book
+        # if tests mutated the object in-place.
+        if 'local_order_book' in overrides:
+            mm.state.market.local_order_book = saved_ob
+        else:
+            # Reset to clean default to prevent in-place mutation leaks
+            from sortedcontainers import SortedDict as _SD
+            mm.state.market.local_order_book = {
+                'bids': _SD(), 'asks': _SD(), 'initialized': False
+            }
 
 
 @contextmanager
