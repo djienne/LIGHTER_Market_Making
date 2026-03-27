@@ -1,314 +1,216 @@
-ETH
-0 ETH
-BTC
-1 BTC
-SOL
-2 SOL
-DOGE
-3 DOGE
-1000PEPE
-4 1000PEPE
-WIF
-5 WIF
-WLD
-6 WLD
-XRP
-7 XRP
-LINK
-8 LINK
-AVAX
-9 AVAX
-NEAR
-10 NEAR
-DOT
-11 DOT
-TON
-12 TON
-TAO
-13 TAO
-POL
-14 POL
-TRUMP
-15 TRUMP
-SUI
-16 SUI
-1000SHIB
-17 1000SHIB
-1000BONK
-18 1000BONK
-1000FLOKI
-19 1000FLOKI
-BERA
-20 BERA
-FARTCOIN
-21 FARTCOIN
-AI16Z
-22 AI16Z
-POPCAT
-23 POPCAT
-HYPE
-24 HYPE
-BNB
-25 BNB
-JUP
-26 JUP
-AAVE
-27 AAVE
-MKR
-28 MKR
-ENA
-29 ENA
-UNI
-30 UNI
-APT
-31 APT
-SEI
-32 SEI
-KAITO
-33 KAITO
-IP
-34 IP
-LTC
-35 LTC
-CRV
-36 CRV
-PENDLE
-37 PENDLE
-ONDO
-38 ONDO
-ADA
-39 ADA
-S
-40 S
-VIRTUAL
-41 VIRTUAL
-SPX
-42 SPX
-TRX
-43 TRX
-SYRUP
-44 SYRUP
-PUMP
-45 PUMP
-LDO
-46 LDO
-PENGU
-47 PENGU
-PAXG
-48 PAXG
-EIGEN
-49 EIGEN
-ARB
-50 ARB
-RESOLV
-51 RESOLV
-GRASS
-52 GRASS
-ZORA
-53 ZORA
-LAUNCHCOIN
-54 LAUNCHCOIN
-OP
-55 OP
-ZK
-56 ZK
-PROVE
-57 PROVE
-BCH
-58 BCH
-HBAR
-59 HBAR
-ZRO
-60 ZRO
-GMX
-61 GMX
-DYDX
-62 DYDX
-MNT
-63 MNT
-ETHFI
-64 ETHFI
-AERO
-65 AERO
-USELESS
-66 USELESS
-TIA
-67 TIA
-MORPHO
-68 MORPHO
-VVV
-69 VVV
-YZY
-70 YZY
-XPL
-71 XPL
-WLFI
-72 WLFI
-CRO
-73 CRO
-NMR
-74 NMR
-DOLO
-75 DOLO
-LINEA
-76 LINEA
-XMR
-77 XMR
-PYTH
-78 PYTH
-SKY
-79 SKY
-MYX
-80 MYX
-1000TOSHI
-81 1000TOSHI
-AVNT
-82 AVNT
-ASTER
-83 ASTER
-0G
-84 0G
-STBL
-85 STBL
-APEX
-86 APEX
-FF
-87 FF
-2Z
-88 2Z
-EDEN
-89 EDEN
-ZEC
-90 ZEC
-MON
-91 MON
-XAU
-92 XAU
-XAG
-93 XAG
-MEGA
-94 MEGA
-MET
-95 MET
-EURUSD
-96 EURUSD
-GBPUSD
-97 GBPUSD
-USDJPY
-98 USDJPY
-USDCHF
-99 USDCHF
-USDCAD
-100 USDCAD
-CC
-101 CC
-ICP
-102 ICP
-FIL
-103 FIL
-STRK
-104 STRK
-USDKRW
-105 USDKRW
-AUDUSD
-106 AUDUSD
-NZDUSD
-107 NZDUSD
-HOOD
-108 HOOD
-COIN
-109 COIN
-NVDA
-110 NVDA
-PLTR
-111 PLTR
-TSLA
-112 TSLA
-AAPL
-113 AAPL
-AMZN
-114 AMZN
-MSFT
-115 MSFT
-GOOGL
-116 GOOGL
-META
-117 META
-STABLE
-118 STABLE
-XLM
-119 XLM
-LIT
-120 LIT
-CRCL
-121 CRCL
-MSTR
-122 MSTR
-BMNR
-123 BMNR
-FOGO
-124 FOGO
-DUSK
-125 DUSK
-RIVER
-126 RIVER
-DASH
-127 DASH
-SPY
-128 SPY
-QQQ
-129 QQQ
-SKR
-130 SKR
-AXS
-131 AXS
-ARC
-132 ARC
-BIRB
-133 BIRB
-JTO
-134 JTO
-PIPPIN
-135 PIPPIN
-XCU
-136 XCU
-INTC
-137 INTC
-AMD
-138 AMD
-SNDK
-139 SNDK
-SAMSUNG
-140 SAMSUNG
-HYUNDAI
-141 HYUNDAI
-KRCOMP
-142 KRCOMP
-SKHYNIX
-143 SKHYNIX
-AZTEC
-144 AZTEC
-WTI
-145 WTI
-XPD
-146 XPD
-XPT
-147 XPT
-HANMI
-148 HANMI
+Lighter Exchange Markets
+========================
+Source: https://mainnet.zklighter.elliot.ai/api/v1/orderBooks
+Last updated: 2026-03-27
 
-=== INACTIVE PERP MARKETS ===
-The following perp markets exist but are currently inactive/delisted:
-22 AI16Z
-28 MKR
-54 LAUNCHCOIN
+=== ACTIVE PERP MARKETS (157 total) ===
+ID   Symbol           SizeDec  PriceDec  MinBase        MinQuote      LiqFee
+---- ---------------- -------- --------- -------------- ------------- ------
+0    ETH              4        2         0.0050         10.000000     1.0000
+1    BTC              5        1         0.00020        10.000000     1.0000
+2    SOL              3        3         0.050          10.000000     1.0000
+3    DOGE             0        6         10             10.000000     1.0000
+4    1000PEPE         0        6         500            10.000000     1.0000
+5    WIF              1        5         5.0            10.000000     1.0000
+6    WLD              1        5         5.0            10.000000     1.0000
+7    XRP              0        6         20             10.000000     1.0000
+8    LINK             1        5         1.0            10.000000     1.0000
+9    AVAX             2        4         0.50           10.000000     1.0000
+10   NEAR             1        5         2.0            10.000000     1.0000
+11   DOT              1        5         2.0            10.000000     1.0000
+12   TON              1        5         2.0            10.000000     1.0000
+13   TAO              3        3         0.050          10.000000     1.0000
+14   POL              0        6         40             10.000000     1.0000
+15   TRUMP            2        4         0.20           10.000000     1.0000
+16   SUI              1        5         3.0            10.000000     1.0000
+17   1000SHIB         0        6         500            10.000000     1.0000
+18   1000BONK         0        6         500            10.000000     1.0000
+19   1000FLOKI        0        6         100            10.000000     1.0000
+20   BERA             1        5         3.0            10.000000     1.0000
+21   FARTCOIN         1        5         20.0           10.000000     1.0000
+23   POPCAT           1        5         40.0           10.000000     1.0000
+24   HYPE             2        4         0.50           10.000000     1.0000
+25   BNB              2        4         0.02           10.000000     1.0000
+26   JUP              1        5         15.0           10.000000     1.0000
+27   AAVE             3        3         0.050          10.000000     1.0000
+29   ENA              1        5         20.0           10.000000     1.0000
+30   UNI              2        4         1.00           10.000000     1.0000
+31   APT              2        4         2.00           10.000000     1.0000
+32   SEI              1        5         50.0           10.000000     1.0000
+33   KAITO            1        5         10.0           10.000000     1.0000
+34   IP               2        4         2.00           10.000000     1.0000
+35   LTC              3        3         0.100          10.000000     1.0000
+36   CRV              1        5         20.0           10.000000     1.0000
+37   PENDLE           2        4         3.00           10.000000     1.0000
+38   ONDO             1        5         10.0           10.000000     1.0000
+39   ADA              1        5         10.0           10.000000     1.0000
+40   S                1        5         20.0           10.000000     1.0000
+41   VIRTUAL          1        5         5.0            10.000000     1.0000
+42   SPX              1        5         5.0            10.000000     1.0000
+43   TRX              1        5         40.0           10.000000     1.0000
+44   SYRUP            1        5         20.0           10.000000     1.0000
+45   PUMP             0        6         2000           10.000000     1.0000
+46   LDO              1        5         5.0            10.000000     1.0000
+47   PENGU            0        6         200            10.000000     1.0000
+48   PAXG             4        2         0.0025         10.000000     1.0000
+49   EIGEN            1        5         5.0            10.000000     1.0000
+50   ARB              1        5         20.0           10.000000     1.0000
+51   RESOLV           0        6         40             10.000000     1.0000
+52   GRASS            1        5         10.0           10.000000     1.0000
+53   ZORA             0        6         100            10.000000     1.0000
+55   OP               1        5         10.0           10.000000     1.0000
+56   ZK               0        6         100            10.000000     1.0000
+57   PROVE            1        5         10.0           10.000000     1.0000
+58   BCH              3        3         0.010          10.000000     1.0000
+59   HBAR             1        5         20.0           10.000000     1.0000
+60   ZRO              1        5         3.0            10.000000     1.0000
+61   GMX              2        4         0.30           10.000000     1.0000
+62   DYDX             1        5         15.0           10.000000     1.0000
+63   MNT              1        5         10.0           10.000000     1.0000
+64   ETHFI            1        5         10.0           10.000000     1.0000
+65   AERO             1        5         10.0           10.000000     1.0000
+66   USELESS          1        5         20.0           10.000000     1.0000
+67   TIA              1        5         3.0            10.000000     1.0000
+68   MORPHO           1        5         3.0            10.000000     1.0000
+69   VVV              2        4         3.00           10.000000     1.0000
+70   YZY              1        5         6.0            10.000000     1.0000
+71   XPL              1        5         10.0           10.000000     1.0000
+72   WLFI             1        5         25.0           10.000000     1.0000
+73   CRO              1        5         20.0           10.000000     1.0000
+74   NMR              2        4         0.50           10.000000     1.0000
+75   DOLO             1        5         30.0           10.000000     1.0000
+76   LINEA            0        6         100            10.000000     1.0000
+77   XMR              3        3         0.020          10.000000     1.0000
+78   PYTH             1        5         40.0           10.000000     1.0000
+79   SKY              0        6         100            10.000000     1.0000
+80   MYX              2        4         0.40           10.000000     1.0000
+81   1000TOSHI        2        4         1.00           10.000000     1.0000
+82   AVNT             1        5         10.0           10.000000     1.0000
+83   ASTER            1        5         20.0           10.000000     1.0000
+84   0G               2        4         1.00           10.000000     1.0000
+85   STBL             1        5         15.0           10.000000     1.0000
+86   APEX             1        5         5.0            10.000000     1.0000
+87   FF               1        5         15.0           10.000000     1.0000
+88   2Z               1        5         15.0           10.000000     1.0000
+89   EDEN             1        5         15.0           10.000000     1.0000
+90   ZEC              3        3         0.100          10.000000     1.0000
+91   MON              1        5         50.0           10.000000     1.0000
+92   XAU              4        2         0.0030         10.000000     1.0000
+93   XAG              2        4         0.15           10.000000     1.0000
+94   MEGA             1        5         15.0           10.000000     1.0000
+95   MET              1        5         15.0           10.000000     1.0000
+96   EURUSD           1        5         10.0           10.000000     1.0000
+97   GBPUSD           1        5         10.0           10.000000     1.0000
+98   USDJPY           3        3         0.050          10.000000     1.0000
+99   USDCHF           1        5         8.0            10.000000     1.0000
+100  USDCAD           1        5         10.0           10.000000     1.0000
+101  CC               1        5         30.0           10.000000     1.0000
+102  ICP              2        4         0.60           10.000000     1.0000
+103  FIL              1        5         5.0            10.000000     1.0000
+104  STRK             1        5         50.0           10.000000     1.0000
+105  USDKRW           4        2         0.0050         10.000000     1.0000
+106  AUDUSD           1        5         10.0           10.000000     1.0000
+107  NZDUSD           1        5         10.0           10.000000     1.0000
+108  HOOD             3        3         0.100          10.000000     1.0000
+109  COIN             3        3         0.025          10.000000     1.0000
+110  NVDA             3        3         0.050          10.000000     1.0000
+111  PLTR             3        3         0.050          10.000000     1.0000
+112  TSLA             4        2         0.0200         10.000000     1.0000
+113  AAPL             3        3         0.050          10.000000     1.0000
+114  AMZN             3        3         0.050          10.000000     1.0000
+115  MSFT             4        2         0.0200         10.000000     1.0000
+116  GOOGL            4        2         0.0300         10.000000     1.0000
+117  META             4        2         0.0200         10.000000     1.0000
+118  STABLE           0        6         300            10.000000     1.0000
+119  XLM              1        5         30.0           10.000000     1.0000
+120  LIT              2        4         2.00           10.000000     1.0000
+121  CRCL             3        3         0.100          10.000000     1.0000
+122  MSTR             4        2         0.0350         10.000000     1.0000
+123  BMNR             3        3         0.250          10.000000     1.0000
+124  FOGO             0        6         200            10.000000     1.0000
+125  DUSK             1        5         25.0           10.000000     1.0000
+126  RIVER            3        3         0.150          10.000000     1.0000
+127  DASH             3        3         0.100          10.000000     1.0000
+128  SPY              4        2         0.0100         10.000000     1.0000
+129  QQQ              4        2         0.0100         10.000000     1.0000
+130  SKR              0        6         200            10.000000     1.0000
+131  AXS              2        4         2.00           10.000000     1.0000
+132  ARC              0        6         80             10.000000     1.0000
+133  BIRB             1        5         25.0           10.000000     1.0000
+134  JTO              1        5         20.0           10.000000     1.0000
+135  PIPPIN           1        5         30.0           10.000000     1.0000
+136  XCU              2        4         1.00           10.000000     1.0000
+137  INTC             3        3         0.100          10.000000     1.0000
+138  AMD              4        2         0.0300         10.000000     1.0000
+139  SNDK             4        2         0.0100         10.000000     1.0000
+140  SAMSUNG          6        0         0.000040       10.000000     1.0000
+141  HYUNDAI          6        0         0.000010       10.000000     1.0000
+142  KRCOMP           5        1         0.00250        10.000000     1.0000
+143  SKHYNIX          6        0         0.000010       10.000000     1.0000
+144  AZTEC            0        6         400            10.000000     1.0000
+145  WTI              3        3         0.100          10.000000     0.0000
+146  XPD              5        1         0.00300        10.000000     1.0000
+147  XPT              5        1         0.00300        10.000000     1.0000
+148  HANMI            6        0         0.000030       10.000000     1.0000
+149  ROBO             0        6         150            10.000000     1.0000
+150  URA              3        3         0.100          10.000000     1.0000
+151  ASML             5        1         0.00400        10.000000     1.0000
+152  DIA              4        2         0.0100         10.000000     1.0000
+153  IWM              4        2         0.0100         10.000000     1.0000
+154  BOTZ             3        3         0.150          10.000000     1.0000
+155  MAGS             3        3         0.100          10.000000     1.0000
+156  STRC             3        3         0.050          10.000000     1.0000
+157  EDGE             1        5         10.0           10.000000     1.0000
+158  NATGAS           2        4         2.00           10.000000     1.0000
+159  BRENTOIL         4        2         0.0500         10.000000     1.0000
 
-=== SPOT MARKETS ===
-2048 ETH/USDC
-2049 LIT/USDC
-2050 LINK/USDC
-2051 UNI/USDC
-2052 AAVE/USDC
-2053 SKY/USDC
-2054 LDO/USDC
-2055 AZTEC/USDC
+Notes:
+- IDs 22, 28, 54 are inactive/skipped (see below)
+- All perps are USD-quoted, maker_fee=0, taker_fee=0 (Standard accounts)
+- SizeDec = supported_size_decimals, PriceDec = supported_price_decimals
+- order_quote_limit is 281474976.710655 for most; 5000000.000000 for XPT(147)
+- WTI(145) has liquidation_fee=0.0000 (all others 1.0000)
+
+=== INACTIVE PERP MARKETS (3 total) ===
+22   AI16Z
+28   MKR
+54   LAUNCHCOIN
+
+=== SPOT MARKETS (8 total) ===
+ID   Symbol           BaseAsset  QuoteAsset  SizeDec  PriceDec  MinBase   MinQuote
+---- ---------------- ---------- ----------- -------- --------- --------- ----------
+2048 ETH/USDC         1          3           4        2         0.0050    10.000000
+2049 LIT/USDC         2          3           2        4         1.00      0.001000
+2050 LINK/USDC        5          3           1        5         1.0       10.000000
+2051 UNI/USDC         6          3           2        4         1.00      10.000000
+2052 AAVE/USDC        7          3           3        3         0.050     10.000000
+2053 SKY/USDC         8          3           0        6         100       10.000000
+2054 LDO/USDC         9          3           1        5         5.0       10.000000
+2055 AZTEC/USDC       10         3           0        6         400       10.000000
+
+Notes:
+- Spot maker_fee=0, taker_fee=0, liquidation_fee=0 for all spot markets
+- All spot markets are quoted in USDC (quote_asset_id=3)
+
+=== MARKET CATEGORIES ===
+
+Crypto majors:    ETH(0), BTC(1), SOL(2), XRP(7), LINK(8), AVAX(9), BNB(25)
+Memecoins:        DOGE(3), 1000PEPE(4), WIF(5), 1000SHIB(17), 1000BONK(18),
+                  1000FLOKI(19), FARTCOIN(21), POPCAT(23), PENGU(47), PUMP(45),
+                  FOGO(124), BIRB(133), PIPPIN(135), MON(91)
+DeFi:             AAVE(27), UNI(30), CRV(36), PENDLE(37), LDO(46), EIGEN(49),
+                  MORPHO(68), DYDX(62), GMX(61), JUP(26), ETHFI(64), AERO(65)
+L1/L2:            NEAR(10), DOT(11), TON(12), SUI(16), APT(31), SEI(32),
+                  OP(55), ARB(50), ZK(56), MNT(63), TIA(67), STRK(104),
+                  ADA(39), ICP(102), FIL(103), HBAR(59), XLM(119)
+Precious metals:  XAU(92), XAG(93), XPD(146), XPT(147)
+Commodities:      XCU(136), WTI(145), NATGAS(158), BRENTOIL(159)
+Forex:            EURUSD(96), GBPUSD(97), USDJPY(98), USDCHF(99), USDCAD(100),
+                  USDKRW(105), AUDUSD(106), NZDUSD(107)
+US equities:      NVDA(110), TSLA(112), AAPL(113), AMZN(114), MSFT(115),
+                  GOOGL(116), META(117), PLTR(111), HOOD(108), COIN(109),
+                  MSTR(122), INTC(137), AMD(138), SNDK(139)
+ETFs:             SPY(128), QQQ(129), DIA(152), IWM(153), BOTZ(154),
+                  MAGS(155), URA(150)
+Korean equities:  SAMSUNG(140), HYUNDAI(141), KRCOMP(142), SKHYNIX(143),
+                  HANMI(148)

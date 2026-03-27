@@ -1,6 +1,7 @@
 Lighter Account Types
 =====================
 Source: https://apidocs.lighter.xyz/docs/account-types
+Last updated: 2026-03-27
 
 === STANDARD ACCOUNT (Default) ===
 
@@ -15,17 +16,21 @@ Designed for retail and latency-insensitive traders.
 Designed for high-frequency trading. 0ms maker/cancel latency.
 Base fees without LIT staking: 0.0040% maker / 0.0280% taker, 200ms taker latency.
 
-LIT Staking Discount Tiers:
-  Staked LIT  | Discount | Maker Fee | Taker Fee | Taker Latency
-  ------------|----------|-----------|-----------|---------------
-  0           | --       | 0.0040%   | 0.0280%   | 200 ms
-  1,000       | 2.5%     | 0.0039%   | 0.0273%   | 195 ms
-  3,000       | 5%       | 0.0038%   | 0.0266%   | 190 ms
-  10,000      | 10%      | 0.0036%   | 0.0252%   | 180 ms
-  30,000      | 15%      | 0.0034%   | 0.0238%   | 170 ms
-  100,000     | 20%      | 0.0032%   | 0.0224%   | 160 ms
-  300,000     | 25%      | 0.0030%   | 0.0210%   | 150 ms
-  500,000     | 30%      | 0.0028%   | 0.0196%   | 140 ms
+LIT Staking Discount Tiers (fee credits also count as staked LIT):
+  Staked LIT  | Discount | Maker Fee | Taker Fee | Taker Latency | sendTx/min
+  ------------|----------|-----------|-----------|---------------|----------
+  0           | --       | 0.0040%   | 0.0280%   | 200 ms        | 4,000
+  1,000       | 2.5%     | 0.0039%   | 0.0273%   | 195 ms        | 5,000
+  3,000       | 5%       | 0.0038%   | 0.0266%   | 190 ms        | 6,000
+  10,000      | 10%      | 0.0036%   | 0.0252%   | 180 ms        | 7,000
+  30,000      | 15%      | 0.0034%   | 0.0238%   | 170 ms        | 8,000
+  100,000     | 20%      | 0.0032%   | 0.0224%   | 160 ms        | 12,000
+  300,000     | 25%      | 0.0030%   | 0.0210%   | 150 ms        | 24,000
+  500,000     | 30%      | 0.0028%   | 0.0196%   | 140 ms        | 40,000
+
+Note: The sendTx/min column applies to both sendTx and sendTxBatch endpoints.
+Premium accounts have separate rate-limit buckets from the general weighted
+request pool (24,000/min). See rate_limits.txt for full details.
 
 === SWITCHING BETWEEN TIERS ===
 

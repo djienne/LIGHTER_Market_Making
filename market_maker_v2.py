@@ -2835,6 +2835,9 @@ async def sign_and_send_batch(client, ops: list):
                         seen_keys.add(aki)
                 return
             logger.error("Batch send failed (%s): %s", send_method, err_msg)
+            for aki in signed_nonces:
+                client.nonce_manager.acknowledge_failure(aki)
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
             _record_order_rejection(f"batch:{err_msg}")
             return
 
@@ -2860,6 +2863,9 @@ async def sign_and_send_batch(client, ops: list):
                 client.nonce_manager.acknowledge_failure(aki)
             client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
             return
+        for aki in signed_nonces:
+            client.nonce_manager.acknowledge_failure(aki)
+        client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
         _record_order_rejection("batch:exception")
 
 
@@ -3295,7 +3301,7 @@ async def periodic_orderbook_sanity_check(interval=None, tolerance_pct=None):
 # === COLD PATH ===
 
 async def main():
-    global ws_task, stale_order_task, _dry_run_engine
+    global ws_task, stale_order_task, _dry_run_engine, _trade_logger
 
     if DRY_RUN:
         logger.info("🚀 === Market Maker v2 Starting — DRY-RUN MODE (no exchange writes) ===")
