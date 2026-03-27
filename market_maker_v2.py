@@ -292,6 +292,10 @@ RECONCILER_SLOW_INTERVAL_SEC = 60.0
 # WS-based cancel confirmation: order_id -> asyncio.Event
 _order_cancel_events: dict[int, asyncio.Event] = {}
 
+# Dry-run / paper-trading engine (None when live)
+_dry_run_engine: Optional['DryRunEngine'] = None
+DRY_RUN = False
+
 # =========================
 # Logging setup
 # =========================
@@ -1281,6 +1285,9 @@ def on_order_book_update(market_id, payload):
                         calc.set_alpha_override(None)
                     calc.on_book_update(mid, ob['bids'], ob['asks'])
 
+                if _dry_run_engine is not None:
+                    _dry_run_engine.check_fills(ob['bids'], ob['asks'])
+
                 order_book_received.set()
             else:
                 # Book is one-sided — clear stale mid_price to prevent
@@ -1396,8 +1403,9 @@ def on_user_stats_update(account_id, stats_data):
             new_portfolio_value = float(stats_data.get("portfolio_value"))
 
             if new_available_capital >= 0 and new_portfolio_value >= 0:
-                state.account.available_capital = new_available_capital
-                state.account.portfolio_value = new_portfolio_value
+                if _dry_run_engine is None or not _dry_run_engine.initialized:
+                    state.account.available_capital = new_available_capital
+                    state.account.portfolio_value = new_portfolio_value
                 state.account.last_capital_update = time.monotonic()
                 logger.info(
                     f"Received user stats for account {account_id}: "
@@ -1458,7 +1466,8 @@ def on_account_all_update(account_id, data):
                             f"WebSocket position update for market {state.config.market_id}: "
                             f"{state.account.position_size} -> {new_size}"
                         )
-                        state.account.position_size = new_size
+                        if _dry_run_engine is None:
+                            state.account.position_size = new_size
                 else:
                     logger.warning("Ignoring malformed account_all positions payload: %r", raw_positions)
 
@@ -2932,32 +2941,37 @@ async def market_making_loop(client):
                     logger.debug("Could not calculate quotes; skipping refresh.")
 
             # Warn if quota is stuck at 0 with no sends for a long time
-            if (_volume_quota_remaining is not None and _volume_quota_remaining <= 0
+            if (not DRY_RUN
+                    and _volume_quota_remaining is not None and _volume_quota_remaining <= 0
                     and time.monotonic() - _last_send_time > 300):
                 logger.warning("Quota stuck at 0 for >5min with no sends — may need manual restart")
 
-            # Quota recovery: if enabled, critically low, NOT in cooldown, and past post-warmup grace
-            if (_QR_ENABLED
-                    and _volume_quota_remaining is not None
-                    and _volume_quota_remaining < _QR_TRIGGER
-                    and not _quota_recovery_in_progress
-                    and time.monotonic() - _quota_recovery_last_attempt >= _QR_COOLDOWN
-                    and time.monotonic() - _trading_start_time >= _QR_POST_WARMUP_GRACE):
-                recovered = await _attempt_quota_recovery(client)
-                if recovered:
-                    logger.info("Quota recovered, resuming normal operations")
-                await asyncio.sleep(MIN_LOOP_INTERVAL)
-                continue  # re-evaluate on next iteration
+            # --- Quota / backoff logic (skip entirely in dry-run) ---
+            if not DRY_RUN:
+                # Quota recovery: if enabled, critically low, NOT in cooldown, and past post-warmup grace
+                if (_QR_ENABLED
+                        and _volume_quota_remaining is not None
+                        and _volume_quota_remaining < _QR_TRIGGER
+                        and not _quota_recovery_in_progress
+                        and time.monotonic() - _quota_recovery_last_attempt >= _QR_COOLDOWN
+                        and time.monotonic() - _trading_start_time >= _QR_POST_WARMUP_GRACE):
+                    recovered = await _attempt_quota_recovery(client)
+                    if recovered:
+                        logger.info("Quota recovered, resuming normal operations")
+                    await asyncio.sleep(MIN_LOOP_INTERVAL)
+                    continue  # re-evaluate on next iteration
 
-            # Yield to quota recovery — don't compete for the free slot
-            if _quota_recovery_in_progress:
-                await asyncio.sleep(MIN_LOOP_INTERVAL)
-                continue
+                # Yield to quota recovery — don't compete for the free slot
+                if _quota_recovery_in_progress:
+                    await asyncio.sleep(MIN_LOOP_INTERVAL)
+                    continue
 
             # Batch all order operations into a single send_tx_batch call
             ops = collect_order_operations(level_prices, base_amount, _log_debug)
             if ops:
-                if time.monotonic() < _global_backoff_until:
+                if _dry_run_engine is not None:
+                    await _dry_run_engine.process_batch(ops)
+                elif time.monotonic() < _global_backoff_until:
                     remaining = _global_backoff_until - time.monotonic()
                     if remaining > 0:
                         await asyncio.sleep(min(remaining, 1.0))
@@ -2967,6 +2981,9 @@ async def market_making_loop(client):
                     cancel_only=all(o.action == "cancel" for o in ops),
                 ):
                     await sign_and_send_batch(client, ops)
+
+            if _dry_run_engine is not None:
+                _dry_run_engine.maybe_log_summary()
 
             consecutive_errors = 0
 
@@ -3103,9 +3120,12 @@ async def periodic_orderbook_sanity_check(interval=None, tolerance_pct=None):
 # === COLD PATH ===
 
 async def main():
-    global ws_task, stale_order_task
+    global ws_task, stale_order_task, _dry_run_engine
 
-    logger.info("🚀 === Market Maker v2 Starting (2-Sided Quoting) ===")
+    if DRY_RUN:
+        logger.info("🚀 === Market Maker v2 Starting — DRY-RUN MODE (no exchange writes) ===")
+    else:
+        logger.info("🚀 === Market Maker v2 Starting (2-Sided Quoting) ===")
     _validate_config()
 
     api_client = lighter.ApiClient(configuration=lighter.Configuration(host=BASE_URL))
@@ -3181,54 +3201,57 @@ async def main():
         else:
             logger.info("No Binance mapping for %s; using Lighter OBI", MARKET_SYMBOL)
 
-    try:
-        client = build_signer_client(
-            url=BASE_URL,
-            account_index=ACCOUNT_INDEX,
-            private_key=API_KEY_PRIVATE_KEY,
-            api_key_index=API_KEY_INDEX,
-        )
-    except Exception as exc:
-        logger.error(f"❌ Failed to initialize SignerClient: {trim_exception(exc)}")
-        await api_client.close()
-        return
-    err = client.check_client()
-    if err is not None:
-        logger.error(f"❌ CheckClient error: {trim_exception(err)}")
-        await api_client.close()
-        await client.close()
-        return
-    logger.info("✅ Client connected successfully")
+    client = None
+    if not DRY_RUN:
+        try:
+            client = build_signer_client(
+                url=BASE_URL,
+                account_index=ACCOUNT_INDEX,
+                private_key=API_KEY_PRIVATE_KEY,
+                api_key_index=API_KEY_INDEX,
+            )
+        except Exception as exc:
+            logger.error(f"❌ Failed to initialize SignerClient: {trim_exception(exc)}")
+            await api_client.close()
+            return
+        err = client.check_client()
+        if err is not None:
+            logger.error(f"❌ CheckClient error: {trim_exception(err)}")
+            await api_client.close()
+            await client.close()
+            return
+        logger.info("✅ Client connected successfully")
 
-    # Clean slate: cancel all at startup — but skip if no open orders
-    _startup_orders = await _fetch_account_active_orders(client)
-    if _startup_orders is None:
-        # Fetch failed — cancel unconditionally to be safe
-        logger.info("Could not fetch active orders; cancelling all as precaution")
-        await cancel_all_orders(client)
-    elif len(_startup_orders) > 0:
-        logger.info("Found %d open orders at startup — cancelling all", len(_startup_orders))
-        await cancel_all_orders(client)
-    else:
-        logger.info("No open orders at startup — skipping cancel_all (saves quota)")
-    # Record the send time so free-slot timer starts from here
-    global _last_send_time
-    _last_send_time = time.monotonic()
-    logger.info("Startup volume quota: %s remaining",
-                _volume_quota_remaining if _volume_quota_remaining is not None else "unknown")
-    if _volume_quota_remaining is not None and _volume_quota_remaining < _RL_QUOTA_MEDIUM:
-        logger.warning("LOW STARTUP QUOTA: only %d remaining — free-slot mode (1 op per 15s via REST)",
-                       _volume_quota_remaining)
-        # Refresh nonce (quota 429s can corrupt nonce state)
-        client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
-    await asyncio.sleep(3)
+        # Clean slate: cancel all at startup — but skip if no open orders
+        _startup_orders = await _fetch_account_active_orders(client)
+        if _startup_orders is None:
+            # Fetch failed — cancel unconditionally to be safe
+            logger.info("Could not fetch active orders; cancelling all as precaution")
+            await cancel_all_orders(client)
+        elif len(_startup_orders) > 0:
+            logger.info("Found %d open orders at startup — cancelling all", len(_startup_orders))
+            await cancel_all_orders(client)
+        else:
+            logger.info("No open orders at startup — skipping cancel_all (saves quota)")
+        # Record the send time so free-slot timer starts from here
+        global _last_send_time
+        _last_send_time = time.monotonic()
+        logger.info("Startup volume quota: %s remaining",
+                    _volume_quota_remaining if _volume_quota_remaining is not None else "unknown")
+        if _volume_quota_remaining is not None and _volume_quota_remaining < _RL_QUOTA_MEDIUM:
+            logger.warning("LOW STARTUP QUOTA: only %d remaining — free-slot mode (1 op per 15s via REST)",
+                           _volume_quota_remaining)
+            # Refresh nonce (quota 429s can corrupt nonce state)
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+        await asyncio.sleep(3)
 
     state.market.last_order_book_update = time.monotonic()
 
-    # Initialize TxWebSocket for sending transactions via WS
-    global _tx_ws
-    _tx_ws = TxWebSocket(WEBSOCKET_URL)
-    await _tx_ws.connect()
+    if not DRY_RUN:
+        # Initialize TxWebSocket for sending transactions via WS
+        global _tx_ws
+        _tx_ws = TxWebSocket(WEBSOCKET_URL)
+        await _tx_ws.connect()
 
     # Start WebSocket Tasks
     ws_task = asyncio.create_task(subscribe_to_market_data(state.config.market_id))
@@ -3271,29 +3294,41 @@ async def main():
         await asyncio.wait_for(account_all_received.wait(), timeout=30.0)
         logger.info(f"✅ Received initial position data. Current size: {state.account.position_size}")
 
-        # Emergency close any leftover position from a previous unclean shutdown
-        if abs(state.account.position_size) > EPSILON:
-            logger.warning(
-                "Detected open position (%.6f) on startup — attempting emergency close.",
-                state.account.position_size,
+        if DRY_RUN:
+            from dry_run import DryRunEngine
+            _dry_run_engine = DryRunEngine(
+                state=state,
+                order_manager=order_manager,
+                client_to_exchange_id=_client_to_exchange_id,
+                leverage=LEVERAGE,
+                logger=logger,
             )
-            closed = await emergency_close_position(client, reason="startup")
-            if not closed:
-                pos_value = abs(state.account.position_size) * (state.market.mid_price or 0)
-                if pos_value > 50.0:
-                    logger.error("Failed to close startup position ($%.2f). Aborting to prevent compounding risk.", pos_value)
-                    return
-                logger.warning(
-                    "Failed to close small startup position ($%.2f). Continuing — quoting skew will manage it.",
-                    pos_value,
-                )
-
-        logger.info(f"⚙️ Attempting to set leverage to {LEVERAGE}x with {MARGIN_MODE} margin...")
-        _, _, err = await adjust_leverage(client, state.config.market_id, LEVERAGE, MARGIN_MODE, logger=logger)
-        if err:
-            logger.error(f"❌ Failed to adjust leverage: {err}. Continuing with default leverage.")
+            _dry_run_engine.capture_initial_state()
+            logger.info("DRY-RUN engine initialized — run with --live for real trading")
         else:
-            logger.info(f"✅ Successfully set leverage to {LEVERAGE}x")
+            # Emergency close any leftover position from a previous unclean shutdown
+            if abs(state.account.position_size) > EPSILON:
+                logger.warning(
+                    "Detected open position (%.6f) on startup — attempting emergency close.",
+                    state.account.position_size,
+                )
+                closed = await emergency_close_position(client, reason="startup")
+                if not closed:
+                    pos_value = abs(state.account.position_size) * (state.market.mid_price or 0)
+                    if pos_value > 50.0:
+                        logger.error("Failed to close startup position ($%.2f). Aborting to prevent compounding risk.", pos_value)
+                        return
+                    logger.warning(
+                        "Failed to close small startup position ($%.2f). Continuing — quoting skew will manage it.",
+                        pos_value,
+                    )
+
+            logger.info(f"⚙️ Attempting to set leverage to {LEVERAGE}x with {MARGIN_MODE} margin...")
+            _, _, err = await adjust_leverage(client, state.config.market_id, LEVERAGE, MARGIN_MODE, logger=logger)
+            if err:
+                logger.error(f"❌ Failed to adjust leverage: {err}. Continuing with default leverage.")
+            else:
+                logger.info(f"✅ Successfully set leverage to {LEVERAGE}x")
 
         balance_task = asyncio.create_task(track_balance())
         sanity_task = asyncio.create_task(periodic_orderbook_sanity_check())
@@ -3330,68 +3365,78 @@ async def main():
                 task.cancel()
         await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
-        try:
-            logger.info("🛡️ Final safety measure: attempting to cancel all orders.")
-            await asyncio.wait_for(cancel_all_orders(client), timeout=10)
-        except asyncio.TimeoutError:
-            logger.error("Timeout during final order cancellation.")
-        except Exception as e:
-            logger.error(f"Error during final order cancellation: {e}")
-
-        # Emergency close any open position before shutting down.
-        # We need WS data for best prices, so briefly re-subscribe if orderbook is stale.
-        if abs(state.account.position_size) > EPSILON:
-            logger.warning(
-                "Open position detected at shutdown (%.6f) — attempting emergency close.",
-                state.account.position_size,
-            )
-            # If the orderbook is gone (WS tasks cancelled), fetch REST prices directly
-            best_bid, best_ask = get_best_prices()
-            if best_bid is None or best_ask is None:
-                try:
-                    loop = asyncio.get_running_loop()
-                    from orderbook_sanity import _fetch_rest_top_of_book
-                    rest_bid, rest_ask = await loop.run_in_executor(
-                        None, _fetch_rest_top_of_book, state.config.market_id, 5.0,
-                    )
-                    if rest_bid > 0 and rest_ask > 0:
-                        state.market.mid_price = (rest_bid + rest_ask) / 2.0
-                        ob = state.market.local_order_book
-                        ob['bids'][rest_bid] = 1.0
-                        ob['asks'][rest_ask] = 1.0
-                except Exception as exc:
-                    logger.error("Failed to fetch REST prices for shutdown close: %s", exc)
+        if DRY_RUN:
+            if _dry_run_engine is not None:
+                _dry_run_engine.maybe_log_summary()
+                logger.info(
+                    "DRY-RUN FINAL | realized=$%.4f | unrealized=$%.4f | total=$%.4f | fills=%d",
+                    _dry_run_engine._realized_pnl, _dry_run_engine.unrealized_pnl,
+                    _dry_run_engine.total_pnl, _dry_run_engine._fill_count,
+                )
+        else:
             try:
-                await asyncio.wait_for(
-                    emergency_close_position(client, reason="shutdown"),
-                    timeout=15,
-                )
+                logger.info("🛡️ Final safety measure: attempting to cancel all orders.")
+                await asyncio.wait_for(cancel_all_orders(client), timeout=10)
             except asyncio.TimeoutError:
-                logger.error("Timeout during shutdown emergency position close!")
+                logger.error("Timeout during final order cancellation.")
             except Exception as e:
-                logger.error("Error during shutdown emergency position close: %s", e)
+                logger.error(f"Error during final order cancellation: {e}")
 
-        # Verify no orders remain live after shutdown cancel
-        try:
-            remaining = await asyncio.wait_for(
-                _fetch_account_active_orders(client), timeout=5
-            )
-            if remaining is None:
-                logger.warning("Could not verify order cancellation (REST fetch failed).")
-            elif len(remaining) > 0:
-                live_ids = [o.get("order_index", "?") for o in remaining]
-                logger.error(
-                    "ORDERS STILL LIVE AFTER SHUTDOWN CANCEL: %s — manual intervention required!",
-                    live_ids,
+            # Emergency close any open position before shutting down.
+            # We need WS data for best prices, so briefly re-subscribe if orderbook is stale.
+            if abs(state.account.position_size) > EPSILON:
+                logger.warning(
+                    "Open position detected at shutdown (%.6f) — attempting emergency close.",
+                    state.account.position_size,
                 )
-            else:
-                logger.info("Verified: no orders remain live on exchange.")
-        except (asyncio.TimeoutError, Exception) as exc:
-            logger.warning("Post-shutdown verification failed: %s", exc)
+                # If the orderbook is gone (WS tasks cancelled), fetch REST prices directly
+                best_bid, best_ask = get_best_prices()
+                if best_bid is None or best_ask is None:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        from orderbook_sanity import _fetch_rest_top_of_book
+                        rest_bid, rest_ask = await loop.run_in_executor(
+                            None, _fetch_rest_top_of_book, state.config.market_id, 5.0,
+                        )
+                        if rest_bid > 0 and rest_ask > 0:
+                            state.market.mid_price = (rest_bid + rest_ask) / 2.0
+                            ob = state.market.local_order_book
+                            ob['bids'][rest_bid] = 1.0
+                            ob['asks'][rest_ask] = 1.0
+                    except Exception as exc:
+                        logger.error("Failed to fetch REST prices for shutdown close: %s", exc)
+                try:
+                    await asyncio.wait_for(
+                        emergency_close_position(client, reason="shutdown"),
+                        timeout=15,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Timeout during shutdown emergency position close!")
+                except Exception as e:
+                    logger.error("Error during shutdown emergency position close: %s", e)
 
-        if _tx_ws is not None:
-            await _tx_ws.close()
-        await client.close()
+            # Verify no orders remain live after shutdown cancel
+            try:
+                remaining = await asyncio.wait_for(
+                    _fetch_account_active_orders(client), timeout=5
+                )
+                if remaining is None:
+                    logger.warning("Could not verify order cancellation (REST fetch failed).")
+                elif len(remaining) > 0:
+                    live_ids = [o.get("order_index", "?") for o in remaining]
+                    logger.error(
+                        "ORDERS STILL LIVE AFTER SHUTDOWN CANCEL: %s — manual intervention required!",
+                        live_ids,
+                    )
+                else:
+                    logger.info("Verified: no orders remain live on exchange.")
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Post-shutdown verification failed: %s", exc)
+
+            if _tx_ws is not None:
+                await _tx_ws.close()
+            if client is not None:
+                await client.close()
         await api_client.close()
         logger.info("🛑 Market maker stopped.")
 
@@ -3399,9 +3444,11 @@ async def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Lighter market maker")
     parser.add_argument("--symbol", default=os.getenv("MARKET_SYMBOL", "BTC"), help="Market symbol to trade")
+    parser.add_argument("--live", action="store_true", help="Live trading mode (default is dry-run/paper-trading)")
     args = parser.parse_args()
     MARKET_SYMBOL = args.symbol.upper()
     os.environ["MARKET_SYMBOL"] = MARKET_SYMBOL
+    DRY_RUN = not args.live
 
     async def main_with_signal_handling():
         loop = asyncio.get_running_loop()
