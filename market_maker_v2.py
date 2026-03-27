@@ -1350,20 +1350,8 @@ def on_order_book_update(market_id, payload):
         logger.error(f"Error in order book callback: {e}", exc_info=True)
         state.market.ws_connection_healthy = False
 
-def on_trade_update(market_id, trades):
-    try:
-        if market_id == state.config.market_id:
-            for trade in trades:
-                price = trade.get('price')
-                size = trade.get('size')
-                side = "SELL" if trade.get('is_maker_ask') else "BUY"
-                logger.debug("Market Trade: %s %s @ %s", side, size, price)
-    except (KeyError, ValueError, TypeError) as e:
-        logger.error(f"❌ Error in trade callback: {e}", exc_info=True)
-
-
 async def subscribe_to_market_data(market_id):
-    """Connects to the websocket, subscribes to orderbook AND trades."""
+    """Connects to the websocket, subscribes to orderbook updates."""
 
     def _on_disconnect():
         state.market.ws_connection_healthy = False
@@ -1385,12 +1373,9 @@ async def subscribe_to_market_data(market_id):
         if msg_type in ("update/order_book", "subscribed/order_book"):
             if 'order_book' in data:
                 on_order_book_update(market_id, data['order_book'])
-        elif msg_type in ("update/trade", "subscribed/trade"):
-            if 'trades' in data:
-                on_trade_update(market_id, data['trades'])
 
     await ws_subscribe(
-        channels=[f"order_book/{market_id}", f"trade/{market_id}"],
+        channels=[f"order_book/{market_id}"],
         label="market data",
         on_message=_on_message,
         url=WEBSOCKET_URL,
@@ -2958,6 +2943,7 @@ async def market_making_loop(client):
     _warmup_logged = False
     _last_warmup_log_min = -1
     _warmup_complete_logged = False
+    _prev_max_pos = 0.0
 
     while True:
         try:
@@ -3049,9 +3035,11 @@ async def market_making_loop(client):
 
             # Update vol_obi skew normalization to match dynamic position limit
             _max_pos = _dynamic_max_position_dollar(snap_mid, snap_capital, base_amount)
-            calc = state.vol_obi_state.calculator
-            if calc is not None and _max_pos > 0:
-                calc.set_max_position_dollar(_max_pos)
+            if _max_pos != _prev_max_pos:
+                _prev_max_pos = _max_pos
+                calc = state.vol_obi_state.calculator
+                if calc is not None and _max_pos > 0:
+                    calc.set_max_position_dollar(_max_pos)
 
             level_prices = calculate_order_prices(
                 snap_mid, position_size=snap_position,
@@ -3478,7 +3466,7 @@ async def main():
         account_all_task = asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX))
 
     account_orders_task = None
-    if client is not None and API_KEY_PRIVATE_KEY:
+    if not DRY_RUN and client is not None and API_KEY_PRIVATE_KEY:
         account_orders_task = asyncio.create_task(
             subscribe_to_account_orders(client, state.config.market_id, ACCOUNT_INDEX)
         )
@@ -3487,7 +3475,7 @@ async def main():
         logger.info("ℹ️  account_orders WS skipped (no credentials)")
 
     stale_order_task = None
-    if client is not None and API_KEY_PRIVATE_KEY:
+    if not DRY_RUN and client is not None and API_KEY_PRIVATE_KEY:
         stale_order_task = asyncio.create_task(
             stale_order_reconciler_loop(client, state.config.market_id, ACCOUNT_INDEX)
         )
@@ -3531,6 +3519,10 @@ async def main():
                 )
             if _dry_run_engine is None:
                 # Seed defaults if load_state failed on corrupt file
+                if DRY_RUN_CAPITAL is None:
+                    # State load was attempted but failed — old trade CSV is
+                    # inconsistent with the fresh wallet, so reset it.
+                    _trade_logger.clear()
                 if state.account.available_capital is None:
                     state.account.available_capital = _dr_default_capital
                     state.account.portfolio_value = _dr_default_capital

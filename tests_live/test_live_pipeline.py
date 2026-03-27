@@ -400,15 +400,8 @@ class TestOnOrderBookUpdate:
 # ===========================================================================
 
 @pytest.mark.live
-class TestOnTradeUpdate:
-    """Calls the real market_maker_v2.on_trade_update() with live WS trade data."""
-
-    def test_trade_callback_does_not_crash(self, trade_messages, fresh_mm_state):
-        mm = fresh_mm_state
-        for msg in trade_messages:
-            trades = msg.get("trades", [])
-            mm.on_trade_update(ETH_MARKET_ID, trades)
-            # No exception = pass
+class TestTradeMessageSchema:
+    """Validates live WS trade message structure (no callback — trade feed removed from hot path)."""
 
     def test_trade_fields_present(self, trade_messages):
         for msg in trade_messages:
