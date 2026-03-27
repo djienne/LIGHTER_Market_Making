@@ -531,7 +531,21 @@ class DryRunEngine:
             self._realized_pnl, self.unrealized_pnl, self.total_pnl,
             self._fill_count, self._total_volume, len(self._live_orders),
         )
-        # Periodic flush: trade log + state (disk I/O only here, not on hot path)
+        # Schedule disk I/O on thread pool — never block the event loop
+        self._flush_to_disk_async()
+
+    def _flush_to_disk_sync(self) -> None:
+        """Disk I/O: save state + flush trade log.  Meant to run on a worker thread."""
+        self.save_state()
         if self._trade_logger is not None:
             self._trade_logger.flush()
-        self.save_state()
+
+    def _flush_to_disk_async(self) -> None:
+        """Submit disk flush to the thread-pool executor (non-blocking)."""
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, self._flush_to_disk_sync)
+        except RuntimeError:
+            # No running loop (e.g. during tests) — flush synchronously
+            self._flush_to_disk_sync()

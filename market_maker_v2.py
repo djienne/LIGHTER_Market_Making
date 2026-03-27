@@ -317,6 +317,8 @@ for _sub_logger_name in ('binance_obi', 'vol_obi', 'ws_manager', 'orderbook_sani
 # State objects
 # =========================
 NUM_LEVELS = int(_trading.get("levels_per_side", 2))  # number of order levels per side
+# Pre-computed spread widening factors per level (avoids per-tick exponentiation)
+_SPREAD_FACTORS = [SPREAD_FACTOR_LEVEL1 ** lvl for lvl in range(max(NUM_LEVELS, 1))]
 
 
 @dataclass
@@ -2731,7 +2733,8 @@ async def sign_and_send_batch(client, ops: list):
         _record_order_rejection("batch:exception")
 
 
-def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amount=None):
+def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amount=None,
+                           max_pos_usd=None):
     """Calculate bid/ask prices for all order levels.
 
     Returns a list of ``NUM_LEVELS`` ``(buy_price, sell_price)`` tuples.
@@ -2750,7 +2753,8 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
                 return none_levels
 
             # Hard position limit: suppress side that would increase exposure
-            max_pos_usd = _dynamic_max_position_dollar(mid_price, capital, base_amount)
+            if max_pos_usd is None:
+                max_pos_usd = _dynamic_max_position_dollar(mid_price, capital, base_amount)
             if max_pos_usd > 0:
                 pos_value_usd = abs(position_size) * mid_price
                 if pos_value_usd >= max_pos_usd:
@@ -2767,7 +2771,7 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
             ask_depth = (sell_0 - mid_price) if sell_0 is not None else None
             tick = state.config.price_tick_float
             for lvl in range(1, NUM_LEVELS):
-                factor = SPREAD_FACTOR_LEVEL1 ** lvl
+                factor = _SPREAD_FACTORS[lvl]
                 raw_bid = (mid_price - bid_depth * factor) if bid_depth is not None else None
                 raw_ask = (mid_price + ask_depth * factor) if ask_depth is not None else None
                 if raw_bid is not None and tick > 0:
@@ -2944,7 +2948,8 @@ async def market_making_loop(client):
 
             level_prices = calculate_order_prices(
                 snap_mid, position_size=snap_position,
-                capital=snap_capital, base_amount=base_amount)
+                capital=snap_capital, base_amount=base_amount,
+                max_pos_usd=_max_pos)
 
             # Log level-0 quote (rate-limited to once every 10s)
             buy_0, sell_0 = level_prices[0]
