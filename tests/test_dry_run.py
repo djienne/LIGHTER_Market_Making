@@ -476,11 +476,11 @@ class TestBugFixes(unittest.TestCase):
         with temp_mm_attrs(
             current_bid_order_id=None, current_bid_price=None,
             current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
-            available_capital=1000.0, current_position_size=0.0,
-            current_mid_price_cached=105.0,
+            available_capital=1000.0, portfolio_value=1000.0,
+            current_position_size=0.0, current_mid_price_cached=105.0,
         ):
             engine = _make_engine(leverage=2)
-            engine._initial_capital = 1000.0
+            engine.capture_initial_state()
 
             self._run(engine.process_batch([
                 mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
@@ -515,6 +515,57 @@ class TestBugFixes(unittest.TestCase):
             engine.capture_initial_state()
             self.assertAlmostEqual(engine._position, 0.0)
             self.assertAlmostEqual(engine._entry_vwap, 0.0)
+
+    def test_modify_resets_prev_available(self):
+        """Bug 5: repriced order must be fresh for fill accounting."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+
+            # Create buy @ 100, partial fill 0.3
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 1.0}, {100.0: 0.3})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.3)
+
+            # Modify remaining order to 101 (more aggressive)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "modify", 101.0, 0.7, 1,
+                           mm._client_to_exchange_id[1]),
+            ]))
+
+            # Same ask@100 x 0.3 resting — repriced order should fill against it
+            bids, asks = _book({99.0: 1.0}, {100.0: 0.3})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.6)
+
+    def test_portfolio_value_uses_portfolio_baseline(self):
+        """Bug 6: portfolio_value baseline must use initial portfolio_value, not available_capital."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=900.0, portfolio_value=1000.0,
+            current_position_size=0.0, current_mid_price_cached=105.0,
+        ):
+            engine = _make_engine(leverage=2)
+            engine.capture_initial_state()
+            self.assertAlmostEqual(engine._initial_portfolio_value, 1000.0)
+
+            # Buy 1 @ 100 with mid at 105 -> unrealized = 5
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 2.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # portfolio = 1000 (initial PV) + 0 (realized) + 5 (unrealized) = 1005
+            self.assertAlmostEqual(mm.state.account.portfolio_value, 1005.0)
 
 
 class TestSimulatedLatency(unittest.TestCase):

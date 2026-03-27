@@ -73,6 +73,7 @@ class DryRunEngine:
         self._total_volume: float = 0.0
         self._fill_count: int = 0
         self._initial_capital: float = 0.0
+        self._initial_portfolio_value: float = 0.0
 
         # Periodic summary
         self._last_summary: float = 0.0
@@ -88,6 +89,8 @@ class DryRunEngine:
         """Snapshot the real account capital and position before trading starts."""
         cap = self._state.account.available_capital
         self._initial_capital = cap if cap is not None else 0.0
+        pv = self._state.account.portfolio_value
+        self._initial_portfolio_value = pv if pv is not None else self._initial_capital
 
         # Inherit the live account position so skew/one-sided quoting is correct
         # from the first loop iteration.  We use mid as a rough VWAP proxy since
@@ -165,6 +168,7 @@ class DryRunEngine:
         sim.price = op.price
         sim.size = op.size
         sim.eligible_at = time.monotonic() + self._sim_latency
+        sim._prev_available = 0.0  # repriced order is fresh for fill accounting
         self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
 
         self._log.info(
@@ -317,9 +321,9 @@ class DryRunEngine:
             margin_consumed = fill_size * fill_price / self._leverage
             self._state.account.available_capital -= margin_consumed
 
-        # Keep portfolio_value in sync: initial_capital + realized + unrealized
+        # Keep portfolio_value in sync: initial portfolio + realized + unrealized
         self._state.account.portfolio_value = (
-            self._initial_capital + self._realized_pnl + self.unrealized_pnl
+            self._initial_portfolio_value + self._realized_pnl + self.unrealized_pnl
         )
 
         # Sync position into state for decision logic
