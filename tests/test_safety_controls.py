@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import market_maker_v2 as mm
@@ -126,15 +127,51 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
                 await mm.subscribe_to_account_orders(object(), market_id=1, account_id=123)
         ws_subscribe_mock.assert_not_called()
 
-    async def test_market_making_loop_paused_cancels_orders_once(self):
+    async def test_market_making_loop_paused_schedules_cleanup_once(self):
+        original_pause_cleanup_running = mm._pause_cleanup_running
+        scheduled = []
+
+        async def _interrupt_sleep(_seconds):
+            raise KeyboardInterrupt
+
+        def _record_task(coro):
+            scheduled.append(coro)
+            coro.close()
+            return SimpleNamespace(cancel=lambda: None, done=lambda: True)
+
+        client = DummyClient()
+
+        try:
+            with temp_mm_attrs(
+                MIN_LOOP_INTERVAL=0.0,
+                WARMUP_SECONDS=0,
+            ):
+                mm.state.risk.pause_cancel_done = False
+                mm._pause_cleanup_running = False
+
+                with patch.object(mm, "_pause_cleanup_task") as cleanup_task_mock, \
+                     patch.object(mm.asyncio, "create_task", side_effect=_record_task) as create_task_mock, \
+                     patch.object(mm, "check_websocket_health", return_value=True), \
+                     patch.object(mm.risk_controller, "maybe_recover", return_value=False), \
+                     patch.object(mm.risk_controller, "is_paused", return_value=True), \
+                     patch.object(mm.asyncio, "sleep", side_effect=_interrupt_sleep):
+                    with self.assertRaises(KeyboardInterrupt):
+                        await mm.market_making_loop(client)
+
+            cleanup_task_mock.assert_called_once_with(client)
+            self.assertEqual(create_task_mock.call_count, 1)
+            self.assertEqual(len(scheduled), 1)
+            self.assertFalse(mm.state.risk.pause_cancel_done)
+        finally:
+            mm._pause_cleanup_running = original_pause_cleanup_running
+
+    async def test_pause_cleanup_task_cancels_orders_once(self):
         original_risk = mm.RiskState(**vars(mm.state.risk))
+        original_pause_cleanup_running = mm._pause_cleanup_running
         batch_calls = []
 
         async def _record_batch(_client, ops):
             batch_calls.append(ops)
-
-        async def _interrupt_sleep(_seconds):
-            raise KeyboardInterrupt
 
         async def _clear_on_reconcile(*a, **kw):
             mm.order_manager.clear_all()
@@ -160,18 +197,15 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
                 WARMUP_SECONDS=0,
             ):
                 mm.state.risk.pause_cancel_done = False
+                mm._pause_cleanup_running = True
                 mm._client_to_exchange_id[101] = 1001
                 mm._client_to_exchange_id[202] = 2002
 
                 with patch.object(mm, "sign_and_send_batch", side_effect=_record_batch), \
                      patch.object(mm, "reconcile_orders_with_exchange", side_effect=_clear_on_reconcile), \
                      patch.object(mm, "_wait_for_write_slot", side_effect=_mock_wait_for_write), \
-                     patch.object(mm, "check_websocket_health", return_value=True), \
-                     patch.object(mm.risk_controller, "maybe_recover", return_value=False), \
-                     patch.object(mm.risk_controller, "is_paused", return_value=True), \
-                     patch.object(mm.asyncio, "sleep", side_effect=_interrupt_sleep):
-                    with self.assertRaises(KeyboardInterrupt):
-                        await mm.market_making_loop(client)
+                     patch.object(mm, "check_websocket_health", return_value=True):
+                    await mm._pause_cleanup_task(client)
 
             # sign_and_send_batch was called with cancel ops for both sides
             self.assertEqual(len(batch_calls), 1)
@@ -182,18 +216,17 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
             self.assertIn(202, cancel_ids)
             self.assertTrue(mm.state.risk.pause_cancel_done)
         finally:
+            mm._pause_cleanup_running = original_pause_cleanup_running
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)
 
-    async def test_market_making_loop_paused_retries_when_reconcile_fails(self):
+    async def test_pause_cleanup_task_retries_when_reconcile_fails(self):
         original_risk = mm.RiskState(**vars(mm.state.risk))
+        original_pause_cleanup_running = mm._pause_cleanup_running
         batch_calls = []
 
         async def _record_batch(_client, ops):
             batch_calls.append(ops)
-
-        async def _interrupt_sleep(_seconds):
-            raise KeyboardInterrupt
 
         async def _failed_reconcile(*a, **kw):
             return False
@@ -218,22 +251,20 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
                 WARMUP_SECONDS=0,
             ):
                 mm.state.risk.pause_cancel_done = False
+                mm._pause_cleanup_running = True
                 mm._client_to_exchange_id[101] = 1001
                 mm._client_to_exchange_id[202] = 2002
 
                 with patch.object(mm, "sign_and_send_batch", side_effect=_record_batch), \
                      patch.object(mm, "reconcile_orders_with_exchange", side_effect=_failed_reconcile), \
                      patch.object(mm, "_wait_for_write_slot", side_effect=_mock_wait_for_write), \
-                     patch.object(mm, "check_websocket_health", return_value=True), \
-                     patch.object(mm.risk_controller, "maybe_recover", return_value=False), \
-                     patch.object(mm.risk_controller, "is_paused", return_value=True), \
-                     patch.object(mm.asyncio, "sleep", side_effect=_interrupt_sleep):
-                    with self.assertRaises(KeyboardInterrupt):
-                        await mm.market_making_loop(client)
+                     patch.object(mm, "check_websocket_health", return_value=True):
+                    await mm._pause_cleanup_task(client)
                 self.assertEqual(len(batch_calls), 1)
                 self.assertFalse(mm.state.risk.pause_cancel_done)
                 self.assertEqual(mm.current_bid_order_id, 101)
                 self.assertEqual(mm.current_ask_order_id, 202)
         finally:
+            mm._pause_cleanup_running = original_pause_cleanup_running
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)

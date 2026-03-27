@@ -196,24 +196,22 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)
 
-    async def test_ws_unhealthy_triggers_restart(self):
-        """When WS is unhealthy the loop should attempt a restart."""
+    async def test_ws_unhealthy_triggers_reconnect_event(self):
+        """When WS is unhealthy the hot loop should trigger the reconnect event."""
         client = DummyClient()
-        restart_called = []
+        slept = []
 
         original_risk = mm.RiskState(**vars(mm.state.risk))
 
-        async def _fake_restart():
-            restart_called.append(True)
-            return False  # restart fails -> sleep 10 -> next iteration
-
         async def _controlled_sleep(seconds):
-            if len(restart_called) >= 1:
+            slept.append(seconds)
+            if len(slept) >= 1:
                 raise KeyboardInterrupt
 
         try:
             mm.state.risk = mm.RiskState()
             mm.risk_controller = mm.RiskController(mm.state.risk)
+            mm.ws_reconnect_event.clear()
             with temp_mm_attrs(
                 ws_connection_healthy=False,
                 current_mid_price_cached=50000.0,
@@ -221,14 +219,14 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 MIN_LOOP_INTERVAL=0.0,
                 WARMUP_SECONDS=0,
             ):
-                with patch.object(mm, "restart_websocket", side_effect=_fake_restart):
-                    with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
-                        with self.assertRaises(KeyboardInterrupt):
-                            await mm.market_making_loop(client)
+                with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                    with self.assertRaises(KeyboardInterrupt):
+                        await mm.market_making_loop(client)
 
-            self.assertTrue(len(restart_called) > 0)
+            self.assertTrue(mm.ws_reconnect_event.is_set())
             self.assertEqual(len(client.create_order_calls), 0)
         finally:
+            mm.ws_reconnect_event.clear()
             mm.state.risk = original_risk
             mm.risk_controller = mm.RiskController(mm.state.risk)
 

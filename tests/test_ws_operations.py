@@ -681,6 +681,14 @@ class TestAccountOrdersCancelEvent(unittest.TestCase):
 
 class TestCollectOrderOperations(unittest.TestCase):
 
+    def setUp(self):
+        mm.order_manager.clear_all()
+        mm._client_to_exchange_id.clear()
+
+    def tearDown(self):
+        mm.order_manager.clear_all()
+        mm._client_to_exchange_id.clear()
+
     def test_collect_creates_for_empty_orders(self):
         """No existing orders -> all create ops."""
         with temp_mm_attrs(
@@ -817,6 +825,192 @@ class TestCollectOrderOperations(unittest.TestCase):
             # Bid has no order -> create; Ask within threshold -> skip
             self.assertEqual(len(create_ops), 1)
             self.assertEqual(create_ops[0].side, "buy")
+
+    def test_collect_does_not_refresh_lifecycle_for_unchanged_orders(self):
+        """Skipping an unchanged order should not mutate lifecycle timestamps."""
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=100.0,
+        ):
+            mm.state.orders.bid_order_ids[0] = 42
+            mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 1.0
+            mm._client_to_exchange_id[42] = 420
+
+            lc = mm.order_manager.lifecycle("buy", 0)
+            lc.status = mm.SideStatus.LIVE
+            lc.target_price = 100.0
+            lc.target_size = 1.0
+            lc.updated_at = 123.0
+
+            ops = mm.collect_order_operations([(100.005, 101.0)], base_amount=1.0)
+
+            self.assertEqual(ops[0].action, "create")
+            self.assertEqual(lc.status, mm.SideStatus.LIVE)
+            self.assertEqual(lc.target_price, 100.0)
+            self.assertEqual(lc.target_size, 1.0)
+            self.assertEqual(lc.updated_at, 123.0)
+
+    def test_collect_leaves_stale_placing_for_watchdog(self):
+        """Stale PLACING slots should be handled by the watchdog, not inline here."""
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS=0.0,
+        ):
+            mm.state.orders.bid_order_ids[0] = 42
+            mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 1.0
+            mm.state.orders.ask_order_ids[0] = None
+            mm.state.orders.ask_prices[0] = None
+            mm.state.orders.ask_sizes[0] = None
+            lc = mm.order_manager.lifecycle("buy", 0)
+            lc.status = mm.SideStatus.PLACING
+            lc.updated_at = 1.0
+
+            with patch.object(mm.time, "monotonic", return_value=1000.0):
+                ops = mm.collect_order_operations([(105.0, 106.0)], base_amount=1.0)
+
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(ops[0].action, "create")
+            self.assertEqual(ops[0].side, "sell")
+            self.assertEqual(mm.state.orders.bid_order_ids[0], 42)
+            self.assertEqual(lc.status, mm.SideStatus.PLACING)
+
+
+class TestOrderLifecycleWatchdog(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        mm.order_manager.clear_all()
+        mm._client_to_exchange_id.clear()
+
+    def tearDown(self):
+        mm.order_manager.clear_all()
+        mm._client_to_exchange_id.clear()
+
+    async def test_watchdog_clears_stale_placing_without_exchange_id(self):
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            current_bid_order_id=42,
+            current_bid_price=100.0,
+            current_bid_size=1.0,
+        ):
+            lc = mm.order_manager.lifecycle("buy", 0)
+            lc.status = mm.SideStatus.PLACING
+            lc.updated_at = 10.0
+
+            sleep_calls = 0
+
+            async def _controlled_sleep(_seconds):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls > 1:
+                    raise KeyboardInterrupt
+
+            with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                with patch.object(mm.time, "monotonic", return_value=100.0):
+                    with self.assertRaises(KeyboardInterrupt):
+                        await mm.order_lifecycle_watchdog_loop(interval=0, placing_timeout=30.0)
+
+            self.assertIsNone(mm.state.orders.bid_order_ids[0])
+            self.assertEqual(mm.order_manager.lifecycle("buy", 0).status, mm.SideStatus.IDLE)
+
+    async def test_watchdog_keeps_fresh_placing_slot(self):
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            current_bid_order_id=42,
+            current_bid_price=100.0,
+            current_bid_size=1.0,
+        ):
+            lc = mm.order_manager.lifecycle("buy", 0)
+            lc.status = mm.SideStatus.PLACING
+            lc.updated_at = 90.0
+
+            sleep_calls = 0
+
+            async def _controlled_sleep(_seconds):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls > 1:
+                    raise KeyboardInterrupt
+
+            with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                with patch.object(mm.time, "monotonic", return_value=100.0):
+                    with self.assertRaises(KeyboardInterrupt):
+                        await mm.order_lifecycle_watchdog_loop(interval=0, placing_timeout=30.0)
+
+            self.assertEqual(mm.state.orders.bid_order_ids[0], 42)
+            self.assertEqual(mm.order_manager.lifecycle("buy", 0).status, mm.SideStatus.PLACING)
+
+
+class TestQuoteTelemetryLoop(unittest.IsolatedAsyncioTestCase):
+
+    async def test_quote_telemetry_logs_latest_snapshot(self):
+        sleep_calls = 0
+
+        async def _controlled_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise KeyboardInterrupt
+
+        snapshot = mm.QuoteTelemetryState(
+            updated_at=time.monotonic(),
+            mid=100.0,
+            position_size=0.25,
+            buy_0=99.5,
+            sell_0=100.5,
+            max_pos_usd=500.0,
+            quota_remaining=25,
+            threshold_bps=12.0,
+        )
+
+        with temp_mm_attrs(_quote_telemetry=snapshot):
+            with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                with patch.object(mm.logger, "info") as mock_info:
+                    with self.assertRaises(KeyboardInterrupt):
+                        await mm.quote_telemetry_loop(interval=0, stale_after=60.0, quota_stuck_cooldown=300.0)
+
+        self.assertTrue(any("QUOTING (" in call.args[0] for call in mock_info.call_args_list))
+
+    async def test_quote_telemetry_rate_limits_quota_stuck_warning(self):
+        class _Clock:
+            def __init__(self):
+                self.now = 1000.0
+
+            def monotonic(self):
+                return self.now
+
+        clock = _Clock()
+        sleep_calls = 0
+
+        async def _controlled_sleep(seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            clock.now += seconds
+            if sleep_calls > 2:
+                raise KeyboardInterrupt
+
+        with temp_mm_attrs(
+            _quote_telemetry=mm.QuoteTelemetryState(),
+            _volume_quota_remaining=0,
+            _last_send_time=600.0,
+            DRY_RUN=False,
+        ):
+            with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                with patch.object(mm.time, "monotonic", side_effect=clock.monotonic):
+                    with patch.object(mm.logger, "warning") as mock_warn:
+                        with self.assertRaises(KeyboardInterrupt):
+                            await mm.quote_telemetry_loop(interval=1.0, stale_after=60.0, quota_stuck_cooldown=300.0)
+
+        quota_calls = [
+            call for call in mock_warn.call_args_list
+            if "Quota stuck at 0 for >5min" in call.args[0]
+        ]
+        self.assertEqual(len(quota_calls), 1)
 
 
 # ---------------------------------------------------------------------------
