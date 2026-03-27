@@ -13,7 +13,7 @@ from sortedcontainers import SortedDict
 import market_maker_v2 as mm
 from dry_run import DryRunEngine, SimulatedOrder
 from trade_log import TradeLogger
-from tests._helpers import temp_mm_attrs
+from _helpers import temp_mm_attrs
 
 
 def _make_engine(**kwargs):
@@ -264,6 +264,36 @@ class TestCheckFills(unittest.TestCase):
 
             self.assertIn(1, engine._live_orders)
             self.assertEqual(engine._fill_count, 0)
+
+    def test_replenished_liquidity_at_different_price(self):
+        """Fill detects new liquidity at a different price even when aggregate depth is flat."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+
+            # Tick 1: 0.5 available at 99.5 — partial fill
+            bids, asks = _book({98.0: 1.0}, {99.5: 0.5})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.5)
+            self.assertIn(1, engine._live_orders)
+            self.assertAlmostEqual(engine._live_orders[1].size, 0.5)
+
+            # Tick 2: 99.5 liquidity gone, fresh 0.5 appears at 100.0
+            # Aggregate depth is still 0.5 — old scalar approach would see delta=0
+            bids, asks = _book({98.0: 1.0}, {100.0: 0.5})
+            engine.check_fills(bids, asks)
+
+            # Per-price delta detects the new liquidity at 100.0
+            self.assertAlmostEqual(engine._position, 1.0)
+            self.assertNotIn(1, engine._live_orders)
+            self.assertEqual(engine._fill_count, 2)
 
 
 class TestPnL(unittest.TestCase):
