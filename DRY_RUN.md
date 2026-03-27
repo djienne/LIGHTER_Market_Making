@@ -50,11 +50,13 @@ The dry-run engine (`dry_run.py`) replaces the exchange interaction layer at two
 
 Fill logic follows POST_ONLY maker semantics with **delta-fill** to avoid double-counting:
 
+- **POST_ONLY enforcement**: at creation, the engine checks the live orderbook. A buy at price P is rejected if `best_ask <= P`; a sell at price P is rejected if `best_bid >= P`. This matches the exchange behavior where POST_ONLY orders that would immediately match are rejected.
+- **Book snapshot at creation**: the current qualifying depth is recorded in the order's `_prev_by_price` dict. On the first fill check after `eligible_at`, only genuinely *new* liquidity (depth increases since creation) is eligible — pre-existing depth does not trigger fills.
 - **Buy limit at price P** fills when the best ask <= P. The engine walks ask levels up to P, sums available liquidity, and computes the *increase* since the last check. Only new liquidity is fillable.
 - **Sell limit at price P** fills when the best bid >= P. Same delta logic on the bid side.
 - **Fill price** is always the limit price (maker gets their specified price).
 - **Partial fills** occur naturally when available liquidity is less than order size.
-- **Multi-order fairness**: when multiple simulated orders compete for the same book side, liquidity consumed by one order is subtracted from what's available to the next within the same tick.
+- **Multi-order fairness**: when multiple simulated orders compete for the same book side, orders are processed in **price priority** (most aggressive first). Liquidity consumed by one order is subtracted from what's available to the next within the same tick.
 
 ### Simulated Latency
 

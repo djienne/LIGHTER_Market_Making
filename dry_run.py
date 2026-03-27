@@ -247,6 +247,29 @@ class DryRunEngine:
         self._next_exchange_id += 1
         now = time.monotonic()
 
+        # POST_ONLY check: reject if immediately marketable
+        ob = self._state.market.local_order_book
+        if op.side == "buy":
+            asks = ob.get('asks')
+            if asks and len(asks) > 0:
+                best_ask = asks.peekitem(0)[0]
+                if best_ask <= op.price:
+                    self._log.info(
+                        "DRY-RUN REJECT %s L%d: %.6f @ $%.2f (POST_ONLY: best_ask $%.2f <= price)",
+                        op.side.upper(), op.level, op.size, op.price, best_ask,
+                    )
+                    return
+        else:
+            bids = ob.get('bids')
+            if bids and len(bids) > 0:
+                best_bid = bids.peekitem(-1)[0]
+                if best_bid >= op.price:
+                    self._log.info(
+                        "DRY-RUN REJECT %s L%d: %.6f @ $%.2f (POST_ONLY: best_bid $%.2f >= price)",
+                        op.side.upper(), op.level, op.size, op.price, best_bid,
+                    )
+                    return
+
         sim = SimulatedOrder(
             client_order_id=op.order_id,
             side=op.side,
@@ -258,6 +281,24 @@ class DryRunEngine:
             synthetic_exchange_id=eid,
             eligible_at=now + self._sim_latency,
         )
+
+        # Snapshot current qualifying depth so first fill check after
+        # eligible_at only sees genuinely new arrivals, not pre-existing depth.
+        if op.side == "buy":
+            asks = ob.get('asks')
+            if asks:
+                for ask_price, ask_size in asks.items():
+                    if ask_price > op.price:
+                        break
+                    sim._prev_by_price[ask_price] = ask_size
+        else:
+            bids = ob.get('bids')
+            if bids:
+                for bid_price in reversed(bids):
+                    if bid_price < op.price:
+                        break
+                    sim._prev_by_price[bid_price] = bids[bid_price]
+
         self._live_orders[op.order_id] = sim
         self._id_map[op.order_id] = eid
         self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
@@ -317,19 +358,22 @@ class DryRunEngine:
         buy_consumed = 0.0
         sell_consumed = 0.0
 
-        # Snapshot order list to allow mutation during iteration
-        for sim in list(self._live_orders.values()):
-            # Process matured pending cancels: order was fillable during the
-            # cancel window but is now confirmed cancelled.
-            if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
-                self._live_orders.pop(sim.client_order_id, None)
-                self._om.clear_live(sim.side, sim.level)
-                continue
+        # Snapshot and sort by price priority: most aggressive orders fill first.
+        # Buys: higher price = more aggressive; Sells: lower price = more aggressive.
+        orders = list(self._live_orders.values())
+        orders.sort(key=lambda s: (-s.price if s.side == "buy" else s.price))
 
+        for sim in orders:
             # Skip orders still in-flight (create/modify latency)
             if now < sim.eligible_at:
+                # Still process matured cancels for in-flight orders
+                if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
+                    self._live_orders.pop(sim.client_order_id, None)
+                    self._om.clear_live(sim.side, sim.level)
                 continue
 
+            # Check fills FIRST — order is live and fillable even during
+            # the cancel latency window (cancel is still in-transit).
             if sim.side == "buy":
                 fill, buy_consumed = self._check_buy_fill(sim, asks, buy_consumed)
             else:
@@ -337,6 +381,11 @@ class DryRunEngine:
 
             if fill > 0:
                 self._process_fill(sim, fill, sim.price)
+
+            # THEN process matured cancel (after fill opportunity)
+            if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
+                self._live_orders.pop(sim.client_order_id, None)
+                self._om.clear_live(sim.side, sim.level)
 
     def _check_buy_fill(self, sim: SimulatedOrder, asks, consumed: float) -> tuple[float, float]:
         """Return (fillable_size, updated_consumed) for a buy limit order.
