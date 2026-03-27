@@ -3268,8 +3268,19 @@ async def main():
     ticker_task = asyncio.create_task(subscribe_to_ticker(state.config.market_id))
     logger.info("✅ ticker WS subscription started for market %d", state.config.market_id)
 
-    user_stats_task = asyncio.create_task(subscribe_to_user_stats(ACCOUNT_INDEX))
-    account_all_task = asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX))
+    user_stats_task = None
+    account_all_task = None
+    if DRY_RUN:
+        # Separate dry-run wallet — no need for real account WS
+        state.account.available_capital = DRY_RUN_CAPITAL
+        state.account.portfolio_value = DRY_RUN_CAPITAL
+        state.account.position_size = 0.0
+        account_state_received.set()
+        account_all_received.set()
+        logger.info("DRY-RUN wallet: $%.2f (use --capital to change, restart to reset)", DRY_RUN_CAPITAL)
+    else:
+        user_stats_task = asyncio.create_task(subscribe_to_user_stats(ACCOUNT_INDEX))
+        account_all_task = asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX))
 
     account_orders_task = None
     if client is not None and API_KEY_PRIVATE_KEY:
@@ -3351,9 +3362,9 @@ async def main():
     finally:
         logger.info("🧹 === Market Maker Cleanup Starting ===")
         tasks_to_cancel = []
-        if 'user_stats_task' in locals():
+        if 'user_stats_task' in locals() and user_stats_task is not None:
             tasks_to_cancel.append(user_stats_task)
-        if 'account_all_task' in locals():
+        if 'account_all_task' in locals() and account_all_task is not None:
             tasks_to_cancel.append(account_all_task)
         if account_orders_task is not None:
             tasks_to_cancel.append(account_orders_task)
@@ -3455,10 +3466,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Lighter market maker")
     parser.add_argument("--symbol", default=os.getenv("MARKET_SYMBOL", "BTC"), help="Market symbol to trade")
     parser.add_argument("--live", action="store_true", help="Live trading mode (default is dry-run/paper-trading)")
+    parser.add_argument("--capital", type=float, default=1000.0, help="Dry-run starting capital in USD (default: 1000)")
     args = parser.parse_args()
     MARKET_SYMBOL = args.symbol.upper()
     os.environ["MARKET_SYMBOL"] = MARKET_SYMBOL
     DRY_RUN = not args.live
+    DRY_RUN_CAPITAL = args.capital
 
     async def main_with_signal_handling():
         loop = asyncio.get_running_loop()
