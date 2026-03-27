@@ -1,6 +1,10 @@
 """Unit tests for the dry-run / paper-trading engine."""
 
 import asyncio
+import csv
+import json
+import os
+import tempfile
 import time
 import unittest
 
@@ -8,6 +12,7 @@ from sortedcontainers import SortedDict
 
 import market_maker_v2 as mm
 from dry_run import DryRunEngine, SimulatedOrder
+from trade_log import TradeLogger
 from tests._helpers import temp_mm_attrs
 
 
@@ -712,6 +717,162 @@ class TestSimulatedLatency(unittest.TestCase):
                 logger=mm.logger,
             )
             self.assertAlmostEqual(engine._sim_latency, 0.050)
+
+
+class TestPersistence(unittest.TestCase):
+    """Test save/load state round-trip."""
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_save_load_round_trip(self):
+        """State saved then loaded should restore engine fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "state.json")
+            with temp_mm_attrs(
+                current_bid_order_id=None, current_bid_price=None,
+                current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+                available_capital=1000.0, portfolio_value=1000.0,
+                current_position_size=0.0, current_mid_price_cached=100.0,
+            ):
+                engine = _make_engine(state_path=state_path)
+                engine.capture_initial_state()
+
+                # Simulate a fill to create non-trivial state
+                self._run(engine.process_batch([
+                    mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+                ]))
+                bids, asks = _book({99.0: 1.0}, {100.0: 2.0})
+                engine.check_fills(bids, asks)
+                engine.save_state()
+
+                self.assertTrue(os.path.exists(state_path))
+
+                # Load into a new engine
+                restored = DryRunEngine.load_state(
+                    state_path,
+                    state=mm.state,
+                    order_manager=mm.order_manager,
+                    client_to_exchange_id=mm._client_to_exchange_id,
+                    leverage=2,
+                    logger=mm.logger,
+                    sim_latency_s=0,
+                )
+                self.assertIsNotNone(restored)
+                self.assertAlmostEqual(restored._position, 0.5)
+                self.assertAlmostEqual(restored._initial_capital, 1000.0)
+                self.assertEqual(restored._fill_count, 1)
+                self.assertTrue(restored.initialized)
+
+    def test_load_missing_file_returns_none(self):
+        """load_state returns None if file doesn't exist."""
+        result = DryRunEngine.load_state(
+            "/nonexistent/path.json",
+            state=mm.state,
+            order_manager=mm.order_manager,
+            client_to_exchange_id=mm._client_to_exchange_id,
+            leverage=2,
+            logger=mm.logger,
+        )
+        self.assertIsNone(result)
+
+    def test_save_state_atomic(self):
+        """save_state should produce valid JSON."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = os.path.join(tmpdir, "state.json")
+            with temp_mm_attrs(available_capital=500.0, portfolio_value=500.0):
+                engine = _make_engine(state_path=state_path)
+                engine.capture_initial_state()
+                engine.save_state()
+
+                with open(state_path) as f:
+                    data = json.load(f)
+                self.assertIn("available_capital", data)
+                self.assertIn("updated_at", data)
+
+
+class TestTradeLog(unittest.TestCase):
+    """Test the TradeLogger CSV output."""
+
+    def test_log_fill_creates_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tl = TradeLogger(tmpdir, "BTC")
+            tl.log_fill(
+                side="buy", price=100.0, size=0.5, level=0,
+                position_after=0.5, realized_pnl=0.0,
+                available_capital=950.0, portfolio_value=1000.0,
+                simulated=True,
+            )
+            tl.flush()
+
+            with open(tl.path) as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                row = next(reader)
+            self.assertEqual(header[0], "timestamp")
+            self.assertEqual(row[1], "BTC")
+            self.assertEqual(row[2], "buy")
+            self.assertEqual(row[10], "true")
+
+    def test_clear_resets_log(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tl = TradeLogger(tmpdir, "BTC")
+            tl.log_fill(
+                side="buy", price=100.0, size=0.5, level=0,
+                position_after=0.5, realized_pnl=0.0,
+                available_capital=950.0, portfolio_value=1000.0,
+                simulated=True,
+            )
+            tl.flush()
+            tl.clear()
+
+            with open(tl.path) as f:
+                lines = f.readlines()
+            # Only header remains
+            self.assertEqual(len(lines), 1)
+
+    def test_buffer_no_disk_until_flush(self):
+        """log_fill should not touch disk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tl = TradeLogger(tmpdir, "BTC")
+            size_before = os.path.getsize(tl.path)  # just header
+            tl.log_fill(
+                side="sell", price=100.0, size=0.5, level=0,
+                position_after=-0.5, realized_pnl=0.0,
+                available_capital=950.0, portfolio_value=1000.0,
+                simulated=False,
+            )
+            size_after = os.path.getsize(tl.path)
+            self.assertEqual(size_before, size_after)  # no disk write yet
+
+            tl.flush()
+            size_flushed = os.path.getsize(tl.path)
+            self.assertGreater(size_flushed, size_before)
+
+    def test_dry_run_fill_writes_trade_log(self):
+        """Fills in DryRunEngine should appear in the trade log."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tl = TradeLogger(tmpdir, "BTC")
+            with temp_mm_attrs(
+                current_bid_order_id=None, current_bid_price=None,
+                current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+                available_capital=1000.0, portfolio_value=1000.0,
+                current_position_size=0.0, current_mid_price_cached=100.0,
+            ):
+                engine = _make_engine(trade_logger=tl)
+                asyncio.run(engine.process_batch([
+                    mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+                ]))
+                bids, asks = _book({99.0: 1.0}, {100.0: 2.0})
+                engine.check_fills(bids, asks)
+                tl.flush()
+
+                with open(tl.path) as f:
+                    rows = list(csv.reader(f))
+                # header + 1 fill
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[1][2], "buy")
 
 
 class TestCLIFlag(unittest.TestCase):

@@ -294,7 +294,9 @@ _order_cancel_events: dict[int, asyncio.Event] = {}
 
 # Dry-run / paper-trading engine (None when live)
 _dry_run_engine: Optional['DryRunEngine'] = None
+_trade_logger = None  # TradeLogger instance (set in main, used in both modes)
 DRY_RUN = False
+DRY_RUN_CAPITAL: Optional[float] = None
 
 # =========================
 # Logging setup
@@ -1483,6 +1485,19 @@ def on_account_all_update(account_id, data):
                             f"Type {trade.get('type')}, Size {trade.get('size')}, "
                             f"Price {trade.get('price')}"
                         )
+                        # Live trade log (buffer only — flushed periodically)
+                        if _trade_logger is not None and _dry_run_engine is None:
+                            _trade_logger.log_fill(
+                                side=str(trade.get("type", "")),
+                                price=float(trade.get("price", 0)),
+                                size=float(trade.get("size", 0)),
+                                level=0,
+                                position_after=state.account.position_size,
+                                realized_pnl=0.0,
+                                available_capital=state.account.available_capital or 0.0,
+                                portfolio_value=state.account.portfolio_value or 0.0,
+                                simulated=False,
+                            )
 
             if positions_updated and not account_all_received.is_set():
                 account_all_received.set()
@@ -2993,7 +3008,7 @@ async def market_making_loop(client):
                     await sign_and_send_batch(client, ops)
 
             if _dry_run_engine is not None:
-                _dry_run_engine.maybe_log_summary()
+                _dry_run_engine.maybe_log_summary()  # also flushes trade log + state
 
             consecutive_errors = 0
 
@@ -3027,6 +3042,9 @@ async def track_balance():
                 logger.info(f"⏸️ Skipping balance logging (open position: {state.account.position_size})")
             else:
                 logger.info("⏸️ Skipping balance logging (portfolio value not yet received)")
+            # Flush trade log periodically (both modes)
+            if _trade_logger is not None:
+                _trade_logger.flush()
         except Exception as e:
             logger.error(f"❌ Error in track_balance: {e}", exc_info=True)
         await asyncio.sleep(300)
@@ -3272,12 +3290,30 @@ async def main():
     account_all_task = None
     if DRY_RUN:
         # Separate dry-run wallet — no need for real account WS
-        state.account.available_capital = DRY_RUN_CAPITAL
-        state.account.portfolio_value = DRY_RUN_CAPITAL
-        state.account.position_size = 0.0
+        _dr_default_capital = 1000.0
+        _dr_state_path = os.path.join(LOG_DIR, "dry_run_state.json")
+
+        if DRY_RUN_CAPITAL is not None:
+            # Explicit --capital: reset to fresh wallet
+            state.account.available_capital = DRY_RUN_CAPITAL
+            state.account.portfolio_value = DRY_RUN_CAPITAL
+            state.account.position_size = 0.0
+            # Clear old state file
+            if os.path.exists(_dr_state_path):
+                os.remove(_dr_state_path)
+            logger.info("DRY-RUN wallet RESET to $%.2f", DRY_RUN_CAPITAL)
+        elif os.path.exists(_dr_state_path):
+            # Saved state exists — will be loaded later by DryRunEngine.load_state
+            logger.info("DRY-RUN: found saved state at %s", _dr_state_path)
+        else:
+            # First run — default capital
+            state.account.available_capital = _dr_default_capital
+            state.account.portfolio_value = _dr_default_capital
+            state.account.position_size = 0.0
+            logger.info("DRY-RUN wallet: $%.2f (first run)", _dr_default_capital)
+
         account_state_received.set()
         account_all_received.set()
-        logger.info("DRY-RUN wallet: $%.2f (use --capital to change, restart to reset)", DRY_RUN_CAPITAL)
     else:
         user_stats_task = asyncio.create_task(subscribe_to_user_stats(ACCOUNT_INDEX))
         account_all_task = asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX))
@@ -3317,16 +3353,39 @@ async def main():
 
         if DRY_RUN:
             from dry_run import DryRunEngine
-            _dry_run_engine = DryRunEngine(
-                state=state,
-                order_manager=order_manager,
-                client_to_exchange_id=_client_to_exchange_id,
-                leverage=LEVERAGE,
-                logger=logger,
-            )
-            _dry_run_engine.capture_initial_state()
+            from trade_log import TradeLogger
+            _trade_logger = TradeLogger(LOG_DIR, MARKET_SYMBOL)
+            if DRY_RUN_CAPITAL is not None:
+                _trade_logger.clear()  # reset trade log on --capital
+
+            # Try to restore from saved state, otherwise create fresh
+            if DRY_RUN_CAPITAL is None:
+                _dry_run_engine = DryRunEngine.load_state(
+                    _dr_state_path,
+                    state=state,
+                    order_manager=order_manager,
+                    client_to_exchange_id=_client_to_exchange_id,
+                    leverage=LEVERAGE,
+                    logger=logger,
+                    trade_logger=_trade_logger,
+                    state_path=_dr_state_path,
+                )
+            if _dry_run_engine is None:
+                _dry_run_engine = DryRunEngine(
+                    state=state,
+                    order_manager=order_manager,
+                    client_to_exchange_id=_client_to_exchange_id,
+                    leverage=LEVERAGE,
+                    logger=logger,
+                    trade_logger=_trade_logger,
+                    state_path=_dr_state_path,
+                )
+                _dry_run_engine.capture_initial_state()
             logger.info("DRY-RUN engine initialized — run with --live for real trading")
         else:
+            from trade_log import TradeLogger
+            _trade_logger = TradeLogger(LOG_DIR, MARKET_SYMBOL)
+
             # Emergency close any leftover position from a previous unclean shutdown
             if abs(state.account.position_size) > EPSILON:
                 logger.warning(
@@ -3388,6 +3447,9 @@ async def main():
 
         if DRY_RUN:
             if _dry_run_engine is not None:
+                _dry_run_engine.save_state()
+                if _dry_run_engine._trade_logger is not None:
+                    _dry_run_engine._trade_logger.flush()
                 _dry_run_engine.maybe_log_summary()
                 logger.info(
                     "DRY-RUN FINAL | realized=$%.4f | unrealized=$%.4f | total=$%.4f | fills=%d",
@@ -3395,6 +3457,8 @@ async def main():
                     _dry_run_engine.total_pnl, _dry_run_engine._fill_count,
                 )
         else:
+            if _trade_logger is not None:
+                _trade_logger.flush()
             try:
                 logger.info("🛡️ Final safety measure: attempting to cancel all orders.")
                 await asyncio.wait_for(cancel_all_orders(client), timeout=10)
@@ -3466,7 +3530,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Lighter market maker")
     parser.add_argument("--symbol", default=os.getenv("MARKET_SYMBOL", "BTC"), help="Market symbol to trade")
     parser.add_argument("--live", action="store_true", help="Live trading mode (default is dry-run/paper-trading)")
-    parser.add_argument("--capital", type=float, default=1000.0, help="Dry-run starting capital in USD (default: 1000)")
+    parser.add_argument("--capital", type=float, default=None, help="Reset dry-run wallet to this USD amount (default: 1000 on first run)")
     args = parser.parse_args()
     MARKET_SYMBOL = args.symbol.upper()
     os.environ["MARKET_SYMBOL"] = MARKET_SYMBOL

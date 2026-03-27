@@ -6,10 +6,17 @@ any transactions to the exchange.  Activated via ``--dry-run`` CLI flag.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from trade_log import TradeLogger
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +60,8 @@ class DryRunEngine:
         *,
         sim_latency_s: float = 0.050,  # simulated exchange latency (default 50 ms)
         log_interval: float = 60.0,
+        trade_logger: Optional['TradeLogger'] = None,
+        state_path: Optional[str] = None,
     ):
         self._state = state
         self._om = order_manager
@@ -61,6 +70,8 @@ class DryRunEngine:
         self._log = logger
         self._sim_latency = sim_latency_s
         self._log_interval = log_interval
+        self._trade_logger = trade_logger
+        self._state_path = state_path
 
         # Simulated order book
         self._live_orders: dict[int, SimulatedOrder] = {}
@@ -109,6 +120,87 @@ class DryRunEngine:
             self._initial_capital, self._position,
             self._leverage, int(self._sim_latency * 1000),
         )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_state(self) -> None:
+        """Atomically write engine state to JSON (tmp + rename)."""
+        if self._state_path is None:
+            return
+        data = {
+            "available_capital": self._state.account.available_capital,
+            "portfolio_value": self._state.account.portfolio_value,
+            "position": self._position,
+            "entry_vwap": self._entry_vwap,
+            "realized_pnl": self._realized_pnl,
+            "fill_count": self._fill_count,
+            "total_volume": self._total_volume,
+            "initial_capital": self._initial_capital,
+            "initial_portfolio_value": self._initial_portfolio_value,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            dir_name = os.path.dirname(self._state_path) or "."
+            fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self._state_path)
+        except OSError as exc:
+            self._log.warning("DRY-RUN: failed to save state: %s", exc)
+
+    @classmethod
+    def load_state(
+        cls,
+        path: str,
+        state,
+        order_manager,
+        client_to_exchange_id: dict,
+        leverage: int,
+        logger: logging.Logger,
+        **kwargs,
+    ) -> Optional['DryRunEngine']:
+        """Restore engine from saved JSON.  Returns None if file missing."""
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("DRY-RUN: could not load state from %s: %s", path, exc)
+            return None
+
+        engine = cls(
+            state=state,
+            order_manager=order_manager,
+            client_to_exchange_id=client_to_exchange_id,
+            leverage=leverage,
+            logger=logger,
+            state_path=path,
+            **kwargs,
+        )
+        engine._initial_capital = data.get("initial_capital", 0.0)
+        engine._initial_portfolio_value = data.get("initial_portfolio_value", 0.0)
+        engine._position = data.get("position", 0.0)
+        engine._entry_vwap = data.get("entry_vwap", 0.0)
+        engine._realized_pnl = data.get("realized_pnl", 0.0)
+        engine._fill_count = data.get("fill_count", 0)
+        engine._total_volume = data.get("total_volume", 0.0)
+
+        # Sync restored state into the global state object
+        state.account.available_capital = data.get("available_capital", engine._initial_capital)
+        state.account.portfolio_value = data.get("portfolio_value", engine._initial_portfolio_value)
+        state.account.position_size = engine._position
+
+        engine.initialized = True
+        logger.info(
+            "DRY-RUN: restored state from %s | capital=$%.2f | pos=%.6f | "
+            "realized=$%.4f | fills=%d",
+            path, state.account.available_capital, engine._position,
+            engine._realized_pnl, engine._fill_count,
+        )
+        return engine
 
     # ------------------------------------------------------------------
     # Batch processing  (replaces sign_and_send_batch)
@@ -354,6 +446,20 @@ class DryRunEngine:
             self._position, self._realized_pnl, self.unrealized_pnl,
         )
 
+        # Trade log (buffer only — no disk I/O on hot path)
+        if self._trade_logger is not None:
+            self._trade_logger.log_fill(
+                side=sim.side,
+                price=fill_price,
+                size=fill_size,
+                level=sim.level,
+                position_after=self._position,
+                realized_pnl=self._realized_pnl,
+                available_capital=self._state.account.available_capital,
+                portfolio_value=self._state.account.portfolio_value,
+                simulated=True,
+            )
+
     @staticmethod
     def _is_reducing(side: str, old_pos: float) -> bool:
         """True if this fill reduces the absolute position."""
@@ -425,3 +531,7 @@ class DryRunEngine:
             self._realized_pnl, self.unrealized_pnl, self.total_pnl,
             self._fill_count, self._total_volume, len(self._live_orders),
         )
+        # Periodic flush: trade log + state (disk I/O only here, not on hot path)
+        if self._trade_logger is not None:
+            self._trade_logger.flush()
+        self.save_state()
