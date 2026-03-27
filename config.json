@@ -2,7 +2,7 @@
     "trading": {
         "leverage": 2,
         "margin_mode": "cross",
-        "levels_per_side": 1,
+        "levels_per_side": 2,
         "base_amount": 0.0002,
         "capital_usage_percent": 0.12,
         "default_quote_update_threshold_bps": 10.0,
@@ -56,6 +56,6 @@
         "max_consecutive_order_rejections": 5,
         "circuit_breaker_cooldown_sec": 60.0,
         "order_reconcile_timeout_sec": 2.0,
-        "max_live_orders_per_market": 2
+        "max_live_orders_per_market": 4
     }
 }

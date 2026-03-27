@@ -696,7 +696,7 @@ def _dynamic_max_position_dollar(mid_price: float, capital: float = None, base_a
     raw = capital * LEVERAGE
     if base_amount is not None and base_amount > 0:
         order_usd = base_amount * mid_price
-        raw -= 2.0 * order_usd  # room for both-side orders
+        raw -= 2.0 * NUM_LEVELS * order_usd  # room for all order levels (both sides)
     return max(0.0, raw * 0.9)  # 10% safety margin
 
 
@@ -3450,7 +3450,18 @@ async def main():
                 os.remove(_dr_state_path)
             logger.info("DRY-RUN wallet RESET to $%.2f", DRY_RUN_CAPITAL)
         elif os.path.exists(_dr_state_path):
-            # Saved state exists — will be loaded later by DryRunEngine.load_state
+            # Saved state exists — pre-load capital so logs/checks aren't None
+            # before DryRunEngine.load_state runs the full restore.
+            try:
+                with open(_dr_state_path) as _sf:
+                    _saved = json.loads(_sf.read())
+                state.account.available_capital = _saved.get("available_capital", _dr_default_capital)
+                state.account.portfolio_value = _saved.get("portfolio_value", _dr_default_capital)
+                state.account.position_size = _saved.get("position", 0.0)
+            except Exception:
+                state.account.available_capital = _dr_default_capital
+                state.account.portfolio_value = _dr_default_capital
+                state.account.position_size = 0.0
             logger.info("DRY-RUN: found saved state at %s", _dr_state_path)
         else:
             # First run — default capital
@@ -3515,7 +3526,6 @@ async def main():
                     leverage=LEVERAGE,
                     logger=logger,
                     trade_logger=_trade_logger,
-                    state_path=_dr_state_path,
                 )
             if _dry_run_engine is None:
                 # Seed defaults if load_state failed on corrupt file
