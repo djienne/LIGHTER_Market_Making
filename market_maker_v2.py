@@ -3526,6 +3526,7 @@ async def main():
                     leverage=LEVERAGE,
                     logger=logger,
                     trade_logger=_trade_logger,
+                    rejection_callback=_record_order_rejection,
                 )
             if _dry_run_engine is None:
                 # Seed defaults if load_state failed on corrupt file
@@ -3546,6 +3547,7 @@ async def main():
                     logger=logger,
                     trade_logger=_trade_logger,
                     state_path=_dr_state_path,
+                    rejection_callback=_record_order_rejection,
                 )
                 _dry_run_engine.capture_initial_state()
             logger.info("DRY-RUN engine initialized — run with --live for real trading")

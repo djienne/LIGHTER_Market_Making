@@ -70,6 +70,7 @@ class DryRunEngine:
         log_interval: float = 60.0,
         trade_logger: Optional['TradeLogger'] = None,
         state_path: Optional[str] = None,
+        rejection_callback=None,          # called on POST_ONLY rejects (for circuit breaker)
     ):
         self._state = state
         self._om = order_manager
@@ -80,6 +81,7 @@ class DryRunEngine:
         self._log_interval = log_interval
         self._trade_logger = trade_logger
         self._state_path = state_path
+        self._rejection_cb = rejection_callback
 
         # Simulated order book
         self._live_orders: dict[int, SimulatedOrder] = {}
@@ -265,6 +267,8 @@ class DryRunEngine:
                         "DRY-RUN REJECT %s L%d: %.6f @ $%.2f (POST_ONLY: best_ask $%.2f <= price)",
                         op.side.upper(), op.level, op.size, op.price, best_ask,
                     )
+                    if self._rejection_cb is not None:
+                        self._rejection_cb("dry_run:create_post_only_reject")
                     return
         else:
             bids = ob.get('bids')
@@ -275,6 +279,8 @@ class DryRunEngine:
                         "DRY-RUN REJECT %s L%d: %.6f @ $%.2f (POST_ONLY: best_bid $%.2f >= price)",
                         op.side.upper(), op.level, op.size, op.price, best_bid,
                     )
+                    if self._rejection_cb is not None:
+                        self._rejection_cb("dry_run:create_post_only_reject")
                     return
 
         sim = SimulatedOrder(
@@ -335,6 +341,8 @@ class DryRunEngine:
                     op.side.upper(), op.level, sim.price, op.price,
                     asks.peekitem(0)[0],
                 )
+                if self._rejection_cb is not None:
+                    self._rejection_cb("dry_run:modify_post_only_reject")
                 return  # old order stays live at old price
         else:
             bids = ob.get('bids')
@@ -345,6 +353,8 @@ class DryRunEngine:
                     op.side.upper(), op.level, sim.price, op.price,
                     bids.peekitem(-1)[0],
                 )
+                if self._rejection_cb is not None:
+                    self._rejection_cb("dry_run:modify_post_only_reject")
                 return  # old order stays live at old price
 
         old_price = sim.price
@@ -430,14 +440,10 @@ class DryRunEngine:
         buy_consumed = 0.0
         sell_consumed = 0.0
 
-        # Sort by price priority (most aggressive first), FIFO at equal price.
-        orders = list(self._live_orders.values())
-        orders.sort(key=lambda s: (-s.price if s.side == "buy" else s.price, s._queue_ts))
-
-        for sim in orders:
-            # --- Promote pending modify when latency expires ---
+        # PASS 1: Promote all pending modifies whose latency expired.
+        # This must happen before sorting so the sort sees final prices.
+        for sim in list(self._live_orders.values()):
             if sim._pending_price is not None and now >= sim.eligible_at:
-                # POST_ONLY arrival check on the NEW price
                 rejected = False
                 if sim.side == "buy" and asks and len(asks) > 0:
                     if asks.peekitem(0)[0] <= sim._pending_price:
@@ -456,27 +462,29 @@ class DryRunEngine:
                         )
                         rejected = True
                 if rejected:
-                    # Clear pending state, keep old order live
                     sim._pending_price = None
                     sim._pending_size = None
                     sim._pending_prev_by_price = None
-                    # Resync state.orders to the old price/size (may have
-                    # been partially filled during latency)
                     self._om.bind_live(sim.side, sim.client_order_id,
                                        sim.price, sim.size, level=sim.level)
+                    if self._rejection_cb is not None:
+                        self._rejection_cb("dry_run:modify_arrival_reject")
                 else:
-                    # Promote: switch to new price
                     sim.price = sim._pending_price
                     sim.size = sim._pending_size
                     sim._prev_by_price = sim._pending_prev_by_price or {}
-                    sim._queue_ts = now  # refreshed for FIFO
+                    sim._queue_ts = now
                     sim._pending_price = None
                     sim._pending_size = None
                     sim._pending_prev_by_price = None
-                    # Sync state.orders to the promoted price
                     self._om.bind_live(sim.side, sim.client_order_id,
                                        sim.price, sim.size, level=sim.level)
 
+        # PASS 2: Sort by (now-final) price priority, then check fills.
+        orders = list(self._live_orders.values())
+        orders.sort(key=lambda s: (-s.price if s.side == "buy" else s.price, s._queue_ts))
+
+        for sim in orders:
             # --- Skip orders in-flight for CREATE (not pending-modify) ---
             if now < sim.eligible_at and sim._pending_price is None:
                 # Pure create in-flight: not fillable yet
@@ -497,6 +505,8 @@ class DryRunEngine:
                         )
                         self._live_orders.pop(sim.client_order_id, None)
                         self._om.clear_live(sim.side, sim.level)
+                        if self._rejection_cb is not None:
+                            self._rejection_cb("dry_run:create_arrival_reject")
                         continue
                 elif sim.side == "sell" and bids and len(bids) > 0:
                     if bids.peekitem(-1)[0] >= sim.price:
@@ -507,6 +517,8 @@ class DryRunEngine:
                         )
                         self._live_orders.pop(sim.client_order_id, None)
                         self._om.clear_live(sim.side, sim.level)
+                        if self._rejection_cb is not None:
+                            self._rejection_cb("dry_run:create_arrival_reject")
                         continue
 
             # Check fills at current (possibly old) price.
