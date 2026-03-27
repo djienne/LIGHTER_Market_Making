@@ -291,6 +291,12 @@ RECONCILER_SLOW_INTERVAL_SEC = 60.0
 
 # WS-based cancel confirmation: order_id -> asyncio.Event
 _order_cancel_events: dict[int, asyncio.Event] = {}
+_pause_cleanup_running = False
+QUOTE_TELEMETRY_INTERVAL_SEC = 30.0
+QUOTE_TELEMETRY_STALE_AFTER_SEC = 60.0
+QUOTA_STUCK_WARNING_COOLDOWN_SEC = 300.0
+ORDER_LIFECYCLE_WATCHDOG_INTERVAL_SEC = 2.0
+ORDER_PLACING_TIMEOUT_SEC = 30.0
 
 # Dry-run / paper-trading engine (None when live)
 _dry_run_engine: Optional['DryRunEngine'] = None
@@ -413,6 +419,18 @@ class RiskState:
 
 
 @dataclass
+class QuoteTelemetryState:
+    updated_at: float = 0.0
+    mid: Optional[float] = None
+    position_size: float = 0.0
+    buy_0: Optional[float] = None
+    sell_0: Optional[float] = None
+    max_pos_usd: float = 0.0
+    quota_remaining: Optional[int] = None
+    threshold_bps: float = 0.0
+
+
+@dataclass
 class MMState:
     orders: OrderState = field(default_factory=OrderState)
     market: MarketState = field(default_factory=MarketState)
@@ -425,6 +443,35 @@ class MMState:
 
 
 state = MMState()
+_quote_telemetry = QuoteTelemetryState()
+
+
+def _reset_quote_telemetry() -> None:
+    global _quote_telemetry
+    _quote_telemetry = QuoteTelemetryState()
+
+
+def _publish_quote_telemetry(
+    *,
+    mid: float,
+    position_size: float,
+    buy_0: Optional[float],
+    sell_0: Optional[float],
+    max_pos_usd: float,
+    quota_remaining: Optional[int],
+    threshold_bps: float,
+) -> None:
+    global _quote_telemetry
+    _quote_telemetry = QuoteTelemetryState(
+        updated_at=time.monotonic(),
+        mid=mid,
+        position_size=position_size,
+        buy_0=buy_0,
+        sell_0=sell_0,
+        max_pos_usd=max_pos_usd,
+        quota_remaining=quota_remaining,
+        threshold_bps=threshold_bps,
+    )
 
 
 class OrderManager:
@@ -2049,6 +2096,126 @@ async def cancel_all_orders(client, _retries_left: int = 3):
         logger.error(f"❌ Failed to cancel orders: {e}", exc_info=True)
 
 
+async def _quota_recovery_task(client) -> None:
+    """Background task wrapper: runs quota recovery without blocking the hot loop."""
+    try:
+        recovered = await _attempt_quota_recovery(client)
+        if recovered:
+            logger.info("Quota recovered, resuming normal operations")
+    except Exception as exc:
+        logger.error("Quota recovery task failed: %s", exc, exc_info=True)
+
+
+async def _pause_cleanup_task(client) -> None:
+    """Background task: cancel all orders and verify during pause.  Non-blocking to hot loop."""
+    global _pause_cleanup_running
+    try:
+        _pause_attempts = getattr(risk_controller, '_pause_cleanup_attempts', 0) + 1
+        risk_controller._pause_cleanup_attempts = _pause_attempts
+        logger.warning("Trading is paused (%s); cancelling live orders (attempt %d).",
+                       state.risk.pause_reason, _pause_attempts)
+
+        # Force-clear stuck PLACING orders after 5 retries
+        if _pause_attempts > 5 and _has_live_local_orders():
+            logger.warning("Pause cleanup stuck after %d attempts — force-clearing PLACING orders",
+                           _pause_attempts)
+            for lvl in range(NUM_LEVELS):
+                for side_name in ("buy", "sell"):
+                    lc = order_manager.lifecycle(side_name, lvl)
+                    if lc.status == SideStatus.PLACING:
+                        order_manager.clear_live(side_name, lvl)
+
+        cancel_ops = []
+        for lvl in range(NUM_LEVELS):
+            bid_id = state.orders.bid_order_ids[lvl]
+            ask_id = state.orders.ask_order_ids[lvl]
+            if bid_id is not None:
+                exchange_id = _resolve_exchange_id(bid_id)
+                if exchange_id is not None:
+                    cancel_ops.append(BatchOp(
+                        side="buy", level=lvl, action="cancel",
+                        price=0, size=0,
+                        order_id=bid_id, exchange_id=exchange_id,
+                    ))
+            if ask_id is not None:
+                exchange_id = _resolve_exchange_id(ask_id)
+                if exchange_id is not None:
+                    cancel_ops.append(BatchOp(
+                        side="sell", level=lvl, action="cancel",
+                        price=0, size=0,
+                        order_id=ask_id, exchange_id=exchange_id,
+                    ))
+        if cancel_ops:
+            if _dry_run_engine is not None:
+                await _dry_run_engine.process_batch(cancel_ops)
+            elif await _wait_for_write_slot(op_count=len(cancel_ops), cancel_only=True):
+                await sign_and_send_batch(client, cancel_ops)
+        elif _has_live_local_orders():
+            logger.info("Pause cleanup waiting for exchange order ids before sending cancels.")
+
+        if DRY_RUN:
+            if not _has_live_local_orders():
+                risk_controller.pause_cancel_done = True
+                risk_controller._pause_cleanup_attempts = 0
+            else:
+                logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
+        else:
+            reconcile_ok = False
+            try:
+                reconcile_ok = await reconcile_orders_with_exchange(client, source="pause_cancel_verify")
+            except Exception as exc:
+                logger.error("Post-pause reconciliation failed: %s", exc)
+            if reconcile_ok and not _has_live_local_orders():
+                risk_controller.pause_cancel_done = True
+                risk_controller._pause_cleanup_attempts = 0
+            else:
+                logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
+    except Exception as exc:
+        logger.error("Pause cleanup task failed: %s", exc, exc_info=True)
+    finally:
+        _pause_cleanup_running = False
+
+
+async def order_lifecycle_watchdog_loop(interval=None, placing_timeout=None) -> None:
+    """Background task: clear stale PLACING slots outside the hot order diff path."""
+    if interval is None:
+        interval = ORDER_LIFECYCLE_WATCHDOG_INTERVAL_SEC
+    if placing_timeout is None:
+        placing_timeout = ORDER_PLACING_TIMEOUT_SEC
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            now = time.monotonic()
+            for level in range(NUM_LEVELS):
+                for side in ("buy", "sell"):
+                    lc = order_manager.lifecycle(side, level)
+                    if lc.status != SideStatus.PLACING or lc.updated_at <= 0:
+                        continue
+
+                    existing_id = (
+                        state.orders.bid_order_ids[level]
+                        if side == "buy"
+                        else state.orders.ask_order_ids[level]
+                    )
+                    if existing_id is None or _has_exchange_id(existing_id):
+                        continue
+
+                    age = now - lc.updated_at
+                    if age <= placing_timeout:
+                        continue
+
+                    logger.warning(
+                        "Order %s[%d] stuck in PLACING for %.0fs — clearing stale slot",
+                        side, level, age,
+                    )
+                    order_manager.clear_live(side, level)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Order lifecycle watchdog failed: %s", exc, exc_info=True)
+
+
 async def _attempt_quota_recovery(client) -> bool:
     """Send small IOC market orders to generate volume and recover quota.
 
@@ -2398,26 +2565,7 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
 
             if existing_id is not None:
                 if not _has_exchange_id(existing_id):
-                    # Timeout stale PLACING orders (no exchange confirmation after 30s)
-                    lc = order_manager.lifecycle(side, level)
-                    if lc.status == SideStatus.PLACING and lc.updated_at > 0:
-                        age = time.monotonic() - lc.updated_at
-                        if age > 30.0:
-                            logger.warning(
-                                "Order %s[%d] stuck in PLACING for %.0fs — clearing stale slot",
-                                side, level, age,
-                            )
-                            order_manager.clear_live(side, level)
-                            # Fall through to create a new order below
-                            if is_buy:
-                                existing_id = orders.bid_order_ids[level]
-                            else:
-                                existing_id = orders.ask_order_ids[level]
                     if existing_id is not None and not _has_exchange_id(existing_id):
-                        order_manager.mark_status(
-                            side, SideStatus.LIVE, level=level,
-                            target_price=new_price, target_size=new_size,
-                        )
                         if _log_debug:
                             logger.debug(
                                 "Keeping %s[%d]: awaiting exchange order_index for client id %d",
@@ -2428,10 +2576,6 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
                 size_changed = _size_change_requires_update(existing_size, new_size)
                 needs_modify = existing_price is None or change_bps > effective_threshold or size_changed
                 if not needs_modify:
-                    order_manager.mark_status(
-                        side, SideStatus.LIVE, level=level,
-                        target_price=new_price, target_size=new_size,
-                    )
                     if _log_debug:
                         logger.debug(
                             "Keeping %s[%d]: price %.2f bps <= %.2f and size unchanged",
@@ -2790,6 +2934,7 @@ _MAX_CONSECUTIVE_LOOP_ERRORS = 10
 
 
 async def market_making_loop(client):
+    global _pause_cleanup_running
     logger.info("Starting 2-sided market making loop...")
     _log_info = logger.isEnabledFor(logging.INFO)
     _log_debug = logger.isEnabledFor(logging.DEBUG)
@@ -2798,7 +2943,6 @@ async def market_making_loop(client):
     _warmup_logged = False
     _last_warmup_log_min = -1
     _warmup_complete_logged = False
-    _last_quote_log_time = 0.0
 
     while True:
         try:
@@ -2845,76 +2989,22 @@ async def market_making_loop(client):
             risk_controller.maybe_recover(websocket_healthy=ws_healthy)
 
             if risk_controller.is_paused():
-                if not risk_controller.pause_cancel_done:
-                    _pause_attempts = getattr(risk_controller, '_pause_cleanup_attempts', 0) + 1
-                    risk_controller._pause_cleanup_attempts = _pause_attempts
-                    logger.warning("Trading is paused (%s); cancelling local live orders (attempt %d).",
-                                   state.risk.pause_reason, _pause_attempts)
-
-                    # Force-clear stuck PLACING orders after 5 retries
-                    if _pause_attempts > 5 and _has_live_local_orders():
-                        logger.warning("Pause cleanup stuck after %d attempts — force-clearing PLACING orders",
-                                       _pause_attempts)
-                        for lvl in range(NUM_LEVELS):
-                            for side_name in ("buy", "sell"):
-                                lc = order_manager.lifecycle(side_name, lvl)
-                                if lc.status == SideStatus.PLACING:
-                                    order_manager.clear_live(side_name, lvl)
-
-                    cancel_ops = []
-                    for lvl in range(NUM_LEVELS):
-                        bid_id = state.orders.bid_order_ids[lvl]
-                        ask_id = state.orders.ask_order_ids[lvl]
-                        if bid_id is not None:
-                            exchange_id = _resolve_exchange_id(bid_id)
-                            if exchange_id is not None:
-                                cancel_ops.append(BatchOp(
-                                    side="buy", level=lvl, action="cancel",
-                                    price=0, size=0,
-                                    order_id=bid_id, exchange_id=exchange_id,
-                                ))
-                        if ask_id is not None:
-                            exchange_id = _resolve_exchange_id(ask_id)
-                            if exchange_id is not None:
-                                cancel_ops.append(BatchOp(
-                                    side="sell", level=lvl, action="cancel",
-                                    price=0, size=0,
-                                    order_id=ask_id, exchange_id=exchange_id,
-                                ))
-                    if cancel_ops:
-                        if _dry_run_engine is not None:
-                            await _dry_run_engine.process_batch(cancel_ops)
-                        elif await _wait_for_write_slot(op_count=len(cancel_ops), cancel_only=True):
-                            await sign_and_send_batch(client, cancel_ops)
-                    elif _has_live_local_orders():
-                        logger.info("Pause cleanup waiting for exchange order ids before sending cancels.")
-
-                    if DRY_RUN:
-                        # No exchange to reconcile; just check local state
-                        if not _has_live_local_orders():
-                            risk_controller.pause_cancel_done = True
-                            risk_controller._pause_cleanup_attempts = 0
-                        else:
-                            logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
-                    else:
-                        reconcile_ok = False
-                        try:
-                            reconcile_ok = await reconcile_orders_with_exchange(client, source="pause_cancel_verify")
-                        except Exception as exc:
-                            logger.error("Post-pause reconciliation failed: %s", exc)
-                        if reconcile_ok and not _has_live_local_orders():
-                            risk_controller.pause_cancel_done = True
-                            risk_controller._pause_cleanup_attempts = 0
-                        else:
-                            logger.warning("Pause cleanup incomplete; will retry while trading remains paused.")
+                _reset_quote_telemetry()
+                if not risk_controller.pause_cancel_done and not _pause_cleanup_running:
+                    _pause_cleanup_running = True
+                    asyncio.create_task(_pause_cleanup_task(client))
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
             if not ws_healthy:
-                logger.warning("Websocket connection unhealthy, attempting restart...")
-                if not await restart_websocket():
-                    await asyncio.sleep(10)
-                    continue
+                # Trigger reconnect via the event — ws_manager handles it
+                # in its own task without blocking the hot loop.
+                _reset_quote_telemetry()
+                if not ws_reconnect_event.is_set():
+                    logger.warning("Websocket unhealthy — triggering reconnect via event")
+                    ws_reconnect_event.set()
+                await asyncio.sleep(MIN_LOOP_INTERVAL)
+                continue
 
             # Wait for fresh order book data but wake up to check state
             # Clear before wait to avoid losing updates between wait() returning and clear()
@@ -2930,11 +3020,13 @@ async def market_making_loop(client):
             snap_capital = state.account.available_capital
 
             if snap_mid is None:
+                _reset_quote_telemetry()
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
             base_amount = calculate_dynamic_base_amount(snap_mid, capital=snap_capital)
             if base_amount is None or base_amount <= 0:
+                _reset_quote_telemetry()
                 if _log_info:
                     logger.warning("Base amount is zero or invalid; skipping order refresh.")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
@@ -2951,45 +3043,27 @@ async def market_making_loop(client):
                 capital=snap_capital, base_amount=base_amount,
                 max_pos_usd=_max_pos)
 
-            # Log level-0 quote (rate-limited to once every 10s)
             buy_0, sell_0 = level_prices[0]
-            _now_mono = time.monotonic()
-            if _log_info and _now_mono - _last_quote_log_time >= 10.0:
-                _last_quote_log_time = _now_mono
-                if buy_0 is not None or sell_0 is not None:
-                    bid_str = f"${buy_0:.4f} (-{(snap_mid - buy_0) / snap_mid * 100:.4f}%)" if buy_0 is not None else "LIMIT"
-                    ask_str = f"${sell_0:.4f} (+{(sell_0 - snap_mid) / snap_mid * 100:.4f}%)" if sell_0 is not None else "LIMIT"
-                    mode = "1-sided" if (buy_0 is None or sell_0 is None) else "2-sided"
-                    logger.info(
-                        "QUOTING (%s) | Pos: %+.4f | Mid: $%.4f | Bid: %s | Ask: %s | MaxPos: $%.0f | Quota: %s | Thr: %.0fbp",
-                        mode, snap_position, snap_mid, bid_str, ask_str,
-                        _max_pos,
-                        _volume_quota_remaining if _volume_quota_remaining is not None else "?",
-                        _adaptive_threshold_bps(),
-                    )
-                elif _log_debug:
-                    logger.debug("Could not calculate quotes; skipping refresh.")
-
-            # Warn if quota is stuck at 0 with no sends for a long time
-            if (not DRY_RUN
-                    and _volume_quota_remaining is not None and _volume_quota_remaining <= 0
-                    and time.monotonic() - _last_send_time > 300):
-                logger.warning("Quota stuck at 0 for >5min with no sends — may need manual restart")
+            _publish_quote_telemetry(
+                mid=snap_mid,
+                position_size=snap_position,
+                buy_0=buy_0,
+                sell_0=sell_0,
+                max_pos_usd=_max_pos,
+                quota_remaining=_volume_quota_remaining,
+                threshold_bps=_adaptive_threshold_bps(),
+            )
 
             # --- Quota / backoff logic (skip entirely in dry-run) ---
             if not DRY_RUN:
-                # Quota recovery: if enabled, critically low, NOT in cooldown, and past post-warmup grace
+                # Quota recovery: launch as background task (non-blocking)
                 if (_QR_ENABLED
                         and _volume_quota_remaining is not None
                         and _volume_quota_remaining < _QR_TRIGGER
                         and not _quota_recovery_in_progress
                         and time.monotonic() - _quota_recovery_last_attempt >= _QR_COOLDOWN
                         and time.monotonic() - _trading_start_time >= _QR_POST_WARMUP_GRACE):
-                    recovered = await _attempt_quota_recovery(client)
-                    if recovered:
-                        logger.info("Quota recovered, resuming normal operations")
-                    await asyncio.sleep(MIN_LOOP_INTERVAL)
-                    continue  # re-evaluate on next iteration
+                    asyncio.create_task(_quota_recovery_task(client))
 
                 # Yield to quota recovery — don't compete for the free slot
                 if _quota_recovery_in_progress:
@@ -3058,6 +3132,71 @@ async def track_balance():
 def _append_line(path, line):
     with open(path, "a") as f:
         f.write(line)
+
+
+async def quote_telemetry_loop(
+    interval=None,
+    stale_after=None,
+    quota_stuck_cooldown=None,
+):
+    """Background task: emit quote telemetry from the latest hot-loop snapshot."""
+    if interval is None:
+        interval = QUOTE_TELEMETRY_INTERVAL_SEC
+    if stale_after is None:
+        stale_after = QUOTE_TELEMETRY_STALE_AFTER_SEC
+    if quota_stuck_cooldown is None:
+        quota_stuck_cooldown = QUOTA_STUCK_WARNING_COOLDOWN_SEC
+
+    last_quota_stuck_log = 0.0
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            now = time.monotonic()
+            snap = _quote_telemetry
+
+            if (logger.isEnabledFor(logging.INFO)
+                    and snap.updated_at > 0
+                    and now - snap.updated_at <= stale_after
+                    and (snap.buy_0 is not None or snap.sell_0 is not None)
+                    and snap.mid is not None):
+                bid_str = (
+                    f"${snap.buy_0:.4f} (-{(snap.mid - snap.buy_0) / snap.mid * 100:.4f}%)"
+                    if snap.buy_0 is not None else "LIMIT"
+                )
+                ask_str = (
+                    f"${snap.sell_0:.4f} (+{(snap.sell_0 - snap.mid) / snap.mid * 100:.4f}%)"
+                    if snap.sell_0 is not None else "LIMIT"
+                )
+                mode = "1-sided" if (snap.buy_0 is None or snap.sell_0 is None) else "2-sided"
+                logger.info(
+                    "QUOTING (%s) | Pos: %+.4f | Mid: $%.4f | Bid: %s | Ask: %s | MaxPos: $%.0f | Quota: %s | Thr: %.0fbp",
+                    mode,
+                    snap.position_size,
+                    snap.mid,
+                    bid_str,
+                    ask_str,
+                    snap.max_pos_usd,
+                    snap.quota_remaining if snap.quota_remaining is not None else "?",
+                    snap.threshold_bps,
+                )
+
+            quota_stuck = (
+                not DRY_RUN
+                and _volume_quota_remaining is not None
+                and _volume_quota_remaining <= 0
+                and now - _last_send_time > 300
+            )
+            if quota_stuck:
+                if last_quota_stuck_log <= 0 or now - last_quota_stuck_log >= quota_stuck_cooldown:
+                    logger.warning("Quota stuck at 0 for >5min with no sends — may need manual restart")
+                    last_quota_stuck_log = now
+            else:
+                last_quota_stuck_log = 0.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Quote telemetry task failed: %s", exc, exc_info=True)
 
 
 async def periodic_orderbook_sanity_check(interval=None, tolerance_pct=None):
@@ -3347,7 +3486,7 @@ async def main():
         logger.info("⏳ Waiting for initial order book, account data, and position data...")
         await asyncio.wait_for(order_book_received.wait(), timeout=30.0)
         logger.info(f"✅ Websocket connected for market {state.config.market_id}")
-        
+
         logger.info("⏳ Waiting for valid account capital...")
         await asyncio.wait_for(account_state_received.wait(), timeout=30.0)
         logger.info(f"✅ Received valid account capital: ${state.account.available_capital}; and portfolio value: ${state.account.portfolio_value}.")
@@ -3423,6 +3562,8 @@ async def main():
 
         balance_task = asyncio.create_task(track_balance())
         sanity_task = asyncio.create_task(periodic_orderbook_sanity_check())
+        lifecycle_watchdog_task = asyncio.create_task(order_lifecycle_watchdog_loop())
+        quote_telemetry_task = asyncio.create_task(quote_telemetry_loop())
         await market_making_loop(client)
 
     except asyncio.TimeoutError:
@@ -3444,6 +3585,10 @@ async def main():
             tasks_to_cancel.append(balance_task)
         if 'sanity_task' in locals():
             tasks_to_cancel.append(sanity_task)
+        if 'lifecycle_watchdog_task' in locals():
+            tasks_to_cancel.append(lifecycle_watchdog_task)
+        if 'quote_telemetry_task' in locals():
+            tasks_to_cancel.append(quote_telemetry_task)
         if 'ticker_task' in locals():
             tasks_to_cancel.append(ticker_task)
         if 'ws_task' in locals():
@@ -3536,7 +3681,7 @@ async def main():
         await api_client.close()
         logger.info("🛑 Market maker stopped.")
 
-# ============ Entrypoint with signal handling ============ 
+# ============ Entrypoint with signal handling ============
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Lighter market maker")
     parser.add_argument("--symbol", default=os.getenv("MARKET_SYMBOL", "BTC"), help="Market symbol to trade")
