@@ -28,12 +28,13 @@ The dry-run engine (`dry_run.py`) replaces the exchange interaction layer at two
 
 ### Fill Simulation
 
-Fill logic follows POST_ONLY maker semantics:
+Fill logic follows POST_ONLY maker semantics with **delta-fill** to avoid double-counting:
 
-- **Buy limit at price P** fills when the best ask <= P. The engine walks ask levels up to P, sums available liquidity, and fills `min(order_size, available_liquidity)`.
-- **Sell limit at price P** fills when the best bid >= P. Same logic on the bid side.
+- **Buy limit at price P** fills when the best ask <= P. The engine walks ask levels up to P, sums available liquidity, and computes the *increase* since the last check. Only new liquidity is fillable.
+- **Sell limit at price P** fills when the best bid >= P. Same delta logic on the bid side.
 - **Fill price** is always the limit price (maker gets their specified price).
 - **Partial fills** occur naturally when available liquidity is less than order size.
+- **Multi-order fairness**: when multiple simulated orders compete for the same book side, liquidity consumed by one order is subtracted from what's available to the next within the same tick.
 
 ### Simulated Latency
 

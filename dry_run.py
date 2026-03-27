@@ -28,6 +28,7 @@ class SimulatedOrder:
     synthetic_exchange_id: int
     eligible_at: float = 0.0        # not fillable until this monotonic time (create/modify latency)
     pending_cancel_at: float = 0.0  # if >0, order removed after this time (cancel latency)
+    _prev_available: float = 0.0    # available liquidity seen on last check (for delta-fill)
 
 
 # ---------------------------------------------------------------------------
@@ -84,13 +85,26 @@ class DryRunEngine:
     # ------------------------------------------------------------------
 
     def capture_initial_state(self) -> None:
-        """Snapshot the real account capital before trading starts."""
+        """Snapshot the real account capital and position before trading starts."""
         cap = self._state.account.available_capital
         self._initial_capital = cap if cap is not None else 0.0
+
+        # Inherit the live account position so skew/one-sided quoting is correct
+        # from the first loop iteration.  We use mid as a rough VWAP proxy since
+        # the real entry price is unknown.
+        pos = self._state.account.position_size
+        self._position = pos
+        if abs(pos) > 1e-12 and self._state.market.mid_price is not None:
+            self._entry_vwap = self._state.market.mid_price
+        else:
+            self._entry_vwap = 0.0
+
         self.initialized = True
         self._log.info(
-            "DRY-RUN: captured initial capital $%.2f | leverage %dx | sim_latency=%dms",
-            self._initial_capital, self._leverage, int(self._sim_latency * 1000),
+            "DRY-RUN: captured initial capital $%.2f | position %.6f | "
+            "leverage %dx | sim_latency=%dms",
+            self._initial_capital, self._position,
+            self._leverage, int(self._sim_latency * 1000),
         )
 
     # ------------------------------------------------------------------
@@ -186,6 +200,11 @@ class DryRunEngine:
 
         now = time.monotonic()
 
+        # Track total available liquidity consumed by earlier orders in this
+        # tick so that multiple simulated orders don't over-consume the same book.
+        buy_consumed = 0.0
+        sell_consumed = 0.0
+
         # Snapshot order list to allow mutation during iteration
         for sim in list(self._live_orders.values()):
             # Process matured pending cancels: order was fillable during the
@@ -200,41 +219,65 @@ class DryRunEngine:
                 continue
 
             if sim.side == "buy":
-                fill = self._check_buy_fill(sim, asks)
+                fill, buy_consumed = self._check_buy_fill(sim, asks, buy_consumed)
             else:
-                fill = self._check_sell_fill(sim, bids)
+                fill, sell_consumed = self._check_sell_fill(sim, bids, sell_consumed)
 
             if fill > 0:
                 self._process_fill(sim, fill, sim.price)
 
-    def _check_buy_fill(self, sim: SimulatedOrder, asks) -> float:
-        """Return fillable size for a buy limit order."""
+    def _check_buy_fill(self, sim: SimulatedOrder, asks, consumed: float) -> tuple[float, float]:
+        """Return (fillable_size, updated_consumed) for a buy limit order.
+
+        Uses delta-fill: only new liquidity appearing at/below our price since
+        the last check is eligible. ``consumed`` tracks liquidity already
+        claimed by earlier simulated orders in the same tick.
+        """
         if not asks:
-            return 0.0
+            sim._prev_available = 0.0
+            return 0.0, consumed
         best_ask = asks.peekitem(0)[0]
         if best_ask > sim.price:
-            return 0.0
+            sim._prev_available = 0.0
+            return 0.0, consumed
         available = 0.0
         for ask_price, ask_size in asks.items():
             if ask_price > sim.price:
                 break
             available += ask_size
-        return min(sim.size, available)
+        # Delta: only the increase since last check is new fillable liquidity
+        new_liq = max(0.0, available - sim._prev_available) - consumed
+        sim._prev_available = available
+        if new_liq <= 0:
+            return 0.0, consumed
+        fill = min(sim.size, new_liq)
+        return fill, consumed + fill
 
-    def _check_sell_fill(self, sim: SimulatedOrder, bids) -> float:
-        """Return fillable size for a sell limit order."""
+    def _check_sell_fill(self, sim: SimulatedOrder, bids, consumed: float) -> tuple[float, float]:
+        """Return (fillable_size, updated_consumed) for a sell limit order.
+
+        Uses delta-fill: only new liquidity appearing at/above our price since
+        the last check is eligible. ``consumed`` tracks liquidity already
+        claimed by earlier simulated orders in the same tick.
+        """
         if not bids:
-            return 0.0
+            sim._prev_available = 0.0
+            return 0.0, consumed
         best_bid = bids.peekitem(-1)[0]
         if best_bid < sim.price:
-            return 0.0
+            sim._prev_available = 0.0
+            return 0.0, consumed
         available = 0.0
-        # Iterate descending from best bid
         for bid_price in reversed(bids):
             if bid_price < sim.price:
                 break
             available += bids[bid_price]
-        return min(sim.size, available)
+        new_liq = max(0.0, available - sim._prev_available) - consumed
+        sim._prev_available = available
+        if new_liq <= 0:
+            return 0.0, consumed
+        fill = min(sim.size, new_liq)
+        return fill, consumed + fill
 
     # ------------------------------------------------------------------
     # Fill processing & PnL
@@ -253,19 +296,31 @@ class DryRunEngine:
             self._position -= fill_size
 
         # PnL: average-cost basis
+        pnl_before = self._realized_pnl
+        self._entry_price_before = self._entry_vwap  # snapshot for margin calc
         self._update_pnl(sim.side, fill_size, fill_price, old_pos)
+        realized_delta = self._realized_pnl - pnl_before
 
         # Bookkeeping
         self._fill_count += 1
         self._total_volume += fill_size * fill_price
 
-        # Margin impact on available capital
-        margin_delta = fill_size * fill_price / self._leverage
-        # If reducing position, release margin; if increasing, consume it
-        if self._is_reducing(sim.side, old_pos):
-            self._state.account.available_capital += margin_delta
+        # Capital impact: margin adjustment + realized PnL
+        reducing = self._is_reducing(sim.side, old_pos)
+        if reducing:
+            # Release margin at the *entry* price (what was originally locked)
+            # and credit the realized PnL separately.
+            margin_release = fill_size * self._entry_price_before / self._leverage
+            self._state.account.available_capital += margin_release + realized_delta
         else:
-            self._state.account.available_capital -= margin_delta
+            # Consume margin for new/increased position
+            margin_consumed = fill_size * fill_price / self._leverage
+            self._state.account.available_capital -= margin_consumed
+
+        # Keep portfolio_value in sync: initial_capital + realized + unrealized
+        self._state.account.portfolio_value = (
+            self._initial_capital + self._realized_pnl + self.unrealized_pnl
+        )
 
         # Sync position into state for decision logic
         self._state.account.position_size = self._position

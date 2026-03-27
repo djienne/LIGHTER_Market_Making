@@ -387,6 +387,136 @@ class TestInitialization(unittest.TestCase):
             # Should not crash; interval not elapsed so just returns
 
 
+class TestBugFixes(unittest.TestCase):
+    """Regression tests for the four reviewer-identified bugs."""
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_no_double_fill_from_static_book(self):
+        """Bug 1: repeated check_fills on a static book must not re-fill."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+
+            bids, asks = _book({99.0: 1.0}, {100.0: 0.3})
+            # First call: fills 0.3 (all available)
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.3)
+
+            # Second call: same static book — no new liquidity, no new fill
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.3)
+
+            # Third call: still no change
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.3)
+            self.assertEqual(engine._fill_count, 1)
+
+    def test_multiple_orders_share_liquidity(self):
+        """Bug 1b: two buy orders must not both fill from the same liquidity."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+            # Two buy orders at the same price
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 2, 0),
+            ]))
+
+            # Only 0.6 available — should not fill both fully (1.0 total)
+            bids, asks = _book({99.0: 1.0}, {100.0: 0.6})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, 0.6, places=5)
+
+    def test_realized_pnl_feeds_capital(self):
+        """Bug 2: realized PnL must flow into available_capital."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_ask_order_id=None,
+            current_bid_price=None, current_ask_price=None,
+            current_bid_size=None, current_ask_size=None,
+            _PRICE_TICK_FLOAT=0.1, available_capital=1000.0,
+            current_position_size=0.0, current_mid_price_cached=110.0,
+        ):
+            engine = _make_engine(leverage=2)
+
+            # Buy 1 @ 100 -> margin consumed = 1*100/2 = 50
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 2.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(mm.state.account.available_capital, 950.0)
+
+            # Sell 1 @ 110 -> release margin 50 + PnL 10 = capital back to 1010
+            self._run(engine.process_batch([
+                mm.BatchOp("sell", 0, "create", 110.0, 1.0, 2, 0),
+            ]))
+            bids, asks = _book({110.0: 2.0}, {111.0: 1.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._realized_pnl, 10.0)
+            self.assertAlmostEqual(mm.state.account.available_capital, 1010.0)
+
+    def test_portfolio_value_tracks_pnl(self):
+        """Bug 2b: portfolio_value must reflect realized + unrealized PnL."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=105.0,
+        ):
+            engine = _make_engine(leverage=2)
+            engine._initial_capital = 1000.0
+
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 1.0, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 2.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # mid=105, unrealized = 1*(105-100)=5, realized=0
+            # portfolio = 1000 + 0 + 5 = 1005
+            self.assertAlmostEqual(mm.state.account.portfolio_value, 1005.0)
+
+    def test_initial_position_inherited(self):
+        """Bug 3: engine must inherit the real account position on init."""
+        with temp_mm_attrs(
+            available_capital=500.0, current_position_size=2.5,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+            engine.capture_initial_state()
+            self.assertAlmostEqual(engine._position, 2.5)
+            self.assertAlmostEqual(engine._entry_vwap, 100.0)
+            # state should still reflect the position
+            self.assertAlmostEqual(mm.state.account.position_size, 2.5)
+
+    def test_initial_flat_position(self):
+        """Bug 3b: flat account should start with vwap=0."""
+        with temp_mm_attrs(
+            available_capital=500.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+        ):
+            engine = _make_engine()
+            engine.capture_initial_state()
+            self.assertAlmostEqual(engine._position, 0.0)
+            self.assertAlmostEqual(engine._entry_vwap, 0.0)
+
+
 class TestSimulatedLatency(unittest.TestCase):
     """Test the sim_latency_s feature."""
 
