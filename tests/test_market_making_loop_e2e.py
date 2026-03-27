@@ -50,18 +50,19 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
         client = DummyClient()
         calc = _VolObiStub(warmed=True, spread_bps=10.0)
         iteration = 0
+        _real_sleep = asyncio.sleep  # save before patching
 
         original_risk = mm.RiskState(**vars(mm.state.risk))
 
         async def _fake_wait_for(coro, *, timeout=None):
-            # Simulate order_book_received firing immediately
-            await asyncio.sleep(0)
-
-        async def _controlled_sleep(seconds):
             nonlocal iteration
+            await _real_sleep(0)  # yield so background send tasks can run
             iteration += 1
-            if iteration >= 2:
+            if iteration > 2:
                 raise KeyboardInterrupt
+
+        async def _noop_sleep(seconds):
+            pass  # bg tasks won't sleep with _RL_MIN_SEND_INTERVAL=0
 
         try:
             mm.state.risk = mm.RiskState()
@@ -88,11 +89,17 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 WARMUP_SECONDS=0,
                 _last_send_time=0.0,
                 _global_backoff_until=0.0,
+                _RL_MIN_SEND_INTERVAL=0.0,
+                _send_task=None,
             ):
                 with patch.object(mm.asyncio, "wait_for", side_effect=_fake_wait_for):
-                    with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                    with patch.object(mm.asyncio, "sleep", side_effect=_noop_sleep):
                         with self.assertRaises(KeyboardInterrupt):
                             await mm.market_making_loop(client)
+                    # Let pending background send complete (sleep mock removed)
+                    if mm._send_task is not None and not mm._send_task.done():
+                        await mm._send_task
+                    mm._send_task = None
 
             # Calculator should have been called at least once
             self.assertGreater(len(calc.quote_calls), 0)
@@ -280,18 +287,10 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
         client = DummyClient(modify_err=None)
         calc = _VolObiStub(warmed=True, spread_bps=10.0)
         cycle = 0
+        _real_sleep = asyncio.sleep  # save before patching
 
         original_risk = mm.RiskState(**vars(mm.state.risk))
         original_orders = mm.OrderState(**vars(mm.state.orders))
-
-        async def _fake_wait_for(coro, *, timeout=None):
-            await asyncio.sleep(0)
-
-        async def _controlled_sleep(seconds):
-            nonlocal cycle
-            cycle += 1
-            if cycle >= 8:
-                raise KeyboardInterrupt
 
         try:
             mm.state.risk = mm.RiskState()
@@ -318,16 +317,20 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                 WARMUP_SECONDS=0,
                 _last_send_time=0.0,
                 _global_backoff_until=0.0,
+                _RL_MIN_SEND_INTERVAL=0.0,
+                _send_task=None,
             ):
                 # Change mid_price between cycles to force modify
                 orig_mid = mm.state.market.mid_price
                 call_count = [0]
 
-                real_wait_for = asyncio.wait_for
-
                 async def _cycle_wait_for(coro, *, timeout=None):
-                    nonlocal call_count
+                    nonlocal call_count, cycle
+                    await _real_sleep(0)  # yield so background send tasks can run
                     call_count[0] += 1
+                    cycle += 1
+                    if cycle >= 8:
+                        raise KeyboardInterrupt
                     # Shift mid_price each cycle so price changes exceed threshold
                     mm.state.market.mid_price = 50000.0 + call_count[0] * 100
                     bid_id = mm.state.orders.bid_order_ids[0]
@@ -336,12 +339,18 @@ class TestMarketMakingLoopE2E(unittest.IsolatedAsyncioTestCase):
                         mm._client_to_exchange_id[bid_id] = 1000
                     if ask_id is not None and ask_id not in mm._client_to_exchange_id:
                         mm._client_to_exchange_id[ask_id] = 2000
-                    await asyncio.sleep(0)
+
+                async def _noop_sleep(seconds):
+                    pass  # bg tasks won't sleep with _RL_MIN_SEND_INTERVAL=0
 
                 with patch.object(mm.asyncio, "wait_for", side_effect=_cycle_wait_for):
-                    with patch.object(mm.asyncio, "sleep", side_effect=_controlled_sleep):
+                    with patch.object(mm.asyncio, "sleep", side_effect=_noop_sleep):
                         with self.assertRaises(KeyboardInterrupt):
                             await mm.market_making_loop(client)
+                    # Let pending background send complete (sleep mock removed)
+                    if mm._send_task is not None and not mm._send_task.done():
+                        await mm._send_task
+                    mm._send_task = None
 
             # First cycle: sign_create_order (batch) for bid+ask
             # Second+ cycles: sign_modify_order (since orders now exist)

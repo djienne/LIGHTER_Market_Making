@@ -102,7 +102,7 @@ class TradeLogger:
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerows(rows)
-        with open(self._path, "a") as f:
+        with open(self._path, "a", newline="") as f:
             f.write(buf.getvalue())
 
     def clear(self) -> None:

@@ -39,6 +39,7 @@ _STATE_MAP = {
     '_quota_warning_level':        lambda: (mm, '_quota_warning_level'),
     '_quota_recovery_in_progress': lambda: (mm, '_quota_recovery_in_progress'),
     '_quota_recovery_last_attempt':lambda: (mm, '_quota_recovery_last_attempt'),
+    '_send_task':                  lambda: (mm, '_send_task'),
 }
 
 

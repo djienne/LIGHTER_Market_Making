@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,7 +36,7 @@ class SimulatedOrder:
     synthetic_exchange_id: int
     eligible_at: float = 0.0        # not fillable until this monotonic time (create/modify latency)
     pending_cancel_at: float = 0.0  # if >0, order removed after this time (cancel latency)
-    _prev_available: float = 0.0    # available liquidity seen on last check (for delta-fill)
+    _prev_by_price: dict = field(default_factory=dict)  # per-price liquidity seen on last check (for delta-fill)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,9 @@ class DryRunEngine:
         # Periodic summary
         self._last_summary: float = 0.0
 
+        # Serialize save_state across main thread and run_in_executor workers
+        self._save_lock = threading.Lock()
+
         # Set after initial capital captured – gates WS overwrites
         self.initialized: bool = False
 
@@ -126,29 +130,36 @@ class DryRunEngine:
     # ------------------------------------------------------------------
 
     def save_state(self) -> None:
-        """Atomically write engine state to JSON (tmp + rename)."""
+        """Atomically write engine state to JSON (tmp + rename).
+
+        Thread-safe: the lock serializes concurrent calls from the main
+        thread (shutdown) and run_in_executor workers (periodic flush).
+        State is captured inside the lock so the last writer always
+        persists the most recent values.
+        """
         if self._state_path is None:
             return
-        data = {
-            "available_capital": self._state.account.available_capital,
-            "portfolio_value": self._state.account.portfolio_value,
-            "position": self._position,
-            "entry_vwap": self._entry_vwap,
-            "realized_pnl": self._realized_pnl,
-            "fill_count": self._fill_count,
-            "total_volume": self._total_volume,
-            "initial_capital": self._initial_capital,
-            "initial_portfolio_value": self._initial_portfolio_value,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            dir_name = os.path.dirname(self._state_path) or "."
-            fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, self._state_path)
-        except OSError as exc:
-            self._log.warning("DRY-RUN: failed to save state: %s", exc)
+        with self._save_lock:
+            data = {
+                "available_capital": self._state.account.available_capital,
+                "portfolio_value": self._state.account.portfolio_value,
+                "position": self._position,
+                "entry_vwap": self._entry_vwap,
+                "realized_pnl": self._realized_pnl,
+                "fill_count": self._fill_count,
+                "total_volume": self._total_volume,
+                "initial_capital": self._initial_capital,
+                "initial_portfolio_value": self._initial_portfolio_value,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                dir_name = os.path.dirname(self._state_path) or "."
+                fd, tmp = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, self._state_path)
+            except OSError as exc:
+                self._log.warning("DRY-RUN: failed to save state: %s", exc)
 
     @classmethod
     def load_state(
@@ -260,7 +271,7 @@ class DryRunEngine:
         sim.price = op.price
         sim.size = op.size
         sim.eligible_at = time.monotonic() + self._sim_latency
-        sim._prev_available = 0.0  # repriced order is fresh for fill accounting
+        sim._prev_by_price = {}  # repriced order is fresh for fill accounting
         self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
 
         self._log.info(
@@ -325,25 +336,32 @@ class DryRunEngine:
     def _check_buy_fill(self, sim: SimulatedOrder, asks, consumed: float) -> tuple[float, float]:
         """Return (fillable_size, updated_consumed) for a buy limit order.
 
-        Uses delta-fill: only new liquidity appearing at/below our price since
-        the last check is eligible. ``consumed`` tracks liquidity already
-        claimed by earlier simulated orders in the same tick.
+        Uses per-price delta-fill: only new or increased liquidity at each
+        qualifying price since the last check is eligible.  This correctly
+        detects replenished liquidity when it appears at a different price
+        even if the aggregate depth stays flat.  ``consumed`` tracks
+        liquidity already claimed by earlier simulated orders in the same tick.
         """
         if not asks:
-            sim._prev_available = 0.0
+            sim._prev_by_price = {}
             return 0.0, consumed
         best_ask = asks.peekitem(0)[0]
         if best_ask > sim.price:
-            sim._prev_available = 0.0
+            sim._prev_by_price = {}
             return 0.0, consumed
-        available = 0.0
+        current: dict[float, float] = {}
         for ask_price, ask_size in asks.items():
             if ask_price > sim.price:
                 break
-            available += ask_size
-        # Delta: only the increase since last check is new fillable liquidity
-        new_liq = max(0.0, available - sim._prev_available) - consumed
-        sim._prev_available = available
+            current[ask_price] = ask_size
+        prev = sim._prev_by_price
+        new_liq = 0.0
+        for price, size in current.items():
+            delta = size - prev.get(price, 0.0)
+            if delta > 0:
+                new_liq += delta
+        new_liq -= consumed
+        sim._prev_by_price = current
         if new_liq <= 0:
             return 0.0, consumed
         fill = min(sim.size, new_liq)
@@ -352,24 +370,32 @@ class DryRunEngine:
     def _check_sell_fill(self, sim: SimulatedOrder, bids, consumed: float) -> tuple[float, float]:
         """Return (fillable_size, updated_consumed) for a sell limit order.
 
-        Uses delta-fill: only new liquidity appearing at/above our price since
-        the last check is eligible. ``consumed`` tracks liquidity already
-        claimed by earlier simulated orders in the same tick.
+        Uses per-price delta-fill: only new or increased liquidity at each
+        qualifying price since the last check is eligible.  This correctly
+        detects replenished liquidity when it appears at a different price
+        even if the aggregate depth stays flat.  ``consumed`` tracks
+        liquidity already claimed by earlier simulated orders in the same tick.
         """
         if not bids:
-            sim._prev_available = 0.0
+            sim._prev_by_price = {}
             return 0.0, consumed
         best_bid = bids.peekitem(-1)[0]
         if best_bid < sim.price:
-            sim._prev_available = 0.0
+            sim._prev_by_price = {}
             return 0.0, consumed
-        available = 0.0
+        current: dict[float, float] = {}
         for bid_price in reversed(bids):
             if bid_price < sim.price:
                 break
-            available += bids[bid_price]
-        new_liq = max(0.0, available - sim._prev_available) - consumed
-        sim._prev_available = available
+            current[bid_price] = bids[bid_price]
+        prev = sim._prev_by_price
+        new_liq = 0.0
+        for price, size in current.items():
+            delta = size - prev.get(price, 0.0)
+            if delta > 0:
+                new_liq += delta
+        new_liq -= consumed
+        sim._prev_by_price = current
         if new_liq <= 0:
             return 0.0, consumed
         fill = min(sim.size, new_liq)
