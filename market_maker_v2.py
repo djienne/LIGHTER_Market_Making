@@ -1607,27 +1607,16 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
             logger.info("account_orders WS ready (snapshot) — %d live orders for market %d",
                         len(active_client_ids), market_id)
 
-            # Authoritative: clear any local orders not in the snapshot,
-            # but protect orders in PLACING state (may be in-flight)
-            orders = state.orders
-            for lvl in range(NUM_LEVELS):
-                bid_id = orders.bid_order_ids[lvl]
-                if bid_id is not None and bid_id not in active_client_ids:
-                    if order_manager.lifecycle("buy", lvl).status == SideStatus.PLACING:
-                        logger.info("Bid[%d] %d not in snapshot but PLACING — keeping", lvl, bid_id)
-                    else:
-                        logger.info("Bid[%d] %d not in WS snapshot — clearing", lvl, bid_id)
-                        order_manager.clear_live("buy", lvl)
-                ask_id = orders.ask_order_ids[lvl]
-                if ask_id is not None and ask_id not in active_client_ids:
-                    if order_manager.lifecycle("sell", lvl).status == SideStatus.PLACING:
-                        logger.info("Ask[%d] %d not in snapshot but PLACING — keeping", lvl, ask_id)
-                    else:
-                        logger.info("Ask[%d] %d not in WS snapshot — clearing", lvl, ask_id)
-                        order_manager.clear_live("sell", lvl)
-
-            _refresh_local_orders_from_remote_orders(live_orders)
-            risk_controller.mark_reconcile(ok=True, reason="account_orders_ws_snapshot")
+            # Reuse the reconciler: clears stale local orders, refreshes
+            # tracked ones, AND detects/surfaces orphaned exchange orders.
+            ok, unknown_ids = _reconcile_local_orders_with_remote_orders(
+                live_orders, source="account_orders_ws_snapshot"
+            )
+            if unknown_ids:
+                logger.warning(
+                    "WS snapshot: %d orphaned orders detected: %s — will be cancelled by reconciler",
+                    len(unknown_ids), sorted(unknown_ids),
+                )
             return
 
         # --- INCREMENTAL UPDATE ---
@@ -1790,17 +1779,18 @@ def calculate_dynamic_base_amount(mid_price, capital=None):
 
     effective_capital = capital if capital is not None else state.account.available_capital
     if effective_capital is None:
-        return BASE_AMOUNT
+        logger.warning("Capital data unavailable; suppressing quoting (returning None)")
+        return None
 
-    # Fall back to static size if capital data is stale
+    # Suppress quoting if capital data is stale
     if state.account.last_capital_update > 0:
         age = time.monotonic() - state.account.last_capital_update
         if age > _CAPITAL_STALE_SECONDS:
             logger.warning(
-                "Capital data is %.0fs stale (threshold: %.0fs); using fallback BASE_AMOUNT=%.6f",
-                age, _CAPITAL_STALE_SECONDS, BASE_AMOUNT,
+                "Capital data is %.0fs stale (threshold: %.0fs); suppressing quoting",
+                age, _CAPITAL_STALE_SECONDS,
             )
-            return BASE_AMOUNT
+            return None
 
     try:
         # Cache key: capital rounded to nearest dollar, mid to 4 decimals
@@ -1837,8 +1827,8 @@ def calculate_dynamic_base_amount(mid_price, capital=None):
         state.account._cached_base_amount_inputs = cache_key
         return size
     except Exception as exc:
-        logger.warning("calculate_dynamic_base_amount failed (%s); using fallback BASE_AMOUNT=%.6f", exc, BASE_AMOUNT)
-        return BASE_AMOUNT
+        logger.warning("calculate_dynamic_base_amount failed (%s); suppressing quoting", exc)
+        return None
 
 # ---------------------------------------------------------------------------
 # Adaptive rate-limiter helpers
@@ -2621,6 +2611,11 @@ async def _send_single_op_rest(client, tx_type: int, tx_info, op) -> bool:
             _trigger_global_backoff()
             client.nonce_manager.acknowledge_failure(API_KEY_INDEX)
             client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+        else:
+            # Ordinary rejection (e.g. "order not found") — track for circuit breaker
+            client.nonce_manager.acknowledge_failure(API_KEY_INDEX)
+            client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
+            _record_order_rejection(f"rest_single:{e}")
         return False
 
 
@@ -2891,6 +2886,9 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
             # Hard position limit: suppress side that would increase exposure
             if max_pos_usd is None:
                 max_pos_usd = _dynamic_max_position_dollar(mid_price, capital, base_amount)
+            if max_pos_usd <= 0:
+                # Can't compute position limit (missing capital?) — suppress all quoting
+                return none_levels
             if max_pos_usd > 0:
                 pos_value_usd = abs(position_size) * mid_price
                 if pos_value_usd >= max_pos_usd:
