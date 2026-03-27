@@ -277,6 +277,7 @@ ws_reconnect_event = asyncio.Event()
 ws_client = None
 ws_task = None
 stale_order_task = None
+_send_task: Optional[asyncio.Task] = None  # background paced-send task
 
 # Serialize all SDK write operations (create/modify/cancel) to avoid nonce collisions.
 # The Lighter SDK's nonce counter is not safe for concurrent async calls.
@@ -2933,8 +2934,22 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
 _MAX_CONSECUTIVE_LOOP_ERRORS = 10
 
 
+async def _paced_send(client, ops: list) -> None:
+    """Background task: pace then send a batch.  Exceptions logged, not raised."""
+    try:
+        cancel_only = all(o.action == "cancel" for o in ops)
+        if await _wait_for_write_slot(op_count=len(ops), cancel_only=cancel_only):
+            await sign_and_send_batch(client, ops)
+        else:
+            logger.debug("Paced send: write slot denied, %d ops deferred to next tick", len(ops))
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error("Paced send failed: %s", exc, exc_info=True)
+
+
 async def market_making_loop(client):
-    global _pause_cleanup_running
+    global _pause_cleanup_running, _send_task
     logger.info("Starting 2-sided market making loop...")
     _log_info = logger.isEnabledFor(logging.INFO)
     _log_debug = logger.isEnabledFor(logging.DEBUG)
@@ -3070,21 +3085,21 @@ async def market_making_loop(client):
                     await asyncio.sleep(MIN_LOOP_INTERVAL)
                     continue
 
-            # Batch all order operations into a single send_tx_batch call
-            ops = collect_order_operations(level_prices, base_amount, _log_debug)
-            if ops:
-                if _dry_run_engine is not None:
-                    await _dry_run_engine.process_batch(ops)
-                elif time.monotonic() < _global_backoff_until:
-                    remaining = _global_backoff_until - time.monotonic()
-                    if remaining > 0:
-                        await asyncio.sleep(min(remaining, 1.0))
-                    continue  # skip order ops during backoff
-                elif await _wait_for_write_slot(
-                    op_count=len(ops),
-                    cancel_only=all(o.action == "cancel" for o in ops),
-                ):
-                    await sign_and_send_batch(client, ops)
+            # Harvest completed background send task
+            if _send_task is not None and _send_task.done():
+                _send_task = None
+
+            # Batch order operations — skip if previous send still in flight
+            if _send_task is not None:
+                if _log_debug:
+                    logger.debug("Skipping ops: previous send still in flight")
+            else:
+                ops = collect_order_operations(level_prices, base_amount, _log_debug)
+                if ops:
+                    if _dry_run_engine is not None:
+                        await _dry_run_engine.process_batch(ops)
+                    else:
+                        _send_task = asyncio.create_task(_paced_send(client, ops))
 
             if _dry_run_engine is not None:
                 _dry_run_engine.maybe_log_summary()  # also flushes trade log + state
