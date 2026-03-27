@@ -11,9 +11,10 @@ class TestCalculateDynamicBaseAmount(unittest.TestCase):
             # 1000 * 0.12 * 2 (leverage) / 200 = 1.2
             self.assertAlmostEqual(float(result), 1.2, places=8)
 
-            mm.available_capital = None
+        # With no capital anywhere, quoting is suppressed (returns None)
+        with temp_mm_attrs(available_capital=None, _AMOUNT_TICK_FLOAT=0.01):
             fallback = mm.calculate_dynamic_base_amount(200.0)
-            self.assertEqual(fallback, mm.BASE_AMOUNT)
+            self.assertIsNone(fallback)
 
     def test_zero_price_returns_none(self):
         with temp_mm_attrs(available_capital=1000.0, _AMOUNT_TICK_FLOAT=0.01):

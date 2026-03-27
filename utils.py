@@ -80,14 +80,15 @@ async def get_market_details_async(symbol: str) -> Tuple[Optional[int], float, O
         return None, price_tick_size, None
 
 def load_config_params():
-    """Load parameters from config.json."""
+    """Load parameters from config.json (resolved relative to this file's directory)."""
+    config_path = Path(__file__).resolve().parent / 'config.json'
     try:
-        with open('config.json', 'r') as f:
+        with open(config_path, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as e:
-        raise SystemExit(f"FATAL: config.json has invalid JSON: {e}") from e
+        raise SystemExit(f"FATAL: {config_path} has invalid JSON: {e}") from e
 
 def get_market_details(symbol: str) -> Tuple[Optional[int], float, Optional[float]]:
     return asyncio.run(get_market_details_async(symbol))

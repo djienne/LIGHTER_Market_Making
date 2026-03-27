@@ -1782,15 +1782,16 @@ def calculate_dynamic_base_amount(mid_price, capital=None):
         logger.warning("Capital data unavailable; suppressing quoting (returning None)")
         return None
 
-    # Suppress quoting if capital data is stale
+    # Warn if capital data is old, but don't suppress — the last known value
+    # is still valid (user_stats WS only fires on balance changes, so no
+    # update for an hour just means no balance change occurred).
     if state.account.last_capital_update > 0:
         age = time.monotonic() - state.account.last_capital_update
         if age > _CAPITAL_STALE_SECONDS:
-            logger.warning(
-                "Capital data is %.0fs stale (threshold: %.0fs); suppressing quoting",
+            logger.info(
+                "Capital data is %.0fs old (threshold: %.0fs); using last known value",
                 age, _CAPITAL_STALE_SECONDS,
             )
-            return None
 
     try:
         # Cache key: capital rounded to nearest dollar, mid to 4 decimals
