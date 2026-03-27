@@ -1097,6 +1097,80 @@ class TestArrivalTimeReject(unittest.TestCase):
             self.assertAlmostEqual(engine._live_orders[1].price, 97.0)
 
 
+class TestStateOrdersSync(unittest.TestCase):
+    """state.orders must match _live_orders after modify reject/promote."""
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_rejected_modify_keeps_old_price_in_state_orders(self):
+        """Rejected modify-at-arrival must leave state.orders at old price."""
+        ob = {'bids': SortedDict({98.0: 1.0}), 'asks': SortedDict({102.0: 2.0})}
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+            local_order_book=ob,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
+
+            # Modify to $101 (accepted at submit, best_ask=$102)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "modify", 101.0, 0.5, 1,
+                           mm._client_to_exchange_id[1]),
+            ]))
+            # state.orders should still show old price during latency
+            self.assertAlmostEqual(mm.state.orders.bid_prices[0], 100.0)
+
+            # Expire latency, book crossed at $101 → rejected at arrival
+            engine._live_orders[1].eligible_at = 0
+            bids, asks = _book({98.0: 1.0}, {101.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # state.orders must be resynced to old price
+            self.assertAlmostEqual(mm.state.orders.bid_prices[0], 100.0)
+            self.assertAlmostEqual(engine._live_orders[1].price, 100.0)
+
+    def test_promoted_modify_syncs_new_price_to_state_orders(self):
+        """Successful modify promotion must update state.orders."""
+        ob = {'bids': SortedDict({98.0: 1.0}), 'asks': SortedDict({102.0: 2.0})}
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=100.0,
+            local_order_book=ob,
+        ):
+            engine = _make_engine(sim_latency_s=10.0)
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            engine._live_orders[1].eligible_at = 0
+            engine._live_orders[1]._arrival_checked = True
+
+            # Modify to $101
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "modify", 101.0, 0.5, 1,
+                           mm._client_to_exchange_id[1]),
+            ]))
+
+            # Expire latency, book not crossed → promote
+            engine._live_orders[1].eligible_at = 0
+            bids, asks = _book({98.0: 1.0}, {102.0: 2.0})
+            engine.check_fills(bids, asks)
+
+            # Both _live_orders and state.orders at $101
+            self.assertAlmostEqual(engine._live_orders[1].price, 101.0)
+            self.assertAlmostEqual(mm.state.orders.bid_prices[0], 101.0)
+
+
 class TestModifyLatency(unittest.TestCase):
     """Old price stays fillable during modify latency."""
 

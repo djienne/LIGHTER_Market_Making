@@ -377,18 +377,20 @@ class DryRunEngine:
             sim._pending_price = None
             sim._pending_size = None
             sim._pending_prev_by_price = None
+            # Sync state.orders to new price immediately
+            self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
         else:
             # Latency > 0: old price stays fillable while modify is in-flight.
             # Store new price as pending; promoted in check_fills when eligible.
             # NOTE: don't reset _arrival_checked — the old price was already
             # validated. The new price gets its own arrival check in check_fills
             # when the pending modify is promoted.
+            # NOTE: don't call bind_live here — state.orders must keep the old
+            # price until the modify actually lands (or is rejected).
             sim._pending_price = op.price
             sim._pending_size = op.size
             sim._pending_prev_by_price = new_snapshot
             sim.eligible_at = now + self._sim_latency
-
-        self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
 
         self._log.info(
             "DRY-RUN MODIFY %s L%d: %.6f @ $%.2f -> $%.2f  (cid=%d)",
@@ -458,6 +460,10 @@ class DryRunEngine:
                     sim._pending_price = None
                     sim._pending_size = None
                     sim._pending_prev_by_price = None
+                    # Resync state.orders to the old price/size (may have
+                    # been partially filled during latency)
+                    self._om.bind_live(sim.side, sim.client_order_id,
+                                       sim.price, sim.size, level=sim.level)
                 else:
                     # Promote: switch to new price
                     sim.price = sim._pending_price
@@ -467,6 +473,9 @@ class DryRunEngine:
                     sim._pending_price = None
                     sim._pending_size = None
                     sim._pending_prev_by_price = None
+                    # Sync state.orders to the promoted price
+                    self._om.bind_live(sim.side, sim.client_order_id,
+                                       sim.price, sim.size, level=sim.level)
 
             # --- Skip orders in-flight for CREATE (not pending-modify) ---
             if now < sim.eligible_at and sim._pending_price is None:
