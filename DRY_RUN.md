@@ -9,12 +9,32 @@ Dry-run is the **default mode**. Use `--live` to trade with real money.
 ## Usage
 
 ```bash
-# Paper trading (default)
+# Paper trading (default, starts with $1000 virtual wallet)
 python -u market_maker_v2.py --symbol BTC
+
+# Resume previous session (wallet state loaded automatically)
+python -u market_maker_v2.py --symbol BTC
+
+# Reset wallet to $5000 (clears state + trade log)
+python -u market_maker_v2.py --symbol BTC --capital 5000
 
 # Real trading
 python -u market_maker_v2.py --symbol BTC --live
 ```
+
+## Persistence
+
+### Virtual Wallet
+
+The dry-run wallet is **persistent across restarts**. State is saved to `logs/dry_run_state.json` every 60 seconds and on shutdown. On the next startup (without `--capital`), the saved state is automatically restored — capital, position, PnL, and fill count all carry over.
+
+Use `--capital N` to **reset** the wallet to `$N` and start fresh. This also clears the trade log.
+
+### Trade Log
+
+All fills are recorded to `logs/trades_{SYMBOL}.csv` in both dry-run and live modes. The CSV contains: timestamp, symbol, side, price, size, level, position, realized PnL, capital, portfolio value, and a `simulated` flag.
+
+`log_fill()` is a zero-I/O buffer append. Disk writes happen only on periodic flush (every 60s in dry-run via the summary logger, every 5min in live mode via the balance tracker, and on shutdown).
 
 ## How It Works
 
