@@ -235,6 +235,26 @@ cdef class CBookSide:
             return [(self._prices[i], self._sizes[i]) for i in range(hi - 1, lo - 1, -1)]
         return [(self._prices[i], self._sizes[i]) for i in range(lo, hi)]
 
+    # -- Fast range-sum methods (pure C loop, no Python objects) --
+
+    cpdef double sum_sizes_from(self, double min_price):
+        """Sum sizes for all levels with price >= min_price.  O(log n + k)."""
+        cdef int i, start_idx
+        cdef double total = 0.0
+        start_idx = self._bisect_left(min_price)
+        for i in range(start_idx, self._count):
+            total += self._sizes[i]
+        return total
+
+    cpdef double sum_sizes_to(self, double max_price):
+        """Sum sizes for all levels with price <= max_price.  O(log n + k)."""
+        cdef int i, end_idx
+        cdef double total = 0.0
+        end_idx = self._bisect_right(max_price)
+        for i in range(end_idx):
+            total += self._sizes[i]
+        return total
+
     # -- Bulk wire-update methods (avoids per-level Python overhead) --
 
     def apply_delta_from_wire(self, list levels):
@@ -587,24 +607,10 @@ cdef class VolObiCalculator:
         return self._compute_imbalance_py(mid_price, bids, asks)
 
     cdef double _compute_imbalance_c(self, double mid_price, CBookSide bids, CBookSide asks):
-        """Pure-C imbalance: binary search + array summation. No Python objects."""
+        """Pure-C imbalance via CBookSide range-sum methods."""
         cdef double lower = mid_price * (1.0 - self._looking_depth)
         cdef double upper = mid_price * (1.0 + self._looking_depth)
-        cdef double sum_bid = 0.0
-        cdef double sum_ask = 0.0
-        cdef int i, start_idx, end_idx
-
-        # Bids: sum all sizes with price >= lower
-        start_idx = bids._bisect_left(lower)
-        for i in range(start_idx, bids._count):
-            sum_bid += bids._sizes[i]
-
-        # Asks: sum all sizes with price <= upper
-        end_idx = asks._bisect_right(upper)
-        for i in range(end_idx):
-            sum_ask += asks._sizes[i]
-
-        return sum_bid - sum_ask
+        return bids.sum_sizes_from(lower) - asks.sum_sizes_to(upper)
 
     cdef double _compute_imbalance_py(self, double mid_price, object bids, object asks):
         """Fallback: iterate SortedDict items (Python objects)."""

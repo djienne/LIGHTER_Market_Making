@@ -167,3 +167,103 @@ async def ws_subscribe(
                 on_disconnect()
             await asyncio.sleep(backoff + backoff * 0.2 * (time.monotonic() % 1))
             backoff = min(backoff * 2, reconnect_max)
+
+
+async def ws_subscribe_fast(
+    channels,
+    label,
+    on_message,
+    *,
+    url="wss://mainnet.zklighter.elliot.ai/stream",
+    ping_interval=20,
+    recv_timeout=30.0,
+    reconnect_base=5,
+    reconnect_max=60,
+    on_connect=None,
+    on_disconnect=None,
+    logger=None,
+    reconnect_event=None,
+    channel_auths: dict | None = None,
+):
+    """Low-overhead WebSocket subscription loop for latency-sensitive feeds.
+
+    Drop-in replacement for ``ws_subscribe()`` that eliminates per-message
+    ``create_task``/``asyncio.wait``/``cancel`` overhead by using a tight
+    ``asyncio.wait_for(ws.recv(), timeout)`` loop instead.
+
+    Use for hot-path market data (orderbook, ticker).  Cold-path channels
+    (account, positions) can keep using ``ws_subscribe()``.
+    """
+    if logger is None:
+        logger = _logger
+
+    backoff = reconnect_base
+
+    while True:
+        try:
+            async with websockets.connect(
+                url,
+                ping_interval=ping_interval,
+                ping_timeout=ping_interval,
+            ) as ws:
+                logger.info(f"Connected to {url} for {label}")
+
+                for ch in channels:
+                    sub = {"type": "subscribe", "channel": ch}
+                    if channel_auths and ch in channel_auths:
+                        sub["auth"] = channel_auths[ch]
+                    await ws.send(_dumps(sub))
+                logger.info(f"Subscribed to {', '.join(channels)}")
+
+                if on_connect:
+                    await on_connect()
+
+                backoff = reconnect_base  # reset on successful connect
+
+                # Tight recv loop — no per-message task creation
+                while True:
+                    # Non-blocking reconnect-event check (replaces event_task racing)
+                    if reconnect_event is not None and reconnect_event.is_set():
+                        reconnect_event.clear()
+                        logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
+                        if on_disconnect:
+                            on_disconnect()
+                        break
+
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"{label} WebSocket watchdog triggered "
+                            f"(no data for {recv_timeout}s). Reconnecting..."
+                        )
+                        if on_disconnect:
+                            on_disconnect()
+                        break
+
+                    data = _loads(message)
+                    msg_type = data.get("type")
+
+                    if msg_type == "ping":
+                        await ws.send(_PONG_MSG)
+                    elif msg_type == "subscribed":
+                        logger.info(f"Subscribed to channel: {data.get('channel')}")
+                    else:
+                        on_message(data)
+
+        except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
+            logger.info(f"{label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")
+            if on_disconnect:
+                on_disconnect()
+            await asyncio.sleep(backoff + backoff * 0.2 * (time.monotonic() % 1))
+            backoff = min(backoff * 2, reconnect_max)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            logger.error(f"Unexpected error in {label} socket: {e}. Reconnecting in {backoff:.0f}s...")
+            if on_disconnect:
+                on_disconnect()
+            await asyncio.sleep(backoff + backoff * 0.2 * (time.monotonic() % 1))
+            backoff = min(backoff * 2, reconnect_max)

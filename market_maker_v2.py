@@ -25,23 +25,33 @@ try:
     from _vol_obi_fast import CBookSide as _BookSide
     _CYTHON_AVAILABLE = True
 except ImportError:
-    from sortedcontainers import SortedDict as _BookSide
     _CYTHON_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "Cython extension _vol_obi_fast not available — using pure-Python SortedDict. "
-        "Build with: python setup_cython.py build_ext --inplace"
-    )
+    _BookSide = None
 try:
     from _vol_obi_fast import price_change_bps_fast as _price_change_bps_c
     from _vol_obi_fast import dynamic_max_position_fast as _dynamic_max_position_c
 except ImportError:
     _price_change_bps_c = None
     _dynamic_max_position_c = None
+# Fail-fast if Cython not available (opt out with ALLOW_PYTHON_FALLBACK=1 for dev/test)
+ALLOW_PYTHON_FALLBACK = os.getenv("ALLOW_PYTHON_FALLBACK", "").lower() in ("1", "true", "yes")
+if not _CYTHON_AVAILABLE and not ALLOW_PYTHON_FALLBACK:
+    raise ImportError(
+        "Cython extension _vol_obi_fast not available. "
+        "Build with: python setup_cython.py build_ext --inplace\n"
+        "Set ALLOW_PYTHON_FALLBACK=1 for dev/test only."
+    )
+if not _CYTHON_AVAILABLE:
+    from sortedcontainers import SortedDict as _BookSide
+    logging.getLogger(__name__).warning(
+        "PYTHON FALLBACK active (ALLOW_PYTHON_FALLBACK=1) — not recommended for production. "
+        "Build Cython: python setup_cython.py build_ext --inplace"
+    )
 import websockets
 from utils import EPSILON, get_market_details_async, load_config_params
 from adjust_leverage import adjust_leverage
 from orderbook import apply_orderbook_update
-from ws_manager import ws_subscribe
+from ws_manager import ws_subscribe, ws_subscribe_fast
 from orderbook_sanity import check_orderbook_sanity
 from vol_obi import VolObiCalculator
 from binance_obi import (
@@ -82,7 +92,6 @@ MIN_ORDER_VALUE_USD = float(_trading.get("min_order_value_usd", 14.5))
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-REQUIRE_CYTHON = os.getenv("REQUIRE_CYTHON", "").lower() in ("1", "true", "yes")
 
 # Trading config
 BASE_AMOUNT = float(os.getenv(
@@ -175,11 +184,6 @@ def _validate_config() -> None:
         errors.append(f"ORDER_TIMEOUT={ORDER_TIMEOUT} must be > 0")
     if SPREAD_FACTOR_LEVEL1 < 1.0:
         errors.append(f"SPREAD_FACTOR_LEVEL1={SPREAD_FACTOR_LEVEL1} must be >= 1.0")
-    if REQUIRE_CYTHON and not _CYTHON_AVAILABLE:
-        errors.append(
-            "REQUIRE_CYTHON=1 but Cython extension not available. "
-            "Build with: python setup_cython.py build_ext --inplace"
-        )
     if errors:
         raise ValueError("Invalid configuration:\n  " + "\n  ".join(errors))
 
@@ -302,6 +306,7 @@ ws_client = None
 ws_task = None
 stale_order_task = None
 _send_task: Optional[asyncio.Task] = None  # background paced-send task
+_latest_ops: Optional[list] = None         # mailbox: latest computed ops (live-mode only)
 
 # Serialize all SDK write operations (create/modify/cancel) to avoid nonce collisions.
 # The Lighter SDK's nonce counter is not safe for concurrent async calls.
@@ -372,6 +377,7 @@ class OrderEvent:
 
 
 _order_event_queue: deque = deque()
+_pending_trades: deque = deque()  # raw trade batches deferred from WS callback
 
 
 @dataclass
@@ -1495,7 +1501,7 @@ def on_order_book_update(market_id, payload):
                     calc.on_book_update(mid, ob['bids'], ob['asks'])
 
                 if _dry_run_engine is not None:
-                    _dry_run_engine.check_fills(ob['bids'], ob['asks'])
+                    asyncio.get_event_loop().call_soon(_deferred_check_fills)
 
                 order_book_received.set()
             else:
@@ -1531,7 +1537,7 @@ async def subscribe_to_market_data(market_id):
             if 'order_book' in data:
                 on_order_book_update(market_id, data['order_book'])
 
-    await ws_subscribe(
+    await ws_subscribe_fast(
         channels=[f"order_book/{market_id}"],
         label="market data",
         on_message=_on_message,
@@ -1570,7 +1576,7 @@ async def subscribe_to_ticker(market_id):
         if "ticker" in msg_type:
             on_ticker_update(market_id, data)
 
-    await ws_subscribe(
+    await ws_subscribe_fast(
         channels=[f"ticker/{market_id}"],
         label="ticker",
         on_message=_on_message,
@@ -1666,37 +1672,55 @@ def on_account_all_update(account_id, data):
                 else:
                     logger.warning("Ignoring malformed account_all positions payload: %r", raw_positions)
 
+            # Defer trade sort/dedup/log to next event-loop tick so the WS
+            # callback returns promptly and doesn't block market-data ingestion.
             new_trades_by_market = data.get("trades", {}) if isinstance(data, dict) else {}
             if new_trades_by_market:
-                all_new_trades = [trade for trades in new_trades_by_market.values() for trade in trades]
-                all_new_trades.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-                for trade in reversed(all_new_trades):
-                    if trade not in state.account.recent_trades:
-                        state.account.recent_trades.append(trade)
-                        logger.info(
-                            f"WebSocket trade update: Market {trade.get('market_id')}, "
-                            f"Type {trade.get('type')}, Size {trade.get('size')}, "
-                            f"Price {trade.get('price')}"
-                        )
-                        # Live trade log (buffer only — flushed periodically)
-                        if _trade_logger is not None and _dry_run_engine is None:
-                            _trade_logger.log_fill(
-                                side=str(trade.get("type", "")),
-                                price=float(trade.get("price", 0)),
-                                size=float(trade.get("size", 0)),
-                                level=0,
-                                position_after=state.account.position_size,
-                                realized_pnl=0.0,
-                                available_capital=state.account.available_capital or 0.0,
-                                portfolio_value=state.account.portfolio_value or 0.0,
-                                simulated=False,
-                            )
+                _pending_trades.append(new_trades_by_market)
+                asyncio.get_event_loop().call_soon(_process_pending_trades)
 
             if positions_updated and not account_all_received.is_set():
                 account_all_received.set()
 
     except (ValueError, TypeError) as e:
         logger.error(f"Error processing account_all update: {e}", exc_info=True)
+
+
+def _process_pending_trades() -> None:
+    """Drain deferred trade batches — sort, dedup, log.  Runs via call_soon."""
+    while _pending_trades:
+        new_trades_by_market = _pending_trades.popleft()
+        all_new_trades = [trade for trades in new_trades_by_market.values() for trade in trades]
+        all_new_trades.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        for trade in reversed(all_new_trades):
+            if trade not in state.account.recent_trades:
+                state.account.recent_trades.append(trade)
+                logger.info(
+                    f"WebSocket trade update: Market {trade.get('market_id')}, "
+                    f"Type {trade.get('type')}, Size {trade.get('size')}, "
+                    f"Price {trade.get('price')}"
+                )
+                if _trade_logger is not None and _dry_run_engine is None:
+                    _trade_logger.log_fill(
+                        side=str(trade.get("type", "")),
+                        price=float(trade.get("price", 0)),
+                        size=float(trade.get("size", 0)),
+                        level=0,
+                        position_after=state.account.position_size,
+                        realized_pnl=0.0,
+                        available_capital=state.account.available_capital or 0.0,
+                        portfolio_value=state.account.portfolio_value or 0.0,
+                        simulated=False,
+                    )
+
+
+def _deferred_check_fills() -> None:
+    """Run dry-run fill simulation deferred from the WS callback via call_soon."""
+    if _dry_run_engine is not None:
+        ob = state.market.local_order_book
+        if ob['bids'] and ob['asks']:
+            _dry_run_engine.check_fills(ob['bids'], ob['asks'])
+
 
 async def subscribe_to_account_all(account_id):
     """Connects to the websocket, subscribes to account_all, and updates global state."""
@@ -3112,7 +3136,7 @@ async def _paced_send(client, ops: list) -> None:
 
 
 async def market_making_loop(client):
-    global _pause_cleanup_running, _send_task
+    global _pause_cleanup_running, _send_task, _latest_ops
     logger.info("Starting 2-sided market making loop...")
     _log_info = logger.isEnabledFor(logging.INFO)
     _log_debug = logger.isEnabledFor(logging.DEBUG)
@@ -3258,17 +3282,21 @@ async def market_making_loop(client):
             if _send_task is not None and _send_task.done():
                 _send_task = None
 
-            # Batch order operations — skip if previous send still in flight
-            if _send_task is not None:
-                if _log_debug:
-                    logger.debug("Skipping ops: previous send still in flight")
-            else:
+            if _dry_run_engine is not None:
+                # Dry-run: synchronous path (no network latency, no mailbox)
                 ops = collect_order_operations(level_prices, base_amount, _log_debug)
                 if ops:
-                    if _dry_run_engine is not None:
-                        await _dry_run_engine.process_batch(ops)
-                    else:
-                        _send_task = asyncio.create_task(_paced_send(client, ops))
+                    await _dry_run_engine.process_batch(ops)
+            else:
+                # Live: always compute ops — no backpressure gate.  Store in
+                # mailbox; sender drains the latest when ready.
+                ops = collect_order_operations(level_prices, base_amount, _log_debug)
+                if ops:
+                    _latest_ops = ops
+                # Dispatch if sender is idle and mailbox has content
+                if _send_task is None and _latest_ops is not None:
+                    _send_task = asyncio.create_task(_paced_send(client, _latest_ops))
+                    _latest_ops = None
 
             if _dry_run_engine is not None:
                 _dry_run_engine.maybe_log_summary()  # also flushes trade log + state

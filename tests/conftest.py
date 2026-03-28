@@ -9,10 +9,14 @@ mock is in place before ``import market_maker_v2`` or ``import utils`` triggers
 No real network calls, wallets, or funds are ever used.
 """
 
+import os
 import sys
 import types
 import pathlib
 from unittest.mock import MagicMock
+
+# Allow tests to run without Cython built (dev/CI environments)
+os.environ.setdefault("ALLOW_PYTHON_FALLBACK", "1")
 
 # ---------------------------------------------------------------------------
 # Build a fake ``lighter`` package that satisfies every attribute used at

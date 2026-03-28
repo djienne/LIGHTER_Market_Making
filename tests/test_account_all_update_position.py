@@ -78,6 +78,8 @@ class TestAccountAllUpdatePosition(unittest.TestCase):
                 },
             })
 
+            # Trade processing is deferred via call_soon — drain manually in sync test
+            mm._process_pending_trades()
             self.assertEqual(len(mm.recent_trades), 1)
             self.assertEqual(mm.recent_trades[0]["price"], "100")
 

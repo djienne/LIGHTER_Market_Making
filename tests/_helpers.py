@@ -40,6 +40,7 @@ _STATE_MAP = {
     '_quota_recovery_in_progress': lambda: (mm, '_quota_recovery_in_progress'),
     '_quota_recovery_last_attempt':lambda: (mm, '_quota_recovery_last_attempt'),
     '_send_task':                  lambda: (mm, '_send_task'),
+    '_latest_ops':                 lambda: (mm, '_latest_ops'),
 }
 
 
