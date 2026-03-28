@@ -298,7 +298,9 @@ BINANCE_BBO_STALE_SECONDS = float(os.getenv("BINANCE_BBO_STALE_SECONDS", _alpha_
 BINANCE_DEPTH_SNAPSHOT_LIMIT = int(os.getenv("BINANCE_DEPTH_SNAPSHOT_LIMIT", _alpha_cfg.get("depth_snapshot_limit", 1000)))
 
 # Global events and task refs (not part of state — asyncio primitives)
-order_book_received = asyncio.Event()
+order_book_received = asyncio.Event()    # legacy: used by startup wait + tests
+_book_seq: int = 0                       # monotonic counter, bumped by WS callback
+_book_seq_event = asyncio.Event()        # signaled on every bump for hot-loop wakeup
 account_state_received = asyncio.Event()
 account_all_received = asyncio.Event()
 ws_reconnect_event = asyncio.Event()
@@ -518,17 +520,14 @@ def _publish_quote_telemetry(
     quota_remaining: Optional[int],
     threshold_bps: float,
 ) -> None:
-    global _quote_telemetry
-    _quote_telemetry = QuoteTelemetryState(
-        updated_at=time.monotonic(),
-        mid=mid,
-        position_size=position_size,
-        buy_0=buy_0,
-        sell_0=sell_0,
-        max_pos_usd=max_pos_usd,
-        quota_remaining=quota_remaining,
-        threshold_bps=threshold_bps,
-    )
+    _quote_telemetry.updated_at = time.monotonic()
+    _quote_telemetry.mid = mid
+    _quote_telemetry.position_size = position_size
+    _quote_telemetry.buy_0 = buy_0
+    _quote_telemetry.sell_0 = sell_0
+    _quote_telemetry.max_pos_usd = max_pos_usd
+    _quote_telemetry.quota_remaining = quota_remaining
+    _quote_telemetry.threshold_bps = threshold_bps
 
 
 class OrderManager:
@@ -1485,8 +1484,8 @@ def on_order_book_update(market_id, payload):
                 prev_mid = state.market.mid_price
                 state.market.mid_price = mid
 
-                # Recompute derived params when mid changes materially
-                if prev_mid is None or round(mid, 4) != round(prev_mid, 4):
+                # Recompute derived params when mid changes materially (~$10 move)
+                if prev_mid is None or round(mid, -1) != round(prev_mid, -1):
                     _recompute_derived_params(mid)
 
                 # Feed vol_obi calculator on every book update (hot path)
@@ -1504,6 +1503,9 @@ def on_order_book_update(market_id, payload):
                     asyncio.get_event_loop().call_soon(_deferred_check_fills)
 
                 order_book_received.set()
+                global _book_seq
+                _book_seq += 1
+                _book_seq_event.set()
             else:
                 # Book is one-sided — clear stale mid_price to prevent
                 # the trading loop from quoting at an outdated level.
@@ -1929,6 +1931,7 @@ async def restart_websocket():
     # Reset market data state (order state is managed by account_orders WS)
     ob = state.market.local_order_book
     order_book_received.clear()
+    _book_seq_event.clear()
     state.market.mid_price = None
     ob['initialized'] = False
     ob['bids'].clear()
@@ -3136,7 +3139,7 @@ async def _paced_send(client, ops: list) -> None:
 
 
 async def market_making_loop(client):
-    global _pause_cleanup_running, _send_task, _latest_ops
+    global _pause_cleanup_running, _send_task, _latest_ops, _book_seq
     logger.info("Starting 2-sided market making loop...")
     _log_info = logger.isEnabledFor(logging.INFO)
     _log_debug = logger.isEnabledFor(logging.DEBUG)
@@ -3145,6 +3148,7 @@ async def market_making_loop(client):
     _warmup_logged = False
     _last_warmup_log_min = -1
     _warmup_complete_logged = False
+    _last_seen_seq = _book_seq  # track last-processed book sequence
 
     while True:
         try:
@@ -3209,13 +3213,15 @@ async def market_making_loop(client):
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
-            # Wait for fresh order book data but wake up to check state
-            # Clear before wait to avoid losing updates between wait() returning and clear()
-            order_book_received.clear()
-            try:
-                await asyncio.wait_for(order_book_received.wait(), timeout=ORDER_TIMEOUT)
-            except asyncio.TimeoutError:
-                pass
+            # Wait for fresh order book data via monotonic sequence counter.
+            # Only wait if no new update arrived since last iteration.
+            if _book_seq == _last_seen_seq:
+                _book_seq_event.clear()
+                try:
+                    await asyncio.wait_for(_book_seq_event.wait(), timeout=ORDER_TIMEOUT)
+                except asyncio.TimeoutError:
+                    pass
+            _last_seen_seq = _book_seq
 
             # Process deferred order-state mutations (WS fills, reconciler,
             # send confirmations) so reads below see consistent state.
