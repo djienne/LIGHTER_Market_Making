@@ -8,12 +8,24 @@ import tempfile
 import time
 import unittest
 
+import pytest
 from sortedcontainers import SortedDict
 
 import market_maker_v2 as mm
 from dry_run import DryRunEngine, SimulatedOrder
 from trade_log import TradeLogger
 from _helpers import temp_mm_attrs
+
+try:
+    from _vol_obi_fast import CBookSide
+    _HAS_CBOOKSIDE = True
+except ImportError:
+    _HAS_CBOOKSIDE = False
+
+# Book types to test with — all _book() calls use this.
+_BOOK_TYPES = [SortedDict]
+if _HAS_CBOOKSIDE:
+    _BOOK_TYPES.append(CBookSide)
 
 
 def _make_engine(**kwargs):
@@ -33,11 +45,9 @@ def _make_engine(**kwargs):
     return DryRunEngine(**defaults)
 
 
-def _book(bids: dict, asks: dict):
+def _book(bids: dict, asks: dict, cls=SortedDict):
     """Build sorted bid/ask book sides."""
-    b = SortedDict(bids)
-    a = SortedDict(asks)
-    return b, a
+    return cls(bids), cls(asks)
 
 
 class TestProcessBatch(unittest.IsolatedAsyncioTestCase):
@@ -1502,6 +1512,172 @@ class TestCLIFlag(unittest.TestCase):
         """DRY_RUN defaults to True (no --live flag)."""
         # After module load, DRY_RUN is set at module level
         self.assertIsInstance(mm.DRY_RUN, bool)
+
+
+# ---------------------------------------------------------------------------
+# CBookSide compatibility: ensure dry_run works with the Cython book type
+# ---------------------------------------------------------------------------
+
+def _cbook(bids: dict, asks: dict):
+    """Build CBookSide bid/ask book sides (Cython type used in production)."""
+    from _vol_obi_fast import CBookSide
+    return CBookSide(bids), CBookSide(asks)
+
+
+class TestCBookSideCreateSell(unittest.IsolatedAsyncioTestCase):
+    """Regression: _handle_create for sell orders iterates bids to snapshot
+    qualifying depth.  This broke with CBookSide because reversed()/list()
+    fall back to __getitem__(int_index) which CBookSide interprets as a
+    price lookup, raising KeyError."""
+
+    async def test_create_sell_with_cbookside(self):
+        """Sell at 66100 with bids at {66000, 66050}. Best bid 66050 < 66100,
+        so POST_ONLY passes. Bid iteration for depth snapshot runs on CBookSide."""
+        with temp_mm_attrs(
+            current_ask_order_id=None, current_ask_price=None,
+            current_ask_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+        ):
+            bids, asks = _cbook(
+                {66000.0: 1.0, 66050.0: 2.0},
+                {66200.0: 1.0, 66300.0: 2.0},
+            )
+            mm.state.market.local_order_book = {'bids': bids, 'asks': asks}
+
+            engine = _make_engine()
+            # Sell at 66100 — above best bid 66050, valid POST_ONLY
+            op = mm.BatchOp("sell", 0, "create", 66100.0, 0.3, 1, 0)
+            await engine.process_batch([op])
+
+            sim = engine._live_orders[1]
+            self.assertEqual(sim.side, "sell")
+            self.assertEqual(sim.price, 66100.0)
+            # No bids >= 66100, so _prev_by_price should be empty
+            self.assertEqual(len(sim._prev_by_price), 0)
+
+    async def test_create_buy_with_cbookside(self):
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+        ):
+            bids, asks = _cbook(
+                {66000.0: 1.0, 66100.0: 2.0},
+                {66300.0: 0.5, 66400.0: 1.0, 66500.0: 2.0},
+            )
+            mm.state.market.local_order_book = {'bids': bids, 'asks': asks}
+
+            engine = _make_engine()
+            # Buy at 66200 — below best ask 66300, valid POST_ONLY
+            op = mm.BatchOp("buy", 0, "create", 66200.0, 0.3, 1, 0)
+            await engine.process_batch([op])
+
+            sim = engine._live_orders[1]
+            self.assertEqual(sim.side, "buy")
+            self.assertEqual(sim.price, 66200.0)
+            # For buy, _prev_by_price snapshots ask prices <= order price
+            # No asks at or below 66200, so snapshot should be empty
+            self.assertEqual(len(sim._prev_by_price), 0)
+
+
+class TestCBookSideFills(unittest.TestCase):
+    """Ensure check_fills works with CBookSide (Cython) book sides."""
+
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def test_sell_fill_with_cbookside(self):
+        """Sell limit fills when bids cross — exercises _check_fills_sell
+        which iterates bids via .items()."""
+        with temp_mm_attrs(
+            current_ask_order_id=None, current_ask_price=None,
+            current_ask_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=66200.0,
+        ):
+            bids_create, asks_create = _cbook(
+                {66000.0: 1.0}, {66400.0: 1.0},
+            )
+            mm.state.market.local_order_book = {
+                'bids': bids_create, 'asks': asks_create,
+            }
+
+            engine = _make_engine()
+            self._run(engine.process_batch([
+                mm.BatchOp("sell", 0, "create", 66200.0, 0.5, 1, 0),
+            ]))
+
+            # Bid crosses our sell limit
+            bids_fill, asks_fill = _cbook(
+                {66200.0: 2.0, 66100.0: 1.0}, {66300.0: 1.0},
+            )
+            engine.check_fills(bids_fill, asks_fill)
+
+            self.assertNotIn(1, engine._live_orders)
+            self.assertAlmostEqual(engine._position, -0.5)
+
+    def test_buy_fill_with_cbookside(self):
+        """Buy limit fills when asks cross — exercises _check_fills_buy
+        which iterates asks via .items()."""
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_bid_price=None,
+            current_bid_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+            current_mid_price_cached=66200.0,
+        ):
+            bids_create, asks_create = _cbook(
+                {66000.0: 1.0}, {66400.0: 1.0},
+            )
+            mm.state.market.local_order_book = {
+                'bids': bids_create, 'asks': asks_create,
+            }
+
+            engine = _make_engine()
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 66200.0, 0.5, 1, 0),
+            ]))
+
+            # Ask crosses our buy limit
+            bids_fill, asks_fill = _cbook(
+                {66100.0: 1.0}, {66200.0: 2.0, 66100.0: 1.0},
+            )
+            engine.check_fills(bids_fill, asks_fill)
+
+            self.assertNotIn(1, engine._live_orders)
+            self.assertAlmostEqual(engine._position, 0.5)
+
+
+class TestCBookSideModify(unittest.IsolatedAsyncioTestCase):
+    """Regression: _handle_modify iterates bids for sell-side depth snapshot.
+    Exercises the third iteration site (dry_run.py line 376)."""
+
+    async def test_modify_sell_with_cbookside(self):
+        with temp_mm_attrs(
+            current_ask_order_id=None, current_ask_price=None,
+            current_ask_size=None, _PRICE_TICK_FLOAT=0.1,
+            available_capital=1000.0, current_position_size=0.0,
+        ):
+            bids, asks = _cbook(
+                {66000.0: 1.0, 66050.0: 2.0},
+                {66300.0: 1.0, 66400.0: 2.0},
+            )
+            mm.state.market.local_order_book = {'bids': bids, 'asks': asks}
+
+            engine = _make_engine()
+            # Create sell at 66300 — above best bid 66050
+            await engine.process_batch([
+                mm.BatchOp("sell", 0, "create", 66300.0, 0.3, 1, 0),
+            ])
+            self.assertIn(1, engine._live_orders)
+
+            # Modify to 66200 — still above best bid, triggers bid iteration
+            await engine.process_batch([
+                mm.BatchOp("sell", 0, "modify", 66200.0, 0.3, 1,
+                           mm._client_to_exchange_id[1]),
+            ])
+            sim = engine._live_orders[1]
+            self.assertEqual(sim.price, 66200.0)
 
 
 if __name__ == "__main__":

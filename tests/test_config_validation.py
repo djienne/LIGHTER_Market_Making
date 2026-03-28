@@ -33,11 +33,11 @@ class TestLoadConfigParams(unittest.TestCase):
             result = load_config_params()
         self.assertEqual(result, {})
 
-    def test_invalid_json_returns_empty_dict(self):
-        """Malformed JSON should return empty dict."""
+    def test_invalid_json_raises_system_exit(self):
+        """Malformed JSON should raise SystemExit (fatal config error)."""
         with patch("builtins.open", unittest.mock.mock_open(read_data="{invalid json!!}")):
-            result = load_config_params()
-        self.assertEqual(result, {})
+            with self.assertRaises(SystemExit):
+                load_config_params()
 
     def test_empty_config_returns_empty_dict(self):
         """Empty JSON object is valid but has no keys."""

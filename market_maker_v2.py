@@ -23,8 +23,14 @@ import sys as _sys
 import types as _types
 try:
     from _vol_obi_fast import CBookSide as _BookSide
+    _CYTHON_AVAILABLE = True
 except ImportError:
     from sortedcontainers import SortedDict as _BookSide
+    _CYTHON_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "Cython extension _vol_obi_fast not available — using pure-Python SortedDict. "
+        "Build with: python setup_cython.py build_ext --inplace"
+    )
 import websockets
 from utils import EPSILON, get_market_details_async, load_config_params
 from adjust_leverage import adjust_leverage
@@ -32,7 +38,10 @@ from orderbook import apply_orderbook_update
 from ws_manager import ws_subscribe
 from orderbook_sanity import check_orderbook_sanity
 from vol_obi import VolObiCalculator
-from binance_obi import BinanceObiClient, SharedAlpha, lighter_to_binance_symbol
+from binance_obi import (
+    BinanceBookTickerClient, BinanceDiffDepthClient,
+    SharedAlpha, SharedBBO, lighter_to_binance_symbol,
+)
 from logging_config import setup_logging
 from dotenv import load_dotenv
 
@@ -67,6 +76,7 @@ MIN_ORDER_VALUE_USD = float(_trading.get("min_order_value_usd", 14.5))
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+REQUIRE_CYTHON = os.getenv("REQUIRE_CYTHON", "").lower() in ("1", "true", "yes")
 
 # Trading config
 BASE_AMOUNT = float(os.getenv(
@@ -105,7 +115,7 @@ ORDER_RECONCILE_TIMEOUT_SEC = float(os.getenv(
     _safety.get("order_reconcile_timeout_sec", 2.0)))
 MAX_LIVE_ORDERS_PER_MARKET = int(os.getenv(
     "MAX_LIVE_ORDERS_PER_MARKET",
-    _safety.get("max_live_orders_per_market", 2)))
+    _safety.get("max_live_orders_per_market", 4)))
 
 # Quota recovery config
 _quota_recovery_cfg = _perf.get("quota_recovery", {})
@@ -159,6 +169,11 @@ def _validate_config() -> None:
         errors.append(f"ORDER_TIMEOUT={ORDER_TIMEOUT} must be > 0")
     if SPREAD_FACTOR_LEVEL1 < 1.0:
         errors.append(f"SPREAD_FACTOR_LEVEL1={SPREAD_FACTOR_LEVEL1} must be >= 1.0")
+    if REQUIRE_CYTHON and not _CYTHON_AVAILABLE:
+        errors.append(
+            "REQUIRE_CYTHON=1 but Cython extension not available. "
+            "Build with: python setup_cython.py build_ext --inplace"
+        )
     if errors:
         raise ValueError("Invalid configuration:\n  " + "\n  ".join(errors))
 
@@ -247,13 +262,13 @@ VOL_OBI_WINDOW_STEPS = int(os.getenv(
 VOL_OBI_STEP_NS = int(os.getenv(
     "VOL_OBI_STEP_NS", _vol_obi_cfg.get("step_ns", 100_000_000)))
 VOL_OBI_VOL_TO_HALF_SPREAD = float(os.getenv(
-    "VOL_OBI_VOL_TO_HALF_SPREAD", _vol_obi_cfg.get("vol_to_half_spread", 0.8)))
+    "VOL_OBI_VOL_TO_HALF_SPREAD", _vol_obi_cfg.get("vol_to_half_spread", 48.0)))
 VOL_OBI_MIN_HALF_SPREAD_BPS = float(os.getenv(
-    "VOL_OBI_MIN_HALF_SPREAD_BPS", _vol_obi_cfg.get("min_half_spread_bps", 2.0)))
+    "VOL_OBI_MIN_HALF_SPREAD_BPS", _vol_obi_cfg.get("min_half_spread_bps", 8.0)))
 VOL_OBI_C1_TICKS = float(os.getenv(
-    "VOL_OBI_C1_TICKS", _vol_obi_cfg.get("c1_ticks", 160.0)))
+    "VOL_OBI_C1_TICKS", _vol_obi_cfg.get("c1_ticks", 20.0)))
 VOL_OBI_SKEW = float(os.getenv(
-    "VOL_OBI_SKEW", _vol_obi_cfg.get("skew", 1.0)))
+    "VOL_OBI_SKEW", _vol_obi_cfg.get("skew", 3.0)))
 VOL_OBI_LOOKING_DEPTH = float(os.getenv(
     "VOL_OBI_LOOKING_DEPTH", _vol_obi_cfg.get("looking_depth", 0.025)))
 VOL_OBI_MIN_WARMUP_SAMPLES = int(os.getenv(
@@ -265,9 +280,12 @@ WARMUP_SECONDS = float(os.getenv(
 _alpha_cfg = _trading.get("alpha", {})
 ALPHA_SOURCE = os.getenv("ALPHA_SOURCE", _alpha_cfg.get("source", "binance"))
 BINANCE_STALE_SECONDS = float(os.getenv("BINANCE_STALE_SECONDS", _alpha_cfg.get("stale_seconds", 5.0)))
-BINANCE_OBI_WINDOW = int(os.getenv("BINANCE_OBI_WINDOW", _alpha_cfg.get("window_size", 300)))
+BINANCE_OBI_WINDOW = int(os.getenv("BINANCE_OBI_WINDOW", _alpha_cfg.get("window_size", 6000)))
 BINANCE_OBI_MIN_SAMPLES = int(os.getenv("BINANCE_OBI_MIN_SAMPLES", _alpha_cfg.get("min_samples", 150)))
 BINANCE_OBI_LOOKING_DEPTH = float(os.getenv("BINANCE_OBI_LOOKING_DEPTH", _alpha_cfg.get("looking_depth", 0.025)))
+BINANCE_BBO_MIN_SAMPLES = int(os.getenv("BINANCE_BBO_MIN_SAMPLES", _alpha_cfg.get("bbo_min_samples", 10)))
+BINANCE_BBO_STALE_SECONDS = float(os.getenv("BINANCE_BBO_STALE_SECONDS", _alpha_cfg.get("bbo_stale_seconds", 5.0)))
+BINANCE_DEPTH_SNAPSHOT_LIMIT = int(os.getenv("BINANCE_DEPTH_SNAPSHOT_LIMIT", _alpha_cfg.get("depth_snapshot_limit", 1000)))
 
 # Global events and task refs (not part of state — asyncio primitives)
 order_book_received = asyncio.Event()
@@ -441,6 +459,7 @@ class MMState:
     order_manager: OrderManagerState = field(default_factory=OrderManagerState)
     risk: RiskState = field(default_factory=RiskState)
     binance_alpha: Optional[SharedAlpha] = None
+    binance_bbo: Optional[SharedBBO] = None
 
 
 state = MMState()
@@ -1851,7 +1870,7 @@ def _ops_available() -> int:
 def _time_until_ops_free(n: int) -> float:
     """Seconds until *n* ops become available (0.0 if already available)."""
     _prune_op_window()
-    if len(_op_timestamps) + n <= _RL_OPS_PER_WINDOW:
+    if not _op_timestamps or len(_op_timestamps) + n <= _RL_OPS_PER_WINDOW:
         return 0.0
     # Need to wait for the (len - (budget - n))-th oldest op to expire
     idx = len(_op_timestamps) - (_RL_OPS_PER_WINDOW - n)
@@ -2541,14 +2560,14 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
                 existing_size = orders.ask_sizes[level]
 
             if existing_id is not None:
-                if not _has_exchange_id(existing_id):
-                    if existing_id is not None and not _has_exchange_id(existing_id):
-                        if _log_debug:
-                            logger.debug(
-                                "Keeping %s[%d]: awaiting exchange order_index for client id %d",
-                                side, level, existing_id,
-                            )
-                        continue
+                exchange_id = _resolve_exchange_id(existing_id)
+                if exchange_id is None:
+                    if _log_debug:
+                        logger.debug(
+                            "Keeping %s[%d]: awaiting exchange order_index for client id %d",
+                            side, level, existing_id,
+                        )
+                    continue
                 change_bps = price_change_bps(existing_price, new_price)
                 size_changed = _size_change_requires_update(existing_size, new_size)
                 needs_modify = existing_price is None or change_bps > effective_threshold or size_changed
@@ -2557,14 +2576,6 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
                         logger.debug(
                             "Keeping %s[%d]: price %.2f bps <= %.2f and size unchanged",
                             side, level, change_bps, effective_threshold,
-                        )
-                    continue
-                exchange_id = _resolve_exchange_id(existing_id)
-                if exchange_id is None:
-                    if _log_debug:
-                        logger.debug(
-                            "Keeping %s[%d]: exchange order_index missing for client id %d",
-                            side, level, existing_id,
                         )
                     continue
                 ops.append(BatchOp(
@@ -2890,15 +2901,14 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
             if max_pos_usd <= 0:
                 # Can't compute position limit (missing capital?) — suppress all quoting
                 return none_levels
-            if max_pos_usd > 0:
-                pos_value_usd = abs(position_size) * mid_price
-                if pos_value_usd >= max_pos_usd:
-                    if position_size > 0:
-                        buy_0 = None  # Long at limit — suppress buys
-                    elif position_size < 0:
-                        sell_0 = None  # Short at limit — suppress sells
-                    if buy_0 is None and sell_0 is None:
-                        return none_levels
+            pos_value_usd = abs(position_size) * mid_price
+            if pos_value_usd >= max_pos_usd:
+                if position_size > 0:
+                    buy_0 = None  # Long at limit — suppress buys
+                elif position_size < 0:
+                    sell_0 = None  # Short at limit — suppress sells
+                if buy_0 is None and sell_0 is None:
+                    return none_levels
 
             levels = [(buy_0, sell_0)]
             # Derive wider levels by scaling the spread from mid
@@ -2979,7 +2989,8 @@ async def market_making_loop(client):
                 _calc = state.vol_obi_state.calculator
                 vol_ready = (_calc is not None and _calc.warmed_up)
                 ba = state.binance_alpha
-                binance_ready = ba is None or ba.warmed_up
+                bb = state.binance_bbo
+                binance_ready = (ba is None or ba.warmed_up) and (bb is None or bb.warmed_up)
                 # Refresh capital timestamp — data is valid (no trading during warmup)
                 if state.account.available_capital is not None:
                     state.account.last_capital_update = time.monotonic()
@@ -2988,7 +2999,7 @@ async def market_making_loop(client):
                     logger.info("Reconnecting TxWebSocket after warmup...")
                     await _tx_ws.connect()
                 logger.info(
-                    "Warmup complete (%.0fs). vol_obi ready=%s, binance_alpha ready=%s",
+                    "Warmup complete (%.0fs). vol_obi ready=%s, binance ready=%s",
                     WARMUP_SECONDS, vol_ready, binance_ready,
                 )
             ws_healthy = check_websocket_health()
@@ -3339,6 +3350,13 @@ async def main():
         state.config.amount_tick_size, state.config.min_base_amount, state.config.min_quote_amount,
     )
 
+    _cython_vobi = VolObiCalculator.__module__ == '_vol_obi_fast'
+    logger.info(
+        "⚡ Acceleration: CBookSide=%s, VolObiCalculator=%s",
+        "Cython" if _CYTHON_AVAILABLE else "Python",
+        "Cython" if _cython_vobi else "Python",
+    )
+
     # Initialize vol_obi spread calculator
     state.vol_obi_state.calculator = VolObiCalculator(
         tick_size=state.config.price_tick_float,
@@ -3359,23 +3377,37 @@ async def main():
         VOL_OBI_SKEW, VOL_OBI_MIN_WARMUP_SAMPLES,
     )
 
-    # Start Binance alpha source (if applicable)
-    binance_task = None
+    # Start Binance feeds (if applicable)
+    binance_bbo_task = None
+    binance_depth_task = None
     if ALPHA_SOURCE == "binance":
         binance_sym = lighter_to_binance_symbol(MARKET_SYMBOL)
         if binance_sym is not None:
+            # Feed 1: @bookTicker → SharedBBO (lowest-latency BBO)
+            shared_bbo = SharedBBO(min_samples=BINANCE_BBO_MIN_SAMPLES)
+            state.binance_bbo = shared_bbo
+            bbo_client = BinanceBookTickerClient(
+                binance_symbol=binance_sym,
+                shared_bbo=shared_bbo,
+                stale_threshold=BINANCE_BBO_STALE_SECONDS,
+            )
+            binance_bbo_task = asyncio.create_task(bbo_client.run())
+            logger.info("Binance BBO: %s@bookTicker", binance_sym)
+
+            # Feed 2: @depth@100ms → SharedAlpha (local book + imbalance alpha)
             shared_alpha = SharedAlpha(min_samples=BINANCE_OBI_MIN_SAMPLES)
             state.binance_alpha = shared_alpha
-            binance_client = BinanceObiClient(
+            depth_client = BinanceDiffDepthClient(
                 binance_symbol=binance_sym,
                 shared_alpha=shared_alpha,
                 window_size=BINANCE_OBI_WINDOW,
                 looking_depth=BINANCE_OBI_LOOKING_DEPTH,
                 stale_threshold=BINANCE_STALE_SECONDS,
+                snapshot_limit=BINANCE_DEPTH_SNAPSHOT_LIMIT,
             )
-            binance_task = asyncio.create_task(binance_client.run())
+            binance_depth_task = asyncio.create_task(depth_client.run())
             logger.info(
-                "Binance alpha: %s | window=%d stale=%.0fs min_samples=%d",
+                "Binance depth: %s@depth@100ms | window=%d stale=%.0fs min_samples=%d",
                 binance_sym, BINANCE_OBI_WINDOW, BINANCE_STALE_SECONDS, BINANCE_OBI_MIN_SAMPLES,
             )
         else:
@@ -3443,7 +3475,11 @@ async def main():
     if DRY_RUN:
         # Separate dry-run wallet — no need for real account WS
         _dr_default_capital = 1000.0
-        _dr_state_path = os.path.join(LOG_DIR, "dry_run_state.json")
+        if TEST_MODE_DURATION is not None:
+            # Test mode: isolated state files that don't interfere with real dry-run
+            _dr_state_path = os.path.join(LOG_DIR, "test_dry_run_state.json")
+        else:
+            _dr_state_path = os.path.join(LOG_DIR, "dry_run_state.json")
 
         if DRY_RUN_CAPITAL is not None:
             # Explicit --capital: reset to fresh wallet
@@ -3517,12 +3553,13 @@ async def main():
         if DRY_RUN:
             from dry_run import DryRunEngine
             from trade_log import TradeLogger
-            _trade_logger = TradeLogger(LOG_DIR, MARKET_SYMBOL)
-            if DRY_RUN_CAPITAL is not None:
-                _trade_logger.clear()  # reset trade log on --capital
+            _test_suffix = "_test" if TEST_MODE_DURATION is not None else ""
+            _trade_logger = TradeLogger(LOG_DIR, MARKET_SYMBOL + _test_suffix)
+            if DRY_RUN_CAPITAL is not None or TEST_MODE_DURATION is not None:
+                _trade_logger.clear()  # reset trade log on --capital or --test
 
             # Try to restore from saved state, otherwise create fresh
-            if DRY_RUN_CAPITAL is None:
+            if DRY_RUN_CAPITAL is None and TEST_MODE_DURATION is None:
                 _dry_run_engine = DryRunEngine.load_state(
                     _dr_state_path,
                     state=state,
@@ -3588,7 +3625,26 @@ async def main():
         sanity_task = asyncio.create_task(periodic_orderbook_sanity_check())
         lifecycle_watchdog_task = asyncio.create_task(order_lifecycle_watchdog_loop())
         quote_telemetry_task = asyncio.create_task(quote_telemetry_loop())
-        await market_making_loop(client)
+
+        # Test mode: auto-exit after configured duration
+        if TEST_MODE_DURATION is not None:
+            async def _test_mode_timer():
+                await asyncio.sleep(TEST_MODE_DURATION)
+                logger.info("🧪 TEST MODE: %ds elapsed — shutting down (no errors detected)", TEST_MODE_DURATION)
+            _test_timer_task = asyncio.create_task(_test_mode_timer())
+            # Race: main loop vs timer. Timer finishing means success.
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(market_making_loop(client)), _test_timer_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            # Re-raise if the loop task ended with an error
+            for t in done:
+                if t.exception() is not None:
+                    raise t.exception()
+        else:
+            await market_making_loop(client)
 
     except asyncio.TimeoutError:
         logger.error("❌ Timeout waiting for initial data from websockets.")
@@ -3617,8 +3673,10 @@ async def main():
             tasks_to_cancel.append(ticker_task)
         if 'ws_task' in locals():
             tasks_to_cancel.append(ws_task)
-        if binance_task is not None:
-            tasks_to_cancel.append(binance_task)
+        if binance_bbo_task is not None:
+            tasks_to_cancel.append(binance_bbo_task)
+        if binance_depth_task is not None:
+            tasks_to_cancel.append(binance_depth_task)
 
         for task in tasks_to_cancel:
             if not task.done():
@@ -3627,7 +3685,14 @@ async def main():
 
         if DRY_RUN:
             if _dry_run_engine is not None:
-                _dry_run_engine.save_state()
+                if TEST_MODE_DURATION is None:
+                    _dry_run_engine.save_state()
+                else:
+                    # Test mode: clean up isolated state file
+                    try:
+                        os.remove(_dr_state_path)
+                    except FileNotFoundError:
+                        pass
                 if _dry_run_engine._trade_logger is not None:
                     _dry_run_engine._trade_logger.flush()
                 _dry_run_engine.maybe_log_summary()
@@ -3711,11 +3776,19 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default=os.getenv("MARKET_SYMBOL", "BTC"), help="Market symbol to trade")
     parser.add_argument("--live", action="store_true", help="Live trading mode (default is dry-run/paper-trading)")
     parser.add_argument("--capital", type=float, default=None, help="Reset dry-run wallet to this USD amount (default: 1000 on first run)")
+    parser.add_argument("--test", type=int, nargs="?", const=180, metavar="SECONDS",
+                        help="Smoke-test mode: 60s warmup, isolated state, auto-exit after SECONDS (default 180)")
     args = parser.parse_args()
     MARKET_SYMBOL = args.symbol.upper()
     os.environ["MARKET_SYMBOL"] = MARKET_SYMBOL
     DRY_RUN = not args.live
     DRY_RUN_CAPITAL = args.capital
+    TEST_MODE_DURATION = args.test  # None if not passed, else seconds
+
+    if TEST_MODE_DURATION is not None:
+        DRY_RUN = True
+        WARMUP_SECONDS = 60
+        logger.info("🧪 TEST MODE: warmup=60s, auto-exit after %ds, isolated state", TEST_MODE_DURATION)
 
     async def main_with_signal_handling():
         loop = asyncio.get_running_loop()

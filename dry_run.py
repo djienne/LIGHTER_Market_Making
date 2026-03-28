@@ -95,6 +95,7 @@ class DryRunEngine:
         self._fill_count: int = 0
         self._initial_capital: float = 0.0
         self._initial_portfolio_value: float = 0.0
+        self._entry_price_before: float = 0.0
 
         # Periodic summary
         self._last_summary: float = 0.0
@@ -303,17 +304,24 @@ class DryRunEngine:
         if op.side == "buy":
             asks = ob.get('asks')
             if asks:
-                for ask_price, ask_size in asks.items():
-                    if ask_price > op.price:
-                        break
-                    sim._prev_by_price[ask_price] = ask_size
+                if hasattr(asks, 'apply_snapshot_from_wire'):
+                    for ask_price, ask_size in asks.irange(max_price=op.price):
+                        sim._prev_by_price[ask_price] = ask_size
+                else:
+                    for ask_price, ask_size in asks.items():
+                        if ask_price > op.price:
+                            break
+                        sim._prev_by_price[ask_price] = ask_size
         else:
             bids = ob.get('bids')
             if bids:
-                for bid_price in reversed(bids):
-                    if bid_price < op.price:
-                        break
-                    sim._prev_by_price[bid_price] = bids[bid_price]
+                if hasattr(bids, 'apply_snapshot_from_wire'):
+                    for bid_price, bid_size in bids.irange(min_price=op.price):
+                        sim._prev_by_price[bid_price] = bid_size
+                else:
+                    for bid_price, bid_size in bids.items():
+                        if bid_price >= op.price:
+                            sim._prev_by_price[bid_price] = bid_size
 
         self._live_orders[op.order_id] = sim
         self._id_map[op.order_id] = eid
@@ -365,17 +373,24 @@ class DryRunEngine:
         if op.side == "buy":
             asks = ob.get('asks')
             if asks:
-                for ask_price, ask_size in asks.items():
-                    if ask_price > op.price:
-                        break
-                    new_snapshot[ask_price] = ask_size
+                if hasattr(asks, 'apply_snapshot_from_wire'):
+                    for ask_price, ask_size in asks.irange(max_price=op.price):
+                        new_snapshot[ask_price] = ask_size
+                else:
+                    for ask_price, ask_size in asks.items():
+                        if ask_price > op.price:
+                            break
+                        new_snapshot[ask_price] = ask_size
         else:
             bids = ob.get('bids')
             if bids:
-                for bid_price in reversed(bids):
-                    if bid_price < op.price:
-                        break
-                    new_snapshot[bid_price] = bids[bid_price]
+                if hasattr(bids, 'apply_snapshot_from_wire'):
+                    for bid_price, bid_size in bids.irange(min_price=op.price):
+                        new_snapshot[bid_price] = bid_size
+                else:
+                    for bid_price, bid_size in bids.items():
+                        if bid_price >= op.price:
+                            new_snapshot[bid_price] = bid_size
 
         if self._sim_latency <= 0:
             # No latency: switch immediately
@@ -553,10 +568,14 @@ class DryRunEngine:
             sim._prev_by_price = {}
             return 0.0, consumed
         current: dict[float, float] = {}
-        for ask_price, ask_size in asks.items():
-            if ask_price > sim.price:
-                break
-            current[ask_price] = ask_size
+        if hasattr(asks, 'apply_snapshot_from_wire'):
+            for ask_price, ask_size in asks.irange(max_price=sim.price):
+                current[ask_price] = ask_size
+        else:
+            for ask_price, ask_size in asks.items():
+                if ask_price > sim.price:
+                    break
+                current[ask_price] = ask_size
         prev = sim._prev_by_price
         new_liq = 0.0
         for price, size in current.items():
@@ -587,10 +606,13 @@ class DryRunEngine:
             sim._prev_by_price = {}
             return 0.0, consumed
         current: dict[float, float] = {}
-        for bid_price in reversed(bids):
-            if bid_price < sim.price:
-                break
-            current[bid_price] = bids[bid_price]
+        if hasattr(bids, 'apply_snapshot_from_wire'):
+            for bid_price, bid_size in bids.irange(min_price=sim.price):
+                current[bid_price] = bid_size
+        else:
+            for bid_price, bid_size in bids.items():
+                if bid_price >= sim.price:
+                    current[bid_price] = bid_size
         prev = sim._prev_by_price
         new_liq = 0.0
         for price, size in current.items():

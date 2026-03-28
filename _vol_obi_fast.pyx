@@ -208,6 +208,143 @@ cdef class CBookSide:
         cdef int i
         return [self._sizes[i] for i in range(self._count)]
 
+    def irange(self, min_price=None, max_price=None, bint reverse=False):
+        """Return list of (price, size) tuples within the given price range.
+
+        Uses binary search to find the index bounds, then slices the
+        internal arrays.  O(log n) to locate bounds, O(k) to build the
+        result list of *k* qualifying levels.
+
+        Args:
+            min_price: Lower bound (inclusive). ``None`` means no lower bound.
+            max_price: Upper bound (inclusive). ``None`` means no upper bound.
+            reverse: If ``True``, results are in descending price order.
+        """
+        cdef int lo, hi, i
+        if min_price is not None:
+            lo = self._bisect_left(<double>min_price)
+        else:
+            lo = 0
+        if max_price is not None:
+            hi = self._bisect_right(<double>max_price)
+        else:
+            hi = self._count
+        if lo >= hi:
+            return []
+        if reverse:
+            return [(self._prices[i], self._sizes[i]) for i in range(hi - 1, lo - 1, -1)]
+        return [(self._prices[i], self._sizes[i]) for i in range(lo, hi)]
+
+    # -- Bulk wire-update methods (avoids per-level Python overhead) --
+
+    def apply_delta_from_wire(self, list levels):
+        """Apply a delta update from wire data.
+
+        Each item in *levels* is a dict with ``'price'`` and ``'size'``
+        string keys.  Calls the C-level ``_c_insert`` / ``_c_remove``
+        directly, avoiding per-level Python ``__setitem__`` / ``pop``
+        overhead.
+        """
+        cdef double price, size
+        for item in levels:
+            price = <double>float(item['price'])
+            size = <double>float(item['size'])
+            if size == 0.0:
+                self._c_remove(price)
+            else:
+                self._c_insert(price, size)
+
+    def apply_snapshot_from_wire(self, list levels):
+        """Apply a full snapshot from wire data.
+
+        Clears the book, parses all levels, sorts by price once, and
+        fills the internal arrays directly.  This avoids the repeated
+        binary-search + memmove that ``_c_insert`` would do for each
+        level during a large snapshot.
+        """
+        cdef int n, i, j
+        cdef double price, size
+
+        # Parse levels into a Python list of (price, size) tuples,
+        # filtering out zero-size entries.
+        parsed = []
+        for item in levels:
+            price = <double>float(item['price'])
+            size = <double>float(item['size'])
+            if size > 0.0:
+                parsed.append((price, size))
+
+        n = len(parsed)
+        if n == 0:
+            self._count = 0
+            return
+
+        # Sort by price ascending
+        parsed.sort()
+
+        # Ensure capacity for n entries.
+        # _ensure_capacity() only doubles when _count >= _capacity,
+        # so we must keep _count in sync after each resize.
+        self._count = self._capacity
+        while self._capacity < n:
+            self._ensure_capacity()
+            self._count = self._capacity
+        for i in range(n):
+            price = parsed[i][0]
+            size = parsed[i][1]
+            self._prices[i] = price
+            self._sizes[i] = size
+        self._count = n
+
+    # -- Binance-format bulk methods ([[price_str, qty_str], ...]) --
+
+    def apply_delta_from_binance(self, list levels):
+        """Apply delta from Binance format ``[[price_str, qty_str], ...]``.
+
+        Zero-qty entries remove the price level.
+        """
+        cdef double price, size
+        for item in levels:
+            price = <double>float(item[0])
+            size = <double>float(item[1])
+            if size == 0.0:
+                self._c_remove(price)
+            else:
+                self._c_insert(price, size)
+
+    def apply_snapshot_from_binance(self, list levels):
+        """Apply full snapshot from Binance format ``[[price_str, qty_str], ...]``.
+
+        Same sort-once/fill-direct approach as ``apply_snapshot_from_wire``.
+        """
+        cdef int n, i
+        cdef double price, size
+
+        parsed = []
+        for item in levels:
+            price = <double>float(item[0])
+            size = <double>float(item[1])
+            if size > 0.0:
+                parsed.append((price, size))
+
+        n = len(parsed)
+        if n == 0:
+            self._count = 0
+            return
+
+        parsed.sort()
+
+        self._count = self._capacity
+        while self._capacity < n:
+            self._ensure_capacity()
+            self._count = self._capacity
+        for i in range(n):
+            price = parsed[i][0]
+            size = parsed[i][1]
+            self._prices[i] = price
+            self._sizes[i] = size
+        self._count = n
+
 
 # ---------------------------------------------------------------------------
 # RollingStats — O(1) ring-buffer statistics (C-level)
