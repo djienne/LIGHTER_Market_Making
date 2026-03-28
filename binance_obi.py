@@ -523,8 +523,8 @@ class BinanceDiffDepthClient:
         upper = mid * (1.0 + self._looking_depth)
 
         if _HAS_CBOOKSIDE:
-            sum_bid = sum(size for _, size in self._bids.irange(min_price=lower))
-            sum_ask = sum(size for _, size in self._asks.irange(max_price=upper))
+            sum_bid = self._bids.sum_sizes_from(lower)
+            sum_ask = self._asks.sum_sizes_to(upper)
         else:
             # SortedDict fallback
             sum_bid = 0.0

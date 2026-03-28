@@ -23,7 +23,7 @@ pip install -r requirements.txt
 python setup_cython.py build_ext --inplace
 ```
 
-The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -march=native -ffast-math` for ~30x faster order book and spread computation. The bot works without it (pure-Python fallback) but the extension is strongly recommended for production.
+The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -march=native -ffast-math` for ~30x faster order book and spread computation. **Cython is required** — the bot will refuse to start without it. Set `ALLOW_PYTHON_FALLBACK=1` to bypass for dev/test only.
 
 ### Configuration
 
@@ -49,13 +49,15 @@ Always use `-u` for unbuffered log output. Logs are written to stdout and `logs/
 
 ```
 market_maker_v2.py       Main market-making loop
+dry_run.py               Paper-trading fill simulation engine
 vol_obi.py               VolObiCalculator + RollingStats spread model
 _vol_obi_fast.pyx        Cython extension (RollingStats, VolObiCalculator, CBookSide)
 setup_cython.py          Build script for the Cython extension
 binance_obi.py           Binance Futures OBI alpha signal
 orderbook.py             Local order book update logic
 orderbook_sanity.py      WS vs REST book cross-check
-ws_manager.py            WebSocket subscription manager
+ws_manager.py            WebSocket subscription manager (ws_subscribe + ws_subscribe_fast)
+trade_log.py             Buffered CSV trade logger
 utils.py                 Shared helpers (config loading, Parquet I/O)
 logging_config.py        Centralized logging setup
 adjust_leverage.py       CLI tool to set leverage/margin mode
@@ -88,6 +90,11 @@ When quota drops below threshold, the bot can execute small IOC market orders vi
 
 ### Dynamic Position Limit
 The maximum position size is computed dynamically each loop iteration from live account data: `(available_capital * leverage - 2 * order_value) * 0.9`. When position value reaches this limit, the side that would increase exposure is suppressed (buy orders suppressed when long at limit, sell orders suppressed when short at limit) and any existing orders on that side are canceled. The vol_obi skew normalization stays in sync with this dynamic limit.
+
+### Hot/Cold Path Separation
+- **Hot path** (market data): orderbook/ticker use `ws_subscribe_fast()` — a tight `await ws.recv()` loop with no per-message task overhead. Book mutation, mid calc, vol_obi update, and quote diff run synchronously. Base amount and max position are precomputed on capital/mid change events, not per tick.
+- **Cold path** (control plane): account data, reconciliation, REST calls, telemetry, trade logging all run on separate WS channels or background tasks. Trade sort/dedup/log is deferred via `call_soon` to avoid blocking market data ingestion.
+- **Order state ownership**: all order mutations go through a deferred event queue (`_order_event_queue`). WS handlers and the reconciler push events; `OrderManager.drain_events()` is the sole writer, called at defined points in the hot loop.
 
 ### Safety Controls
 - **Orderbook sanity**: periodic REST snapshots cross-checked against WS book
