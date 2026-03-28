@@ -20,6 +20,7 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
                 current_ask_size=0.1,
             ):
                 ok, unknown_ids = mm._reconcile_local_orders_with_remote_orders([], source="unit")
+                mm.order_manager.drain_events()
                 self.assertFalse(ok)
                 self.assertIsNone(mm.current_bid_order_id)
                 self.assertIsNone(mm.current_ask_order_id)
@@ -174,7 +175,7 @@ class TestSafetyControls(unittest.IsolatedAsyncioTestCase):
             batch_calls.append(ops)
 
         async def _clear_on_reconcile(*a, **kw):
-            mm.order_manager.clear_all()
+            mm.order_manager._clear_all()
             return True
 
         async def _mock_wait_for_write(op_count=4, cancel_only=False):

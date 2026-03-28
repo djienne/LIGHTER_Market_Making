@@ -742,3 +742,31 @@ cdef class VolObiCalculator:
     def set_max_position_dollar(self, double value):
         """Update the max position dollar limit at runtime."""
         self._max_position_dollar = value if value > 0.0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Standalone helpers exposed to Python for hot-path arithmetic
+# ---------------------------------------------------------------------------
+
+cpdef double price_change_bps_fast(double old_price, double new_price):
+    """Return price change in basis points.  Zero-safe."""
+    if old_price <= 0.0:
+        return 1e18  # inf sentinel
+    cdef double diff = new_price - old_price
+    if diff < 0.0:
+        diff = -diff
+    return diff / old_price * 10000.0
+
+
+cpdef double dynamic_max_position_fast(double mid, double capital,
+                                        int leverage, double base_amount,
+                                        int num_levels):
+    """Pure-arithmetic max-position computation (no Python objects)."""
+    if capital <= 0.0 or mid <= 0.0:
+        return 0.0
+    cdef double raw = capital * leverage
+    if base_amount > 0.0:
+        raw -= 2.0 * num_levels * base_amount * mid
+    if raw < 0.0:
+        return 0.0
+    return raw * 0.9

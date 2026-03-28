@@ -77,10 +77,16 @@ Reference note for later implementation work. This is a short summary of the off
   - `result: null`
   - same `id`
 
-## Integration implication for this repo
+## Current implementation (binance_obi.py)
 
-- Best top-of-book latency should come from `@bookTicker`
-- Depth-based imbalance or depth-aware alpha should stay on a depth stream unless the signal definition changes
-- A practical design is:
-  - `@bookTicker` for freshest Binance best bid / ask and micro-mid
-  - existing depth stream only for alpha / depth-derived features
+Two independent feeds, each with its own shared state object:
+
+- **`BinanceBookTickerClient`** connects to `@bookTicker`, publishes `SharedBBO` (best bid/ask, quantities, mid, update ID, timestamps)
+- **`BinanceDiffDepthClient`** connects to `@depth@100ms` with REST snapshot sync (`/fapi/v1/depth?limit=1000`), maintains a local Binance order book (CBookSide), computes depth-derived imbalance alpha, publishes `SharedAlpha`
+
+Ownership:
+- bookTicker owns: Binance best bid/ask, quantities, mid, BBO staleness
+- Diff depth owns: local Binance book, sequence state, depth-derived imbalance alpha
+- The trading loop reads both independently via `state.binance_bbo` and `state.binance_alpha`
+
+The old `@depth20@100ms` partial-depth approach has been removed.
