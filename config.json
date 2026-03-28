@@ -27,7 +27,10 @@
             "stale_seconds": 5.0,
             "window_size": 6000,
             "min_samples": 150,
-            "looking_depth": 0.025
+            "looking_depth": 0.025,
+            "bbo_min_samples": 10,
+            "bbo_stale_seconds": 5.0,
+            "depth_snapshot_limit": 1000
         }
     },
     "performance": {

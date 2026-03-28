@@ -41,7 +41,7 @@ class TestSpreadModeIntegration(unittest.TestCase):
         with temp_mm_attrs(
             vol_obi_calc=calc,
         ):
-            levels = mm.calculate_order_prices(3000.0, position_size=0.0)
+            levels = mm.calculate_order_prices(3000.0, position_size=0.0, max_pos_usd=1e9)
             buy, sell = levels[0]
             self.assertIsNotNone(buy)
             self.assertIsNotNone(sell)
@@ -90,7 +90,7 @@ class TestSpreadModeIntegration(unittest.TestCase):
 
         # Get baseline quote with Lighter OBI alpha
         with temp_mm_attrs(vol_obi_calc=calc):
-            levels_base = mm.calculate_order_prices(3000.0, position_size=0.0)
+            levels_base = mm.calculate_order_prices(3000.0, position_size=0.0, max_pos_usd=1e9)
             buy_base, sell_base = levels_base[0]
 
         # Now inject a strong positive alpha (bid-heavy -> shift fair price up)
@@ -100,7 +100,7 @@ class TestSpreadModeIntegration(unittest.TestCase):
         asks = SortedDict({3000.05: 1.0})
         calc.on_book_update(3000.0, bids, asks)
         with temp_mm_attrs(vol_obi_calc=calc):
-            levels_override = mm.calculate_order_prices(3000.0, position_size=0.0)
+            levels_override = mm.calculate_order_prices(3000.0, position_size=0.0, max_pos_usd=1e9)
             buy_override, sell_override = levels_override[0]
 
         # With positive alpha the fair price is higher, so bids/asks shift up
@@ -116,7 +116,7 @@ class TestSpreadModeIntegration(unittest.TestCase):
         self.assertTrue(calc.warmed_up)
 
         with temp_mm_attrs(vol_obi_calc=calc):
-            levels = mm.calculate_order_prices(3000.0, position_size=0.0)
+            levels = mm.calculate_order_prices(3000.0, position_size=0.0, max_pos_usd=1e9)
             buy, sell = levels[0]
             self.assertIsNotNone(buy)
             self.assertIsNotNone(sell)

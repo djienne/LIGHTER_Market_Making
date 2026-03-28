@@ -331,3 +331,7 @@ try:
     from _vol_obi_fast import RollingStats, VolObiCalculator, CBookSide  # noqa: F811
 except ImportError:
     from sortedcontainers import SortedDict as CBookSide  # noqa: F811
+    logger.warning(
+        "Cython VolObiCalculator not available — using pure-Python fallback. "
+        "Build with: python setup_cython.py build_ext --inplace"
+    )

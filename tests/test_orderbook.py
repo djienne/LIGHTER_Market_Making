@@ -93,5 +93,88 @@ class TestApplyOrderbookUpdate(unittest.TestCase):
         self.assertEqual(asks.peekitem(0), (101.0, 3.0))
 
 
+class TestApplyOrderbookUpdateCBookSide(unittest.TestCase):
+    """Same tests as above but with CBookSide containers.
+
+    Exercises the real production code path: apply_orderbook_update()
+    called with CBookSide instances (Cython sorted arrays).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from _vol_obi_fast import CBookSide
+        cls.CBookSide = CBookSide
+
+    def _make(self):
+        return self.CBookSide(), self.CBookSide()
+
+    def test_snapshot_on_uninitialized(self):
+        bids, asks = self._make()
+        bids_in = [{"price": "100", "size": "1"}, {"price": "99", "size": "2"}]
+        asks_in = [{"price": "101", "size": "3"}]
+
+        is_snapshot = apply_orderbook_update(bids, asks, False, bids_in, asks_in)
+
+        self.assertTrue(is_snapshot)
+        self.assertEqual(bids[100.0], 1.0)
+        self.assertEqual(bids[99.0], 2.0)
+        self.assertEqual(asks[101.0], 3.0)
+        self.assertEqual(bids.peekitem(-1), (100.0, 1.0))
+
+    def test_delta_update(self):
+        bids, asks = self.CBookSide({100.0: 1.0, 99.0: 2.0}), self.CBookSide({101.0: 3.0})
+        bids_in = [{"price": "100", "size": "5"}, {"price": "98", "size": "1"}]
+        asks_in = [{"price": "102", "size": "2"}]
+
+        is_snapshot = apply_orderbook_update(bids, asks, True, bids_in, asks_in)
+
+        self.assertFalse(is_snapshot)
+        self.assertEqual(bids[100.0], 5.0)
+        self.assertEqual(bids[99.0], 2.0)
+        self.assertEqual(bids[98.0], 1.0)
+        self.assertEqual(asks[101.0], 3.0)
+        self.assertEqual(asks[102.0], 2.0)
+
+    def test_zero_size_removes_level(self):
+        bids = self.CBookSide({100.0: 1.0, 99.0: 2.0})
+        asks = self.CBookSide({101.0: 3.0, 102.0: 4.0})
+        bids_in = [{"price": "99", "size": "0"}]
+        asks_in = [{"price": "102", "size": "0"}]
+
+        is_snapshot = apply_orderbook_update(bids, asks, True, bids_in, asks_in)
+
+        self.assertFalse(is_snapshot)
+        self.assertNotIn(99.0, bids)
+        self.assertEqual(bids[100.0], 1.0)
+        self.assertNotIn(102.0, asks)
+        self.assertEqual(asks[101.0], 3.0)
+
+    def test_snapshot_ignores_zero_size(self):
+        bids, asks = self._make()
+        bids_in = [{"price": "100", "size": "1"}, {"price": "99", "size": "0"}]
+        asks_in = [{"price": "101", "size": "0"}]
+
+        is_snapshot = apply_orderbook_update(bids, asks, False, bids_in, asks_in)
+
+        self.assertTrue(is_snapshot)
+        self.assertEqual(len(bids), 1)
+        self.assertEqual(bids[100.0], 1.0)
+        self.assertEqual(len(asks), 0)
+
+    def test_snapshot_clears_old_entries(self):
+        bids = self.CBookSide({999.0: 1.0})
+        asks = self.CBookSide({150.0: 1.0})
+        bids_in = [{"price": str(i), "size": "1"} for i in range(101)]
+        asks_in = [{"price": "200", "size": "5"}]
+
+        is_snapshot = apply_orderbook_update(bids, asks, True, bids_in, asks_in)
+
+        self.assertTrue(is_snapshot)
+        self.assertNotIn(999.0, bids)
+        self.assertNotIn(150.0, asks)
+        self.assertEqual(len(bids), 101)
+        self.assertEqual(asks[200.0], 5.0)
+
+
 if __name__ == "__main__":
     unittest.main()
