@@ -51,6 +51,11 @@ def temp_mm_attrs(**overrides):
     saved_id_mapping = dict(mm._client_to_exchange_id)
     mm._client_to_exchange_id.clear()
     mm._order_event_queue.clear()
+    mm._latest_reconcile_event = None
+    mm._reconcile_pending_event.clear()
+    mm._pending_trades.clear()
+    mm._pending_trades_scheduled = False
+    mm._pending_dry_run_fill_check = False
     # Save/restore local_order_book by replacing with a fresh empty book on teardown.
     # Cannot deepcopy because CBookSide (Cython) doesn't support __reduce__.
     saved_ob = mm.state.market.local_order_book
@@ -81,6 +86,11 @@ def temp_mm_attrs(**overrides):
         mm._client_to_exchange_id.clear()
         mm._client_to_exchange_id.update(saved_id_mapping)
         mm._order_event_queue.clear()
+        mm._latest_reconcile_event = None
+        mm._reconcile_pending_event.clear()
+        mm._pending_trades.clear()
+        mm._pending_trades_scheduled = False
+        mm._pending_dry_run_fill_check = False
         # Restore original if it was replaced, or reset to fresh empty book
         # if tests mutated the object in-place.
         if 'local_order_book' in overrides:

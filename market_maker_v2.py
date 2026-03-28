@@ -307,6 +307,7 @@ ws_reconnect_event = asyncio.Event()
 ws_client = None
 ws_task = None
 stale_order_task = None
+order_state_task = None
 _send_task: Optional[asyncio.Task] = None  # background paced-send task
 _latest_ops: Optional[list] = None         # mailbox: latest computed ops (live-mode only)
 
@@ -319,6 +320,7 @@ _WS_AUTH_TOKEN_TTL = int(os.getenv(
     _ws.get("auth_token_ttl", 9 * 60)))   # seconds — refresh before 10-min server-side expiry
 _account_orders_ws_ready = False
 _account_orders_ws_connected = asyncio.Event()
+_reconcile_pending_event = asyncio.Event()
 RECONCILER_SLOW_INTERVAL_SEC = 60.0
 
 # WS-based cancel confirmation: order_id -> asyncio.Event
@@ -379,7 +381,20 @@ class OrderEvent:
 
 
 _order_event_queue: deque = deque()
+_latest_reconcile_event: Optional[OrderEvent] = None
 _pending_trades: deque = deque()  # raw trade batches deferred from WS callback
+_pending_trades_scheduled = False
+_pending_dry_run_fill_check = False
+
+
+def _enqueue_order_event(event: OrderEvent) -> None:
+    """Route hot slot updates to the queue and reconcile snapshots to latest-only storage."""
+    global _latest_reconcile_event
+    if event.event_type == OrderEventType.RECONCILE:
+        _latest_reconcile_event = event
+        _reconcile_pending_event.set()
+        return
+    _order_event_queue.append(event)
 
 
 @dataclass
@@ -593,9 +608,8 @@ class OrderManager:
 
     # -- Event queue: single-owner drain (the only public mutation API) --
 
-    def drain_events(self) -> None:
-        """Process all pending order events.  Called at well-defined points in
-        the hot loop so that order state is consistent during collect/send."""
+    def drain_hot_events(self) -> None:
+        """Process only hot order-slot mutations needed by quote/send decisions."""
         while _order_event_queue:
             evt = _order_event_queue.popleft()
             if evt.event_type == OrderEventType.BIND_LIVE:
@@ -604,8 +618,25 @@ class OrderManager:
                 self._clear_live(evt.side, level=evt.level)
             elif evt.event_type == OrderEventType.CLEAR_ALL:
                 self._clear_all()
-            elif evt.event_type == OrderEventType.RECONCILE:
-                self._process_reconcile(evt.remote_orders, evt.source)
+
+    def drain_reconcile_events(self) -> bool:
+        """Process the latest pending reconcile snapshot, if any."""
+        global _latest_reconcile_event
+        evt = _latest_reconcile_event
+        if evt is None:
+            _reconcile_pending_event.clear()
+            return False
+        _latest_reconcile_event = None
+        self._process_reconcile(evt.remote_orders, evt.source)
+        if _latest_reconcile_event is None:
+            _reconcile_pending_event.clear()
+        return True
+
+    def drain_events(self) -> None:
+        """Process all pending order events for compatibility with tests/cold paths."""
+        self.drain_hot_events()
+        while self.drain_reconcile_events():
+            self.drain_hot_events()
 
     def _process_reconcile(self, remote_orders: list, source: str) -> None:
         """Apply a full reconcile snapshot atomically (clear stale + refresh)."""
@@ -1184,7 +1215,7 @@ def _sync_tracked_order_from_remote(side: str, level: int, order: dict) -> None:
     if price is None or size is None:
         order_manager.mark_status(side, SideStatus.LIVE, level=level)
         return
-    _order_event_queue.append(OrderEvent(
+    _enqueue_order_event(OrderEvent(
         event_type=OrderEventType.BIND_LIVE,
         side=side, level=level,
         order_id=cid, price=price, size=size,
@@ -1282,9 +1313,9 @@ def _reconcile_local_orders_with_remote_orders(
 ) -> tuple[bool, set[int]]:
     """Reconcile local order IDs/price/size against exchange open-order snapshot.
 
-    Enqueues a RECONCILE event for deferred processing by drain_events().
+    Stores a coalesced RECONCILE snapshot for deferred cold-path processing.
     Returns ``(ok, unknown_exchange_ids)`` computed against *projected* state
-    (what state will look like after drain).
+    (what state will look like after reconcile is applied).
     """
     # Populate the client_order_index -> order_index mapping (no order-state mutation)
     _update_id_mapping_from_orders(remote_orders)
@@ -1318,8 +1349,9 @@ def _reconcile_local_orders_with_remote_orders(
             else:
                 projected_tracked.add(ask_id)
 
-    # Enqueue reconcile event — actual clear/refresh happens in drain_events()
-    _order_event_queue.append(OrderEvent(
+    # Coalesce reconcile snapshots — actual clear/refresh happens in the
+    # cold reconcile task (or drain_events() in tests/cold paths).
+    _enqueue_order_event(OrderEvent(
         event_type=OrderEventType.RECONCILE,
         remote_orders=remote_orders,
         source=source,
@@ -1454,6 +1486,7 @@ async def stale_order_reconciler_loop(client, market_id: int, account_id: int) -
 
 def on_order_book_update(market_id, payload):
     ob = state.market.local_order_book
+    global _pending_dry_run_fill_check
     try:
         if market_id == state.config.market_id:
             bids_in = payload.get('bids', [])
@@ -1499,7 +1532,8 @@ def on_order_book_update(market_id, payload):
                         calc.set_alpha_override(None)
                     calc.on_book_update(mid, ob['bids'], ob['asks'])
 
-                if _dry_run_engine is not None:
+                if _dry_run_engine is not None and not _pending_dry_run_fill_check:
+                    _pending_dry_run_fill_check = True
                     asyncio.get_event_loop().call_soon(_deferred_check_fills)
 
                 order_book_received.set()
@@ -1645,6 +1679,7 @@ async def subscribe_to_user_stats(account_id):
     )
 
 def on_account_all_update(account_id, data):
+    global _pending_trades_scheduled
     try:
         if account_id == ACCOUNT_INDEX:
             positions_updated = False
@@ -1679,7 +1714,9 @@ def on_account_all_update(account_id, data):
             new_trades_by_market = data.get("trades", {}) if isinstance(data, dict) else {}
             if new_trades_by_market:
                 _pending_trades.append(new_trades_by_market)
-                asyncio.get_event_loop().call_soon(_process_pending_trades)
+                if not _pending_trades_scheduled:
+                    _pending_trades_scheduled = True
+                    asyncio.get_event_loop().call_soon(_process_pending_trades)
 
             if positions_updated and not account_all_received.is_set():
                 account_all_received.set()
@@ -1690,38 +1727,49 @@ def on_account_all_update(account_id, data):
 
 def _process_pending_trades() -> None:
     """Drain deferred trade batches — sort, dedup, log.  Runs via call_soon."""
-    while _pending_trades:
-        new_trades_by_market = _pending_trades.popleft()
-        all_new_trades = [trade for trades in new_trades_by_market.values() for trade in trades]
-        all_new_trades.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-        for trade in reversed(all_new_trades):
-            if trade not in state.account.recent_trades:
-                state.account.recent_trades.append(trade)
-                logger.info(
-                    f"WebSocket trade update: Market {trade.get('market_id')}, "
-                    f"Type {trade.get('type')}, Size {trade.get('size')}, "
-                    f"Price {trade.get('price')}"
-                )
-                if _trade_logger is not None and _dry_run_engine is None:
-                    _trade_logger.log_fill(
-                        side=str(trade.get("type", "")),
-                        price=float(trade.get("price", 0)),
-                        size=float(trade.get("size", 0)),
-                        level=0,
-                        position_after=state.account.position_size,
-                        realized_pnl=0.0,
-                        available_capital=state.account.available_capital or 0.0,
-                        portfolio_value=state.account.portfolio_value or 0.0,
-                        simulated=False,
+    global _pending_trades_scheduled
+    try:
+        while _pending_trades:
+            new_trades_by_market = _pending_trades.popleft()
+            all_new_trades = [trade for trades in new_trades_by_market.values() for trade in trades]
+            all_new_trades.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+            for trade in reversed(all_new_trades):
+                if trade not in state.account.recent_trades:
+                    state.account.recent_trades.append(trade)
+                    logger.info(
+                        f"WebSocket trade update: Market {trade.get('market_id')}, "
+                        f"Type {trade.get('type')}, Size {trade.get('size')}, "
+                        f"Price {trade.get('price')}"
                     )
+                    if _trade_logger is not None and _dry_run_engine is None:
+                        _trade_logger.log_fill(
+                            side=str(trade.get("type", "")),
+                            price=float(trade.get("price", 0)),
+                            size=float(trade.get("size", 0)),
+                            level=0,
+                            position_after=state.account.position_size,
+                            realized_pnl=0.0,
+                            available_capital=state.account.available_capital or 0.0,
+                            portfolio_value=state.account.portfolio_value or 0.0,
+                            simulated=False,
+                        )
+    finally:
+        _pending_trades_scheduled = False
+        if _pending_trades:
+            _pending_trades_scheduled = True
+            asyncio.get_event_loop().call_soon(_process_pending_trades)
 
 
 def _deferred_check_fills() -> None:
     """Run dry-run fill simulation deferred from the WS callback via call_soon."""
-    if _dry_run_engine is not None:
-        ob = state.market.local_order_book
-        if ob['bids'] and ob['asks']:
-            _dry_run_engine.check_fills(ob['bids'], ob['asks'])
+    global _pending_dry_run_fill_check
+    try:
+        if _dry_run_engine is not None:
+            ob = state.market.local_order_book
+            if ob['bids'] and ob['asks']:
+                _dry_run_engine.check_fills(ob['bids'], ob['asks'])
+    finally:
+        _pending_dry_run_fill_check = False
 
 
 async def subscribe_to_account_all(account_id):
@@ -1823,13 +1871,13 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
                 for lvl in range(NUM_LEVELS):
                     if orders.bid_order_ids[lvl] == cid:
                         logger.info("Bid[%d] %d status=%s — enqueue clear", lvl, cid, status)
-                        _order_event_queue.append(OrderEvent(
+                        _enqueue_order_event(OrderEvent(
                             event_type=OrderEventType.CLEAR_LIVE,
                             side="buy", level=lvl,
                         ))
                     if orders.ask_order_ids[lvl] == cid:
                         logger.info("Ask[%d] %d status=%s — enqueue clear", lvl, cid, status)
-                        _order_event_queue.append(OrderEvent(
+                        _enqueue_order_event(OrderEvent(
                             event_type=OrderEventType.CLEAR_LIVE,
                             side="sell", level=lvl,
                         ))
@@ -2291,7 +2339,7 @@ async def _pause_cleanup_task(client) -> None:
                 for side_name in ("buy", "sell"):
                     lc = order_manager.lifecycle(side_name, lvl)
                     if lc.status == SideStatus.PLACING:
-                        _order_event_queue.append(OrderEvent(
+                        _enqueue_order_event(OrderEvent(
                             event_type=OrderEventType.CLEAR_LIVE,
                             side=side_name, level=lvl,
                         ))
@@ -2380,7 +2428,7 @@ async def order_lifecycle_watchdog_loop(interval=None, placing_timeout=None) -> 
                         "Order %s[%d] stuck in PLACING for %.0fs — clearing stale slot",
                         side, level, age,
                     )
-                    _order_event_queue.append(OrderEvent(
+                    _enqueue_order_event(OrderEvent(
                         event_type=OrderEventType.CLEAR_LIVE,
                         side=side, level=level,
                     ))
@@ -2787,7 +2835,7 @@ async def _send_single_op_rest(client, tx_type: int, tx_info, op) -> bool:
         )
         _record_order_success()
         if op.action != "cancel":
-            _order_event_queue.append(OrderEvent(
+            _enqueue_order_event(OrderEvent(
                 event_type=OrderEventType.BIND_LIVE,
                 side=op.side, level=op.level,
                 order_id=op.order_id, price=op.price, size=op.size,
@@ -3042,7 +3090,7 @@ async def sign_and_send_batch(client, ops: list):
         _record_order_success()
         for op in signed_ops:
             if op.action != "cancel":
-                _order_event_queue.append(OrderEvent(
+                _enqueue_order_event(OrderEvent(
                     event_type=OrderEventType.BIND_LIVE,
                     side=op.side, level=op.level,
                     order_id=op.order_id, price=op.price, size=op.size,
@@ -3138,6 +3186,21 @@ async def _paced_send(client, ops: list) -> None:
         logger.error("Paced send failed: %s", exc, exc_info=True)
 
 
+async def order_state_reconcile_loop() -> None:
+    """Cold-path task: apply coalesced reconcile snapshots outside the quote lane."""
+    while True:
+        try:
+            await _reconcile_pending_event.wait()
+            await asyncio.sleep(0)
+            while order_manager.drain_reconcile_events():
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Order-state reconcile task failed: %s", exc, exc_info=True)
+            await asyncio.sleep(1.0)
+
+
 async def market_making_loop(client):
     global _pause_cleanup_running, _send_task, _latest_ops, _book_seq
     logger.info("Starting 2-sided market making loop...")
@@ -3179,8 +3242,7 @@ async def market_making_loop(client):
                 _calc = state.vol_obi_state.calculator
                 vol_ready = (_calc is not None and _calc.warmed_up)
                 ba = state.binance_alpha
-                bb = state.binance_bbo
-                binance_ready = (ba is None or ba.warmed_up) and (bb is None or bb.warmed_up)
+                binance_ready = (ba is None or ba.warmed_up)
                 # Refresh capital timestamp — data is valid (no trading during warmup)
                 if state.account.available_capital is not None:
                     state.account.last_capital_update = time.monotonic()
@@ -3223,9 +3285,9 @@ async def market_making_loop(client):
                     pass
             _last_seen_seq = _book_seq
 
-            # Process deferred order-state mutations (WS fills, reconciler,
-            # send confirmations) so reads below see consistent state.
-            order_manager.drain_events()
+            # Process only hot slot mutations here. Reconcile snapshots are
+            # coalesced and handled by the cold reconcile task.
+            order_manager.drain_hot_events()
 
             # Snapshot volatile state into locals for speed and consistency
             snap_mid = state.market.mid_price
@@ -3511,7 +3573,15 @@ async def periodic_orderbook_sanity_check(interval=None, tolerance_pct=None):
 # === COLD PATH ===
 
 async def main():
-    global ws_task, stale_order_task, _dry_run_engine, _trade_logger
+    global ws_task, stale_order_task, order_state_task, _dry_run_engine, _trade_logger
+    global _latest_reconcile_event, _pending_trades_scheduled, _pending_dry_run_fill_check
+
+    _order_event_queue.clear()
+    _pending_trades.clear()
+    _latest_reconcile_event = None
+    _reconcile_pending_event.clear()
+    _pending_trades_scheduled = False
+    _pending_dry_run_fill_check = False
 
     if DRY_RUN:
         logger.info("🚀 === Market Maker v2 Starting — DRY-RUN MODE (no exchange writes) ===")
@@ -3668,6 +3738,7 @@ async def main():
     # Start WebSocket Tasks
     ws_task = asyncio.create_task(subscribe_to_market_data(state.config.market_id))
     ticker_task = asyncio.create_task(subscribe_to_ticker(state.config.market_id))
+    order_state_task = asyncio.create_task(order_state_reconcile_loop())
     logger.info("✅ ticker WS subscription started for market %d", state.config.market_id)
 
     user_stats_task = None
@@ -3869,6 +3940,8 @@ async def main():
             tasks_to_cancel.append(lifecycle_watchdog_task)
         if 'quote_telemetry_task' in locals():
             tasks_to_cancel.append(quote_telemetry_task)
+        if order_state_task is not None:
+            tasks_to_cancel.append(order_state_task)
         if 'ticker_task' in locals():
             tasks_to_cancel.append(ticker_task)
         if 'ws_task' in locals():
