@@ -212,6 +212,9 @@ class TestReconciliationDuringRefresh(unittest.IsolatedAsyncioTestCase):
                     {"orders": {"1": [{"order_index": 8888, "client_order_index": 100, "status": "filled"}]}}
                 )
 
+                # Mutations are deferred — drain the event queue
+                mm.order_manager.drain_events()
+
                 # Bid should now be cleared (filled)
                 self.assertIsNone(mm.current_bid_order_id)
                 # Ask should still be present (not mentioned in incremental)
@@ -248,6 +251,9 @@ class TestReconciliationDuringRefresh(unittest.IsolatedAsyncioTestCase):
                     mm.ACCOUNT_INDEX, 1,
                     {"orders": {"1": [{"order_index": 9999, "client_order_index": 200, "status": "open"}]}}
                 )
+
+                # Mutations are deferred — drain the event queue
+                mm.order_manager.drain_events()
 
                 # Bid absent from snapshot → cleared
                 self.assertIsNone(mm.current_bid_order_id)

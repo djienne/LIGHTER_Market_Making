@@ -325,7 +325,7 @@ class DryRunEngine:
 
         self._live_orders[op.order_id] = sim
         self._id_map[op.order_id] = eid
-        self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
+        self._om._bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
 
         self._log.info(
             "DRY-RUN CREATE %s L%d: %.6f @ $%.2f  (cid=%d eid=%d)",
@@ -403,7 +403,7 @@ class DryRunEngine:
             sim._pending_size = None
             sim._pending_prev_by_price = None
             # Sync state.orders to new price immediately
-            self._om.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
+            self._om._bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
         else:
             # Latency > 0: old price stays fillable while modify is in-flight.
             # Store new price as pending; promoted in check_fills when eligible.
@@ -425,7 +425,7 @@ class DryRunEngine:
     def _handle_cancel(self, op) -> None:
         sim = self._live_orders.get(op.order_id)
         if sim is None:
-            self._om.clear_live(op.side, op.level)
+            self._om._clear_live(op.side, op.level)
             self._log.debug("DRY-RUN CANCEL: cid=%d already gone", op.order_id)
             return
         # Order stays fillable during the cancel latency window
@@ -480,7 +480,7 @@ class DryRunEngine:
                     sim._pending_price = None
                     sim._pending_size = None
                     sim._pending_prev_by_price = None
-                    self._om.bind_live(sim.side, sim.client_order_id,
+                    self._om._bind_live(sim.side, sim.client_order_id,
                                        sim.price, sim.size, level=sim.level)
                     if self._rejection_cb is not None:
                         self._rejection_cb("dry_run:modify_arrival_reject")
@@ -492,7 +492,7 @@ class DryRunEngine:
                     sim._pending_price = None
                     sim._pending_size = None
                     sim._pending_prev_by_price = None
-                    self._om.bind_live(sim.side, sim.client_order_id,
+                    self._om._bind_live(sim.side, sim.client_order_id,
                                        sim.price, sim.size, level=sim.level)
 
         # PASS 2: Sort by (now-final) price priority, then check fills.
@@ -505,7 +505,7 @@ class DryRunEngine:
                 # Pure create in-flight: not fillable yet
                 if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
                     self._live_orders.pop(sim.client_order_id, None)
-                    self._om.clear_live(sim.side, sim.level)
+                    self._om._clear_live(sim.side, sim.level)
                 continue
 
             # POST_ONLY recheck at simulated arrival time (for creates)
@@ -519,7 +519,7 @@ class DryRunEngine:
                             sim.side.upper(), sim.level, sim.price,
                         )
                         self._live_orders.pop(sim.client_order_id, None)
-                        self._om.clear_live(sim.side, sim.level)
+                        self._om._clear_live(sim.side, sim.level)
                         if self._rejection_cb is not None:
                             self._rejection_cb("dry_run:create_arrival_reject")
                         continue
@@ -531,7 +531,7 @@ class DryRunEngine:
                             sim.side.upper(), sim.level, sim.price,
                         )
                         self._live_orders.pop(sim.client_order_id, None)
-                        self._om.clear_live(sim.side, sim.level)
+                        self._om._clear_live(sim.side, sim.level)
                         if self._rejection_cb is not None:
                             self._rejection_cb("dry_run:create_arrival_reject")
                         continue
@@ -549,7 +549,7 @@ class DryRunEngine:
             # THEN process matured cancel (after fill opportunity)
             if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
                 self._live_orders.pop(sim.client_order_id, None)
-                self._om.clear_live(sim.side, sim.level)
+                self._om._clear_live(sim.side, sim.level)
 
     def _check_buy_fill(self, sim: SimulatedOrder, asks, consumed: float) -> tuple[float, float]:
         """Return (fillable_size, updated_consumed) for a buy limit order.
@@ -689,10 +689,10 @@ class DryRunEngine:
         # Update order state
         if fully_filled:
             self._live_orders.pop(sim.client_order_id, None)
-            self._om.clear_live(sim.side, sim.level)
+            self._om._clear_live(sim.side, sim.level)
             label = "FILLED"
         else:
-            self._om.bind_live(sim.side, sim.client_order_id, sim.price, sim.size, level=sim.level)
+            self._om._bind_live(sim.side, sim.client_order_id, sim.price, sim.size, level=sim.level)
             label = "PARTIAL"
 
         self._log.info(

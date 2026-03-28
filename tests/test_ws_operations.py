@@ -335,7 +335,7 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.send_tx_batch_calls), 1)
 
     async def test_batch_cancel_ops_skip_bind_live(self):
-        """Cancel BatchOps don't call order_manager.bind_live."""
+        """Cancel BatchOps don't enqueue BIND_LIVE events."""
         client = DummyClient()
         cancel_op = _make_cancel_op()
 
@@ -343,9 +343,11 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
         ):
-            with patch.object(mm.order_manager, "bind_live", wraps=mm.order_manager.bind_live) as spy:
-                await mm.sign_and_send_batch(client, [cancel_op])
-                spy.assert_not_called()
+            mm._order_event_queue.clear()
+            await mm.sign_and_send_batch(client, [cancel_op])
+            bind_events = [e for e in mm._order_event_queue
+                           if e.event_type == mm.OrderEventType.BIND_LIVE]
+            self.assertEqual(len(bind_events), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +483,7 @@ class TestSanityCheckEdgeCases(unittest.IsolatedAsyncioTestCase):
             async def fake_sleep(secs, *a, **kw):
                 nonlocal call_count
                 call_count += 1
-                if call_count >= 2:
+                if call_count >= 3:  # 1=interval, 2=yield-after-REST, 3=next interval
                     raise asyncio.CancelledError
 
             rest_result = MagicMock()
@@ -682,11 +684,11 @@ class TestAccountOrdersCancelEvent(unittest.TestCase):
 class TestCollectOrderOperations(unittest.TestCase):
 
     def setUp(self):
-        mm.order_manager.clear_all()
+        mm.order_manager._clear_all()
         mm._client_to_exchange_id.clear()
 
     def tearDown(self):
-        mm.order_manager.clear_all()
+        mm.order_manager._clear_all()
         mm._client_to_exchange_id.clear()
 
     def test_collect_creates_for_empty_orders(self):
@@ -884,11 +886,11 @@ class TestCollectOrderOperations(unittest.TestCase):
 class TestOrderLifecycleWatchdog(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
-        mm.order_manager.clear_all()
+        mm.order_manager._clear_all()
         mm._client_to_exchange_id.clear()
 
     def tearDown(self):
-        mm.order_manager.clear_all()
+        mm.order_manager._clear_all()
         mm._client_to_exchange_id.clear()
 
     async def test_watchdog_clears_stale_placing_without_exchange_id(self):
@@ -915,6 +917,7 @@ class TestOrderLifecycleWatchdog(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(KeyboardInterrupt):
                         await mm.order_lifecycle_watchdog_loop(interval=0, placing_timeout=30.0)
 
+            mm.order_manager.drain_events()
             self.assertIsNone(mm.state.orders.bid_order_ids[0])
             self.assertEqual(mm.order_manager.lifecycle("buy", 0).status, mm.SideStatus.IDLE)
 
@@ -1065,6 +1068,7 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
                     }
                 ]}}
                 mm.on_account_orders_update(account_id=1, market_id=1, data=data)
+                mm.order_manager.drain_events()
 
                 # After snapshot: _account_orders_ws_ready should be True
                 self.assertTrue(mm._account_orders_ws_ready)
@@ -1106,6 +1110,7 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
                     {"client_order_index": 300, "order_index": 8888, "status": "filled"}
                 ]}}
                 mm.on_account_orders_update(account_id=1, market_id=1, data=data)
+                mm.order_manager.drain_events()
 
                 # Bid 300 was filled -> cleared
                 self.assertIsNone(mm.state.orders.bid_order_ids[0])
@@ -1148,6 +1153,7 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
                     }
                 ]}}
                 mm.on_account_orders_update(account_id=1, market_id=1, data=data)
+                mm.order_manager.drain_events()
 
                 self.assertEqual(mm.state.orders.bid_order_ids[0], 300)
                 self.assertAlmostEqual(mm.state.orders.bid_prices[0], 50.5)

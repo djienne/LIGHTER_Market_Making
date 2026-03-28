@@ -31,6 +31,12 @@ except ImportError:
         "Cython extension _vol_obi_fast not available — using pure-Python SortedDict. "
         "Build with: python setup_cython.py build_ext --inplace"
     )
+try:
+    from _vol_obi_fast import price_change_bps_fast as _price_change_bps_c
+    from _vol_obi_fast import dynamic_max_position_fast as _dynamic_max_position_c
+except ImportError:
+    _price_change_bps_c = None
+    _dynamic_max_position_c = None
 import websockets
 from utils import EPSILON, get_market_details_async, load_config_params
 from adjust_leverage import adjust_leverage
@@ -346,6 +352,28 @@ NUM_LEVELS = int(_trading.get("levels_per_side", 2))  # number of order levels p
 _SPREAD_FACTORS = [SPREAD_FACTOR_LEVEL1 ** lvl for lvl in range(max(NUM_LEVELS, 1))]
 
 
+class OrderEventType(str, Enum):
+    BIND_LIVE = "BIND_LIVE"
+    CLEAR_LIVE = "CLEAR_LIVE"
+    CLEAR_ALL = "CLEAR_ALL"
+    RECONCILE = "RECONCILE"
+
+
+@dataclass(slots=True)
+class OrderEvent:
+    event_type: OrderEventType
+    side: str = ""
+    level: int = 0
+    order_id: int = 0
+    price: float = 0.0
+    size: float = 0.0
+    remote_orders: list = field(default_factory=list)
+    source: str = ""
+
+
+_order_event_queue: deque = deque()
+
+
 @dataclass
 class OrderState:
     bid_order_ids: list = field(default_factory=lambda: [None] * NUM_LEVELS)
@@ -381,6 +409,9 @@ class AccountState:
     last_capital_update: float = 0.0  # monotonic timestamp of last capital update
     _cached_base_amount: Optional[float] = None
     _cached_base_amount_inputs: tuple = (None, None)
+    # Precomputed on capital/mid change — read-only in hot loop
+    precomputed_base_amount: Optional[float] = None
+    precomputed_max_pos_usd: float = 0.0
 
 
 @dataclass
@@ -522,7 +553,9 @@ class OrderManager:
         s.target_size = target_size
         s.updated_at = time.monotonic()
 
-    def bind_live(self, side: str, order_id: int, price: float, size: float, *, level: int = 0) -> None:
+    # -- Private: direct state mutation (called only by drain_events / dry_run) --
+
+    def _bind_live(self, side: str, order_id: int, price: float, size: float, *, level: int = 0) -> None:
         orders = state.orders
         if side == "buy":
             orders.bid_order_ids[level] = order_id
@@ -534,7 +567,7 @@ class OrderManager:
             orders.ask_sizes[level] = size
         self.mark_status(side, SideStatus.LIVE, level=level, target_price=price, target_size=size)
 
-    def clear_live(self, side: str, level: Optional[int] = None) -> None:
+    def _clear_live(self, side: str, level: Optional[int] = None) -> None:
         """Clear one level (if level given) or all levels for a side."""
         levels = range(NUM_LEVELS) if level is None else [level]
         orders = state.orders
@@ -549,9 +582,78 @@ class OrderManager:
                 orders.ask_sizes[lvl] = None
             self.mark_status(side, SideStatus.IDLE, level=lvl)
 
-    def clear_all(self) -> None:
-        self.clear_live("buy")
-        self.clear_live("sell")
+    def _clear_all(self) -> None:
+        self._clear_live("buy")
+        self._clear_live("sell")
+
+    # -- Event queue: single-owner drain (the only public mutation API) --
+
+    def drain_events(self) -> None:
+        """Process all pending order events.  Called at well-defined points in
+        the hot loop so that order state is consistent during collect/send."""
+        while _order_event_queue:
+            evt = _order_event_queue.popleft()
+            if evt.event_type == OrderEventType.BIND_LIVE:
+                self._bind_live(evt.side, evt.order_id, evt.price, evt.size, level=evt.level)
+            elif evt.event_type == OrderEventType.CLEAR_LIVE:
+                self._clear_live(evt.side, level=evt.level)
+            elif evt.event_type == OrderEventType.CLEAR_ALL:
+                self._clear_all()
+            elif evt.event_type == OrderEventType.RECONCILE:
+                self._process_reconcile(evt.remote_orders, evt.source)
+
+    def _process_reconcile(self, remote_orders: list, source: str) -> None:
+        """Apply a full reconcile snapshot atomically (clear stale + refresh)."""
+        _update_id_mapping_from_orders(remote_orders)
+        live_client_ids = _orders_to_live_client_id_set(remote_orders)
+        orders = state.orders
+        for lvl in range(NUM_LEVELS):
+            bid_id = orders.bid_order_ids[lvl]
+            if bid_id is not None and bid_id not in live_client_ids:
+                self._clear_live("buy", lvl)
+            ask_id = orders.ask_order_ids[lvl]
+            if ask_id is not None and ask_id not in live_client_ids:
+                self._clear_live("sell", lvl)
+        # Refresh price/size for tracked orders (direct, not enqueued)
+        remote_by_client: dict[int, dict] = {}
+        for order in remote_orders:
+            cid = _extract_client_order_index(order)
+            if cid is not None:
+                remote_by_client[cid] = order
+        for level in range(NUM_LEVELS):
+            bid_id = orders.bid_order_ids[level]
+            if bid_id is not None and bid_id in remote_by_client:
+                self._sync_from_remote("buy", level, remote_by_client[bid_id])
+            ask_id = orders.ask_order_ids[level]
+            if ask_id is not None and ask_id in remote_by_client:
+                self._sync_from_remote("sell", level, remote_by_client[ask_id])
+
+    def _sync_from_remote(self, side: str, level: int, order: dict) -> None:
+        """Direct bind from exchange data (used inside drain_events only)."""
+        cid = _extract_client_order_index(order)
+        if cid is None:
+            return
+        is_ask = _extract_order_is_ask(order)
+        if side == "buy" and is_ask is True:
+            return
+        if side == "sell" and is_ask is False:
+            return
+        if side == "buy":
+            current_price = state.orders.bid_prices[level]
+            current_size = state.orders.bid_sizes[level]
+        else:
+            current_price = state.orders.ask_prices[level]
+            current_size = state.orders.ask_sizes[level]
+        price = _extract_order_price(order)
+        size = _extract_order_size(order)
+        if price is None:
+            price = current_price
+        if size is None:
+            size = current_size
+        if price is None or size is None:
+            self.mark_status(side, SideStatus.LIVE, level=level)
+            return
+        self._bind_live(side, cid, price, size, level=level)
 
 
 class RiskController:
@@ -697,6 +799,8 @@ def next_client_order_index() -> int:
 def price_change_bps(old_price: Optional[float], new_price: Optional[float]) -> float:
     if old_price is None or new_price is None or old_price <= 0:
         return float("inf")
+    if _price_change_bps_c is not None:
+        return _price_change_bps_c(old_price, new_price)
     return abs(new_price - old_price) / old_price * 10000.0
 
 
@@ -712,11 +816,33 @@ def _dynamic_max_position_dollar(mid_price: float, capital: float = None, base_a
         capital = state.account.available_capital
     if capital is None or capital <= 0 or mid_price is None or mid_price <= 0:
         return 0.0  # Can't compute — suppress all quoting (safe default)
+    if _dynamic_max_position_c is not None and base_amount is not None:
+        return _dynamic_max_position_c(mid_price, capital, LEVERAGE, base_amount, NUM_LEVELS)
     raw = capital * LEVERAGE
     if base_amount is not None and base_amount > 0:
         order_usd = base_amount * mid_price
         raw -= 2.0 * NUM_LEVELS * order_usd  # room for all order levels (both sides)
     return max(0.0, raw * 0.9)  # 10% safety margin
+
+
+def _recompute_derived_params(mid_price: Optional[float] = None) -> None:
+    """Recompute base_amount and max_position from current capital/mid.
+
+    Called on capital update (user_stats WS) and on significant mid-price
+    change (orderbook WS).  Results are stored as read-only snapshots for
+    the hot loop.
+    """
+    if mid_price is None:
+        mid_price = state.market.mid_price
+    capital = state.account.available_capital
+    base_amount = calculate_dynamic_base_amount(mid_price, capital=capital)
+    max_pos = _dynamic_max_position_dollar(mid_price, capital, base_amount)
+    state.account.precomputed_base_amount = base_amount
+    state.account.precomputed_max_pos_usd = max_pos
+    # Push to vol_obi calculator if max_pos changed
+    calc = state.vol_obi_state.calculator
+    if calc is not None and max_pos > 0:
+        calc.set_max_position_dollar(max_pos)
 
 
 def position_label(position_size: float) -> str:
@@ -867,7 +993,11 @@ def _is_transient_error(exc: Exception) -> bool:
 # ---------------------------------------------------------------------------
 # Adaptive rate limiter: sliding-window token bucket
 # ---------------------------------------------------------------------------
-# "Default" tx-type limit: 40 ops per rolling 60s window (binding constraint)
+# "Default" tx-type limit: 40 ops per rolling 60s window (binding constraint).
+# NOTE: This matches the documented default per-transaction-type limit.
+# Premium accounts also have a separate weighted limit (4,000+ sendTx/min).
+# If sendTxBatch counts as 1 request regardless of op count, the effective
+# limit may be higher.  Verify with exchange support before increasing.
 _RL_OPS_PER_WINDOW = 40
 _RL_WINDOW_SECONDS = 60.0
 _RL_MIN_SEND_INTERVAL = float(_perf.get("rate_limit_send_interval", 0.1))  # floor between any two sends (seconds)
@@ -1022,6 +1152,7 @@ def _size_change_requires_update(existing_size: Optional[float], new_size: Optio
 
 
 def _sync_tracked_order_from_remote(side: str, level: int, order: dict) -> None:
+    """Enqueue a BIND_LIVE event to refresh a tracked order from exchange data."""
     cid = _extract_client_order_index(order)
     if cid is None:
         return
@@ -1048,7 +1179,11 @@ def _sync_tracked_order_from_remote(side: str, level: int, order: dict) -> None:
     if price is None or size is None:
         order_manager.mark_status(side, SideStatus.LIVE, level=level)
         return
-    order_manager.bind_live(side, cid, price, size, level=level)
+    _order_event_queue.append(OrderEvent(
+        event_type=OrderEventType.BIND_LIVE,
+        side=side, level=level,
+        order_id=cid, price=price, size=size,
+    ))
 
 
 def _refresh_local_orders_from_remote_orders(remote_orders: list[dict]) -> None:
@@ -1142,11 +1277,11 @@ def _reconcile_local_orders_with_remote_orders(
 ) -> tuple[bool, set[int]]:
     """Reconcile local order IDs/price/size against exchange open-order snapshot.
 
-    Returns ``(ok, unknown_exchange_ids)`` where *unknown_exchange_ids* are
-    exchange-assigned order_index values for live orders that are not tracked
-    locally and should be cancelled by the caller.
+    Enqueues a RECONCILE event for deferred processing by drain_events().
+    Returns ``(ok, unknown_exchange_ids)`` computed against *projected* state
+    (what state will look like after drain).
     """
-    # Populate the client_order_index -> order_index mapping
+    # Populate the client_order_index -> order_index mapping (no order-state mutation)
     _update_id_mapping_from_orders(remote_orders)
 
     # Build set of live client_order_index values (matching against local state)
@@ -1162,33 +1297,30 @@ def _reconcile_local_orders_with_remote_orders(
     orders = state.orders
     mismatch_reasons = []
 
-    # Clear locally tracked orders that are no longer live on exchange
+    # Compute projected tracked IDs (IDs that will survive after reconcile)
+    projected_tracked: set[int] = set()
     for lvl in range(NUM_LEVELS):
         bid_id = orders.bid_order_ids[lvl]
-        if bid_id is not None and bid_id not in live_client_ids:
-            mismatch_reasons.append(f"missing_local_bid[{lvl}]:{bid_id}")
-            order_manager.clear_live("buy", lvl)
+        if bid_id is not None:
+            if bid_id not in live_client_ids:
+                mismatch_reasons.append(f"missing_local_bid[{lvl}]:{bid_id}")
+            else:
+                projected_tracked.add(bid_id)
         ask_id = orders.ask_order_ids[lvl]
-        if ask_id is not None and ask_id not in live_client_ids:
-            mismatch_reasons.append(f"missing_local_ask[{lvl}]:{ask_id}")
-            order_manager.clear_live("sell", lvl)
+        if ask_id is not None:
+            if ask_id not in live_client_ids:
+                mismatch_reasons.append(f"missing_local_ask[{lvl}]:{ask_id}")
+            else:
+                projected_tracked.add(ask_id)
 
-    _refresh_local_orders_from_remote_orders(remote_orders)
+    # Enqueue reconcile event — actual clear/refresh happens in drain_events()
+    _order_event_queue.append(OrderEvent(
+        event_type=OrderEventType.RECONCILE,
+        remote_orders=remote_orders,
+        source=source,
+    ))
 
-    # NOTE: We intentionally do NOT rebind untracked remote orders to empty
-    # local slots.  Rebinding creates a race condition: if the main loop has
-    # already prepared a "create" op for the empty slot (between
-    # collect_order_operations and sign_and_send_batch), the rebound order
-    # becomes orphaned on the exchange.  Instead, untracked orders fall through
-    # to the unknown_live_ids check and get cancelled; the main loop will
-    # recreate what's needed on its next iteration.
-
-    tracked_ids = {
-        oid
-        for oid in (*orders.bid_order_ids, *orders.ask_order_ids)
-        if oid is not None
-    }
-    unknown_client_ids = live_client_ids - tracked_ids
+    unknown_client_ids = live_client_ids - projected_tracked
     # Resolve to exchange order_index for cancellation via SDK
     unknown_exchange_ids = {
         client_to_exchange[cid]
@@ -1304,6 +1436,7 @@ async def stale_order_reconciler_loop(client, market_id: int, account_id: int) -
                 account_id=account_id,
                 source="stale_poller",
             )
+            await asyncio.sleep(0)  # yield to let hot-path callbacks run
             if not ok and risk_controller.mismatch_streak >= max(1, STALE_ORDER_DEBOUNCE_COUNT):
                 risk_controller.trigger_pause(
                     f"order reconciliation mismatch for {risk_controller.mismatch_streak} polls"
@@ -1343,7 +1476,12 @@ def on_order_book_update(market_id, payload):
                 best_bid = ob['bids'].peekitem(-1)[0]
                 best_ask = ob['asks'].peekitem(0)[0]
                 mid = (best_bid + best_ask) / 2
+                prev_mid = state.market.mid_price
                 state.market.mid_price = mid
+
+                # Recompute derived params when mid changes materially
+                if prev_mid is None or round(mid, 4) != round(prev_mid, 4):
+                    _recompute_derived_params(mid)
 
                 # Feed vol_obi calculator on every book update (hot path)
                 calc = state.vol_obi_state.calculator
@@ -1463,6 +1601,7 @@ def on_user_stats_update(account_id, stats_data):
                     state.account.available_capital = new_available_capital
                     state.account.portfolio_value = new_portfolio_value
                 state.account.last_capital_update = time.monotonic()
+                _recompute_derived_params()
                 logger.info(
                     f"Received user stats for account {account_id}: "
                     f"Available Capital=${state.account.available_capital}, Portfolio Value=${state.account.portfolio_value}"
@@ -1654,14 +1793,20 @@ def on_account_orders_update(account_id: int, market_id: int, data: dict) -> Non
                 continue
             status = o.get("status", "open")
             if status not in LIVE:
-                # Order is dead (filled / cancelled / expired)
+                # Order is dead (filled / cancelled / expired) — enqueue clear
                 for lvl in range(NUM_LEVELS):
                     if orders.bid_order_ids[lvl] == cid:
-                        logger.info("Bid[%d] %d status=%s — clearing", lvl, cid, status)
-                        order_manager.clear_live("buy", lvl)
+                        logger.info("Bid[%d] %d status=%s — enqueue clear", lvl, cid, status)
+                        _order_event_queue.append(OrderEvent(
+                            event_type=OrderEventType.CLEAR_LIVE,
+                            side="buy", level=lvl,
+                        ))
                     if orders.ask_order_ids[lvl] == cid:
-                        logger.info("Ask[%d] %d status=%s — clearing", lvl, cid, status)
-                        order_manager.clear_live("sell", lvl)
+                        logger.info("Ask[%d] %d status=%s — enqueue clear", lvl, cid, status)
+                        _order_event_queue.append(OrderEvent(
+                            event_type=OrderEventType.CLEAR_LIVE,
+                            side="sell", level=lvl,
+                        ))
                 # Signal any pending cancel confirmation waiters
                 evt = _order_cancel_events.pop(cid, None)
                 if evt is not None:
@@ -2119,7 +2264,10 @@ async def _pause_cleanup_task(client) -> None:
                 for side_name in ("buy", "sell"):
                     lc = order_manager.lifecycle(side_name, lvl)
                     if lc.status == SideStatus.PLACING:
-                        order_manager.clear_live(side_name, lvl)
+                        _order_event_queue.append(OrderEvent(
+                            event_type=OrderEventType.CLEAR_LIVE,
+                            side=side_name, level=lvl,
+                        ))
 
         cancel_ops = []
         for lvl in range(NUM_LEVELS):
@@ -2205,7 +2353,10 @@ async def order_lifecycle_watchdog_loop(interval=None, placing_timeout=None) -> 
                         "Order %s[%d] stuck in PLACING for %.0fs — clearing stale slot",
                         side, level, age,
                     )
-                    order_manager.clear_live(side, level)
+                    _order_event_queue.append(OrderEvent(
+                        event_type=OrderEventType.CLEAR_LIVE,
+                        side=side, level=level,
+                    ))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2609,7 +2760,11 @@ async def _send_single_op_rest(client, tx_type: int, tx_info, op) -> bool:
         )
         _record_order_success()
         if op.action != "cancel":
-            order_manager.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
+            _order_event_queue.append(OrderEvent(
+                event_type=OrderEventType.BIND_LIVE,
+                side=op.side, level=op.level,
+                order_id=op.order_id, price=op.price, size=op.size,
+            ))
         return True
     except Exception as e:
         body = getattr(e, 'body', None) or getattr(e, 'reason', '')
@@ -2653,6 +2808,10 @@ async def sign_and_send_batch(client, ops: list):
         ops = ops[:1]
         logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx (%s %s)",
                     ops[0].action, ops[0].side)
+
+    # Drain any events that arrived since collect_order_operations (WS fills,
+    # reconciler updates) so the stale-create guard below sees fresh state.
+    order_manager.drain_events()
 
     # Safety: drop create ops whose slot got filled since collect_order_operations
     # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
@@ -2856,7 +3015,11 @@ async def sign_and_send_batch(client, ops: list):
         _record_order_success()
         for op in signed_ops:
             if op.action != "cancel":
-                order_manager.bind_live(op.side, op.order_id, op.price, op.size, level=op.level)
+                _order_event_queue.append(OrderEvent(
+                    event_type=OrderEventType.BIND_LIVE,
+                    side=op.side, level=op.level,
+                    order_id=op.order_id, price=op.price, size=op.size,
+                ))
 
     except Exception as e:
         body = getattr(e, 'body', None) or getattr(e, 'reason', '')
@@ -2958,7 +3121,6 @@ async def market_making_loop(client):
     _warmup_logged = False
     _last_warmup_log_min = -1
     _warmup_complete_logged = False
-    _prev_max_pos = 0.0
 
     while True:
         try:
@@ -3031,6 +3193,10 @@ async def market_making_loop(client):
             except asyncio.TimeoutError:
                 pass
 
+            # Process deferred order-state mutations (WS fills, reconciler,
+            # send confirmations) so reads below see consistent state.
+            order_manager.drain_events()
+
             # Snapshot volatile state into locals for speed and consistency
             snap_mid = state.market.mid_price
             snap_position = state.account.position_size
@@ -3041,21 +3207,20 @@ async def market_making_loop(client):
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
-            base_amount = calculate_dynamic_base_amount(snap_mid, capital=snap_capital)
+            # Use precomputed values (updated on capital/mid change events)
+            base_amount = state.account.precomputed_base_amount
+            _max_pos = state.account.precomputed_max_pos_usd
+            if base_amount is None or base_amount <= 0:
+                # First tick or data unavailable — force recompute
+                _recompute_derived_params(snap_mid)
+                base_amount = state.account.precomputed_base_amount
+                _max_pos = state.account.precomputed_max_pos_usd
             if base_amount is None or base_amount <= 0:
                 _reset_quote_telemetry()
                 if _log_info:
                     logger.warning("Base amount is zero or invalid; skipping order refresh.")
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
-
-            # Update vol_obi skew normalization to match dynamic position limit
-            _max_pos = _dynamic_max_position_dollar(snap_mid, snap_capital, base_amount)
-            if _max_pos != _prev_max_pos:
-                _prev_max_pos = _max_pos
-                calc = state.vol_obi_state.calculator
-                if calc is not None and _max_pos > 0:
-                    calc.set_max_position_dollar(_max_pos)
 
             level_prices = calculate_order_prices(
                 snap_mid, position_size=snap_position,
@@ -3287,6 +3452,7 @@ async def periodic_orderbook_sanity_check(interval=None, tolerance_pct=None):
                     ws_asks=ob['asks'],
                     tolerance_pct=tolerance_pct,
                 )
+                await asyncio.sleep(0)  # yield to let hot-path callbacks run
                 if result.ok:
                     logger.info(
                         "Orderbook sanity OK (REST fallback) | bid_diff=%.4f%% ask_diff=%.4f%% latency=%.0fms",
@@ -3788,6 +3954,10 @@ if __name__ == "__main__":
     if TEST_MODE_DURATION is not None:
         DRY_RUN = True
         WARMUP_SECONDS = 60
+        # Tighter spreads to generate fills during the short test window
+        VOL_OBI_VOL_TO_HALF_SPREAD = 12.0
+        VOL_OBI_MIN_HALF_SPREAD_BPS = 1.5
+        QUOTE_UPDATE_THRESHOLD_BPS = 2.0
         logger.info("🧪 TEST MODE: warmup=60s, auto-exit after %ds, isolated state", TEST_MODE_DURATION)
 
     async def main_with_signal_handling():

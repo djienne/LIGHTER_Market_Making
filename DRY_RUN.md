@@ -18,6 +18,12 @@ python -u market_maker_v2.py --symbol BTC
 # Reset wallet to $5000 (clears state + trade log)
 python -u market_maker_v2.py --symbol BTC --capital 5000
 
+# Smoke test: 60s warmup, 180s run, tight spreads for fills, auto-exit
+python -u market_maker_v2.py --symbol BTC --test
+
+# Smoke test with custom duration (seconds)
+python -u market_maker_v2.py --symbol BTC --test 300
+
 # Real trading
 python -u market_maker_v2.py --symbol BTC --live
 ```
