@@ -27,7 +27,7 @@ The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -m
 
 ### Configuration
 
-1. Create `.env` with your credentials:
+1. Create `.env` with your credentials (only needed for `--live` mode — dry-run and grid mode work without it):
 ```
 API_KEY_PRIVATE_KEY=0x...
 API_KEY_PUBLIC_KEY=0x...
@@ -42,6 +42,13 @@ ACCOUNT_INDEX=107607
 source venv/bin/activate
 python -u market_maker_v2.py --symbol BTC
 ```
+
+```bash
+# Grid dry-run: test N parameter combos in parallel (paper trading, no .env needed)
+python -u market_maker_v2.py --symbol BTC --grid grid_config.json
+```
+
+See [GRID_QUICKSTART.md](GRID_QUICKSTART.md) for full grid configuration and monitoring details.
 
 Always use `-u` for unbuffered log output. Logs are written to stdout and `logs/`.
 
@@ -61,7 +68,10 @@ trade_log.py             Buffered CSV trade logger
 utils.py                 Shared helpers (config loading, Parquet I/O)
 logging_config.py        Centralized logging setup
 adjust_leverage.py       CLI tool to set leverage/margin mode
+grid_dry_run.py          Parallel grid dry-run engine (N sims sharing one WS)
+deploy.py                Zip + upload to remote VPS
 config.json              Runtime configuration
+grid_config.json         Grid parameter search configuration
 tests/                   Unit tests (pytest)
 ```
 

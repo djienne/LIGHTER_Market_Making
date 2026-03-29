@@ -1,3 +1,5 @@
+> **Note**: This is a historical log from the initial dry-run session (March 2026). For current monitoring, see `run_grid_3d.sh` and `GRID_QUICKSTART.md`.
+
 # Dry-Run Monitoring Log
 
 ## Session Info

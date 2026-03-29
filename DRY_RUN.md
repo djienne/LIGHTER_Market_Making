@@ -24,6 +24,10 @@ python -u market_maker_v2.py --symbol BTC --test
 # Smoke test with custom duration (seconds)
 python -u market_maker_v2.py --symbol BTC --test 300
 
+# Grid dry-run: N parallel paper-trading simulations
+python -u market_maker_v2.py --symbol BTC --grid grid_config.json
+# See GRID_QUICKSTART.md for full grid configuration and monitoring details.
+
 # Real trading
 python -u market_maker_v2.py --symbol BTC --live
 ```
