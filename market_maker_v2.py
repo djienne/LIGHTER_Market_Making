@@ -3685,6 +3685,10 @@ async def main():
 
     client = None
     if not DRY_RUN:
+        if not API_KEY_PRIVATE_KEY:
+            logger.error("❌ API_KEY_PRIVATE_KEY not set. Create a .env file or set the env var. Exiting.")
+            await api_client.close()
+            return
         try:
             client = build_signer_client(
                 url=BASE_URL,
