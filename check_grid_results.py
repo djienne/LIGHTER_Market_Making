@@ -96,7 +96,7 @@ def format_usd(val: float) -> str:
     return f"-${abs(val):>8.4f}"
 
 
-def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: str):
+def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: str, maker_fee_rate: float):
     if not slots:
         print("No grid state files found.")
         return
@@ -112,6 +112,7 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
         s["pnl_per_fill"] = s["total_pnl"] / fills if fills > 0 else 0
         vol = s.get("total_volume", 0)
         s["pnl_per_volume"] = (s["total_pnl"] / vol * 10000) if vol > 0 else 0  # bps
+        s["fees_paid"] = vol * maker_fee_rate
 
     # Sort
     sort_map = {
@@ -153,7 +154,7 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
     print(f"  Slots: {total_slots} total, {active_slots} with fills, {total_slots - active_slots} idle")
     print(f"  Fills: {total_fills:,}")
     print(f"  Volume: ${total_volume:,.2f}")
-    print(f"  Realized PnL: ${total_realized:,.4f}")
+    print(f"  Maker fee: {maker_fee_rate*100:.4f}%")
     print(f"  Profitable: {profitable} | Losing: {losing} | Flat: {flat}")
     if latest:
         age = datetime.now(timezone.utc) - latest
@@ -162,8 +163,8 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
 
     # Top N
     print(f"TOP {top_n} (sorted by {sort_key}):")
-    print(f"{'#':>3} {'v2hs':>5} {'skew':>5} {'Fills':>6} {'Realized':>10} {'Unrealzd':>10} {'Total':>10} {'$/Fill':>8} {'bps/Vol':>8} {'Volume':>10}")
-    print("-" * 90)
+    print(f"{'#':>3} {'v2hs':>5} {'skew':>5} {'Fills':>6} {'Realized':>10} {'Unrealzd':>10} {'Total':>10} {'Fees':>8} {'$/Fill':>8} {'Volume':>10}")
+    print("-" * 95)
     for i, s in enumerate(slots[:top_n]):
         p = s.get("params", {})
         print(
@@ -172,8 +173,8 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
             f"{format_usd(s.get('realized_pnl', 0))} "
             f"{format_usd(s['unrealized_pnl'])} "
             f"{format_usd(s['total_pnl'])} "
+            f"${s['fees_paid']:>7.4f} "
             f"{s['pnl_per_fill']:>8.4f} "
-            f"{s['pnl_per_volume']:>8.2f} "
             f"${s.get('total_volume', 0):>9.2f}"
         )
 
@@ -182,8 +183,8 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
     # Bottom N
     bottom = list(reversed(slots[-min(top_n, len(slots)):]))
     print(f"BOTTOM {len(bottom)} (worst performers):")
-    print(f"{'#':>3} {'v2hs':>5} {'skew':>5} {'Fills':>6} {'Realized':>10} {'Unrealzd':>10} {'Total':>10} {'$/Fill':>8} {'bps/Vol':>8} {'Volume':>10}")
-    print("-" * 90)
+    print(f"{'#':>3} {'v2hs':>5} {'skew':>5} {'Fills':>6} {'Realized':>10} {'Unrealzd':>10} {'Total':>10} {'Fees':>8} {'$/Fill':>8} {'Volume':>10}")
+    print("-" * 95)
     for i, s in enumerate(bottom):
         p = s.get("params", {})
         print(
@@ -192,8 +193,8 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
             f"{format_usd(s.get('realized_pnl', 0))} "
             f"{format_usd(s['unrealized_pnl'])} "
             f"{format_usd(s['total_pnl'])} "
+            f"${s['fees_paid']:>7.4f} "
             f"{s['pnl_per_fill']:>8.4f} "
-            f"{s['pnl_per_volume']:>8.2f} "
             f"${s.get('total_volume', 0):>9.2f}"
         )
 
@@ -272,6 +273,8 @@ def main():
     parser.add_argument("--sort", default="total_pnl",
                         choices=["total_pnl", "pnl", "fills", "volume", "realized", "pnl_per_fill", "efficiency"],
                         help="Sort key (default: total_pnl)")
+    parser.add_argument("--fee", type=float, default=0.000_04,
+                        help="Maker fee rate as fraction (default: 0.00004 = 0.004%%)")
     args = parser.parse_args()
 
     if not os.path.isdir(args.grid_dir):
@@ -280,7 +283,7 @@ def main():
 
     slots = load_state_files(args.grid_dir)
     trade_counts = load_trade_counts(args.grid_dir)
-    print_summary(slots, trade_counts, args.top, args.sort)
+    print_summary(slots, trade_counts, args.top, args.sort, args.fee)
 
 
 if __name__ == "__main__":
