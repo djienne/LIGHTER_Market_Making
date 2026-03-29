@@ -91,9 +91,7 @@ def load_trade_counts(grid_dir: str) -> dict[str, int]:
 
 
 def format_usd(val: float) -> str:
-    if val >= 0:
-        return f" ${val:>8.4f}"
-    return f"-${abs(val):>8.4f}"
+    return f"${val:>+9.4f}"
 
 
 def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: str, maker_fee_rate: float):
