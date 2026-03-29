@@ -2024,7 +2024,7 @@ def calculate_dynamic_base_amount(mid_price, capital=None):
     # Warn if capital data is old, but don't suppress — the last known value
     # is still valid (user_stats WS only fires on balance changes, so no
     # update for an hour just means no balance change occurred).
-    if state.account.last_capital_update > 0:
+    if state.account.last_capital_update > 0 and not DRY_RUN:
         age = time.monotonic() - state.account.last_capital_update
         if age > _CAPITAL_STALE_SECONDS:
             logger.info(
@@ -4051,9 +4051,23 @@ if __name__ == "__main__":
     parser.add_argument("--capital", type=float, default=None, help="Reset dry-run wallet to this USD amount (default: 1000 on first run)")
     parser.add_argument("--test", type=int, nargs="?", const=180, metavar="SECONDS",
                         help="Smoke-test mode: 60s warmup, isolated state, auto-exit after SECONDS (default 180)")
+    parser.add_argument("--grid", type=str, default=None, metavar="CONFIG",
+                        help="Parallel grid dry-run: run N parameter combos against shared orderbook")
     args = parser.parse_args()
     MARKET_SYMBOL = args.symbol.upper()
     os.environ["MARKET_SYMBOL"] = MARKET_SYMBOL
+
+    # Grid mode: parallel paper-trading only — never live
+    if args.grid:
+        if args.live:
+            print("ERROR: --grid is paper-trading only and cannot be combined with --live")
+            _sys.exit(1)
+        from grid_dry_run import GridRunner
+        setup_logging(__name__, log_dir=LOG_DIR, log_filename="grid_debug.log")
+        runner = GridRunner(args.grid, MARKET_SYMBOL)
+        asyncio.run(runner.run())
+        _sys.exit(0)
+
     DRY_RUN = not args.live
     DRY_RUN_CAPITAL = args.capital
     TEST_MODE_DURATION = args.test  # None if not passed, else seconds

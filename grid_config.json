@@ -1,0 +1,18 @@
+{
+  "capital": 1000,
+  "leverage": 2,
+  "warmup_seconds": 600,
+  "summary_interval_seconds": 60,
+  "sim_latency_s": 0.050,
+  "parameters": {
+    "vol_to_half_spread": [8, 12, 18, 24, 36, 48, 60, 80],
+    "skew": [0.1, 0.5, 1.0, 1.5, 2.5, 3.0, 4.0, 5.0]
+  },
+  "fixed": {
+    "min_half_spread_bps": 4,
+    "spread_factor_level1": 2.0,
+    "capital_usage_percent": 0.12,
+    "num_levels": 2,
+    "c1_ticks": 20.0
+  }
+}
