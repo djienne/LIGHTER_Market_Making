@@ -287,6 +287,15 @@ class GridRunner:
         tick = self._shared_config.price_tick_float
         amount_tick = self._shared_config.amount_tick_float
 
+        # Quiet logger for per-slot engines: only WARNING+ to avoid
+        # 128 slots x 4 orders x every tick flooding the log.
+        # Fills and summaries are tracked via GridRunner's own logger + trade CSVs.
+        engine_logger = logging.getLogger("grid_engine")
+        engine_logger.setLevel(logging.WARNING)
+        if not engine_logger.handlers:
+            engine_logger.addHandler(logging.NullHandler())
+        engine_logger.propagate = False
+
         for i, params in enumerate(self._param_combos):
             pk = _param_key(params)
 
@@ -354,7 +363,7 @@ class GridRunner:
                 slot_om,
                 client_to_exchange_id,
                 self._leverage,
-                logger,
+                engine_logger,
                 sim_latency_s=self._sim_latency,
                 trade_logger=trade_logger,
             )
@@ -369,7 +378,7 @@ class GridRunner:
                     slot_om,
                     client_to_exchange_id,
                     self._leverage,
-                    logger,
+                    engine_logger,
                     sim_latency_s=self._sim_latency,
                     trade_logger=trade_logger,
                     state_path=state_path,
@@ -852,6 +861,10 @@ class GridRunner:
                 )
                 binance_tasks.append(asyncio.create_task(depth_client.run()))
                 logger.info("Binance feeds: %s@bookTicker + %s@depth@100ms", binance_sym, binance_sym)
+
+        # Silence per-slot vol_obi warmup spam (128x "warmed up" messages)
+        logging.getLogger("vol_obi").setLevel(logging.WARNING)
+        logging.getLogger("_vol_obi_fast").setLevel(logging.WARNING)
 
         # Create slots (after shared state is ready, so SlotState refs are valid)
         self._slots = self._create_slots()
