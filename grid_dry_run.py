@@ -232,6 +232,7 @@ class GridRunner:
         self._warmup_seconds = float(cfg.get("warmup_seconds", 600))
         self._summary_interval = float(cfg.get("summary_interval_seconds", 60))
         self._sim_latency = float(cfg.get("sim_latency_s", 0.050))
+        self._maker_fee_rate = float(cfg.get("maker_fee_rate", 0.000_04))  # 0.004% default
 
         # Build Cartesian product of parameter grid
         param_axes = cfg.get("parameters", {})
@@ -366,6 +367,7 @@ class GridRunner:
                 engine_logger,
                 sim_latency_s=self._sim_latency,
                 trade_logger=trade_logger,
+                maker_fee_rate=self._maker_fee_rate,
             )
             if engine is not None:
                 logger.info("Grid slot %s (%s): restored | capital=$%.2f pos=%.6f pnl=$%.4f fills=%d",
@@ -382,6 +384,7 @@ class GridRunner:
                     sim_latency_s=self._sim_latency,
                     trade_logger=trade_logger,
                     state_path=state_path,
+                    maker_fee_rate=self._maker_fee_rate,
                 )
                 engine.capture_initial_state()
                 logger.info("Grid slot %s (%s): fresh | capital=$%.0f", params.label, pk, self._capital)
