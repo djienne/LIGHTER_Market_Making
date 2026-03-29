@@ -241,7 +241,8 @@ def print_summary(slots: list[dict], trade_counts: dict, top_n: int, sort_key: s
                 lookup[(v, sk)] = s["total_pnl"]
 
         print("PnL HEATMAP (vol_to_half_spread x skew):")
-        header = f"{'v2hs\\skew':>10}"
+        label = "v2hs\\skew"
+        header = f"{label:>10}"
         for sk in skew_vals:
             header += f" {sk:>7}"
         print(header)
