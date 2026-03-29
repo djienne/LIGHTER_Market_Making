@@ -673,7 +673,7 @@ class DryRunEngine:
                 self._state.account.available_capital -= excess * fill_price / self._leverage
         else:
             # Purely increasing position
-            self._state.account.available_capital -= fill_size * fill_price / self._leverage
+            self._state.account.available_capital -= fill_size * fill_price / self._leverage + fee
 
         # Keep portfolio_value in sync: initial portfolio + realized + unrealized
         self._state.account.portfolio_value = (
