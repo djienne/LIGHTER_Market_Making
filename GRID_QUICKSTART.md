@@ -22,6 +22,9 @@ python setup_cython.py build_ext --inplace
 # Start grid dry-run (paper trading only, no real orders)
 python -u market_maker_v2.py --symbol BTC --grid grid_config.json
 
+# Run in background with logs to file (survives SSH disconnect)
+nohup python -u market_maker_v2.py --symbol BTC --grid grid_config.json > logs/grid_console.log 2>&1 &
+
 # Or run with the 3-day monitoring wrapper (auto-restart on crash)
 bash run_grid_3d.sh
 ```
@@ -66,6 +69,23 @@ bash run_grid_3d.sh
 | `capital_usage_percent` | Fraction of capital per order side | 0.05–0.20 |
 | `num_levels` | Quote levels per side (buy/sell) | 1–3 |
 | `c1_ticks` | OBI alpha sensitivity in ticks | 5–40 |
+
+## Analyzing results
+
+```bash
+# Full summary with top/bottom performers, parameter analysis, and PnL heatmap
+python check_grid_results.py
+
+# Show top 20 instead of default 10
+python check_grid_results.py --top 20
+
+# Sort by fills or efficiency (PnL per volume in bps)
+python check_grid_results.py --sort fills
+python check_grid_results.py --sort efficiency
+
+# Custom grid directory
+python check_grid_results.py /path/to/grid/
+```
 
 ## Monitoring
 
