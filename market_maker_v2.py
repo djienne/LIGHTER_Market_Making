@@ -3865,6 +3865,7 @@ async def main():
                     trade_logger=_trade_logger,
                     state_path=_dr_state_path,
                     rejection_callback=_record_order_rejection,
+                    maker_fee_rate=0.0000_4,  # 0.004% maker fee (Lighter premium)
                 )
                 _dry_run_engine.capture_initial_state()
             logger.info("DRY-RUN engine initialized — run with --live for real trading")

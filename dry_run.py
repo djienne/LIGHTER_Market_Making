@@ -71,6 +71,7 @@ class DryRunEngine:
         trade_logger: Optional['TradeLogger'] = None,
         state_path: Optional[str] = None,
         rejection_callback=None,          # called on POST_ONLY rejects (for circuit breaker)
+        maker_fee_rate: float = 0.0,      # maker fee as fraction (e.g. 0.00004 for 0.004%)
     ):
         self._state = state
         self._om = order_manager
@@ -82,6 +83,7 @@ class DryRunEngine:
         self._trade_logger = trade_logger
         self._state_path = state_path
         self._rejection_cb = rejection_callback
+        self._maker_fee_rate = maker_fee_rate
 
         # Simulated order book
         self._live_orders: dict[int, SimulatedOrder] = {}
@@ -647,6 +649,11 @@ class DryRunEngine:
         self._entry_price_before = self._entry_vwap  # snapshot for margin calc
         self._update_pnl(sim.side, fill_size, fill_price, old_pos)
         realized_delta = self._realized_pnl - pnl_before
+
+        # Maker fee
+        fee = fill_size * fill_price * self._maker_fee_rate
+        self._realized_pnl -= fee
+        realized_delta -= fee
 
         # Bookkeeping
         self._fill_count += 1
