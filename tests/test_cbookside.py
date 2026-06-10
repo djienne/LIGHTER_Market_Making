@@ -1,7 +1,14 @@
 """Tests for CBookSide — C-level sorted orderbook side."""
 
 import unittest
-from _vol_obi_fast import CBookSide
+
+import pytest
+
+_vol_obi_fast = pytest.importorskip(
+    "_vol_obi_fast",
+    reason="Cython extension not built (python setup_cython.py build_ext --inplace)",
+)
+CBookSide = _vol_obi_fast.CBookSide
 
 
 class TestCBookSideBasic(unittest.TestCase):

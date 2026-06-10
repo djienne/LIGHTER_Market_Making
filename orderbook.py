@@ -1,7 +1,8 @@
 """Shared order book update logic used by both market_maker_v2 and gather_lighter_data."""
 
 
-def apply_orderbook_update(book_bids, book_asks, initialized, bids_in, asks_in, snapshot_threshold=100):
+def apply_orderbook_update(book_bids, book_asks, initialized, bids_in, asks_in, snapshot_threshold=100,
+                           *, is_snapshot_hint=None):
     """Apply an order book update (snapshot or delta) to bid/ask mappings.
 
     Works with both plain ``dict`` and ``SortedDict`` containers.
@@ -15,7 +16,15 @@ def apply_orderbook_update(book_bids, book_asks, initialized, bids_in, asks_in, 
         bids_in: List of ``{'price': ..., 'size': ...}`` dicts from the wire.
         asks_in: List of ``{'price': ..., 'size': ...}`` dicts from the wire.
         snapshot_threshold: If either side exceeds this count and the book is
-            already initialized, treat the message as a snapshot.
+            already initialized, treat the message as a snapshot (legacy
+            heuristic, used only when ``is_snapshot_hint`` is ``None``).
+        is_snapshot_hint: Authoritative protocol hint.  ``True`` when the
+            message type marks a snapshot (``subscribed/order_book``) —
+            forces snapshot handling even for small books.  ``False``
+            (``update/order_book``) forces delta handling even for large
+            updates — live data shows busy deltas can exceed 100 levels, and
+            the size heuristic would wrongly clear the book on those.
+            ``None`` falls back to the size heuristic (legacy callers).
 
     Returns:
         is_snapshot (bool): Whether the update was treated as a full snapshot.
@@ -23,6 +32,8 @@ def apply_orderbook_update(book_bids, book_asks, initialized, bids_in, asks_in, 
     is_snapshot = False
     if not initialized:
         is_snapshot = True
+    elif is_snapshot_hint is not None:
+        is_snapshot = is_snapshot_hint
     elif len(bids_in) > snapshot_threshold or len(asks_in) > snapshot_threshold:
         is_snapshot = True
 

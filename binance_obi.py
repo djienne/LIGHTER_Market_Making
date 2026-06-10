@@ -212,7 +212,7 @@ class BinanceBookTickerClient:
             try:
                 self._shared_bbo.reset()
                 async with websockets.connect(
-                    self.url, ping_interval=20, ping_timeout=20,
+                    self.url, ping_interval=20, ping_timeout=20, close_timeout=5,
                 ) as ws:
                     logger.info("Binance BBO connected: %s", self.url)
                     backoff = self._reconnect_base
@@ -332,7 +332,7 @@ class BinanceDiffDepthClient:
             try:
                 self._reset()
                 async with websockets.connect(
-                    self.url, ping_interval=20, ping_timeout=20,
+                    self.url, ping_interval=20, ping_timeout=20, close_timeout=5,
                 ) as ws:
                     logger.info("Binance depth connected: %s", self.url)
                     backoff = self._reconnect_base

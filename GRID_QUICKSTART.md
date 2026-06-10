@@ -39,24 +39,25 @@ bash run_grid_3d.sh
   "summary_interval_seconds": 60,
   "sim_latency_s": 0.050,
   "parameters": {
-    "vol_to_half_spread": [8, 12, 24, 48],
-    "skew": [0.1, 1.0, 3.0, 5.0]
+    "vol_to_half_spread": [30, 36, 42, 48, 54, 60, 70],
+    "skew": [0.1, 0.5, 1.0, 1.5, 2.5],
+    "c1_ticks": [20, 40, 80, 120, 160]
   },
   "fixed": {
     "min_half_spread_bps": 4,
     "spread_factor_level1": 2.0,
     "capital_usage_percent": 0.12,
-    "num_levels": 2,
-    "c1_ticks": 20.0
+    "num_levels": 2
   }
 }
 ```
 
-- **`parameters`**: axes to vary — Cartesian product creates one slot per combination (4x4 = 16 slots above)
+- **`parameters`**: axes to vary — Cartesian product creates one slot per combination (7×5×5 = 175 slots above, max 500)
 - **`fixed`**: constant across all slots
 - **`capital`**: starting virtual wallet per slot (USD)
 - **`warmup_seconds`**: collect volatility data before trading (600s recommended)
 - **`sim_latency_s`**: simulated exchange latency for realistic fill modeling
+- **`maker_fee_rate`** (optional): fee applied to simulated fills; defaults to `trading.maker_fee_rate` from `config.json` (0.004%)
 
 ### Key parameters
 
@@ -68,7 +69,9 @@ bash run_grid_3d.sh
 | `spread_factor_level1` | How much wider level 1 is vs level 0 | 1.5–3.0 |
 | `capital_usage_percent` | Fraction of capital per order side | 0.05–0.20 |
 | `num_levels` | Quote levels per side (buy/sell) | 1–3 |
-| `c1_ticks` | OBI alpha sensitivity in ticks | 5–40 |
+| `c1_ticks` | OBI alpha sensitivity in ticks | 5–160 |
+
+An 8-day fee-aware grid on live BTC feeds (May–Jun 2026) found the profitable region at `vol_to_half_spread` 42–60, `skew` 0.1–1.5, `c1_ticks` 40–120; very tight spreads (`vol_to_half_spread` ≤ 21) lost consistently to adverse selection, and ≥ 80 rarely quoted. The default sweep above refines around that region.
 
 ## Analyzing results
 

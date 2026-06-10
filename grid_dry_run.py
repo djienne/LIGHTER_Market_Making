@@ -232,7 +232,9 @@ class GridRunner:
         self._warmup_seconds = float(cfg.get("warmup_seconds", 600))
         self._summary_interval = float(cfg.get("summary_interval_seconds", 60))
         self._sim_latency = float(cfg.get("sim_latency_s", 0.050))
-        self._maker_fee_rate = float(cfg.get("maker_fee_rate", 0.000_04))  # 0.004% default
+        self._maker_fee_rate = float(cfg.get(
+            "maker_fee_rate",
+            _trading.get("maker_fee_rate", 0.000_04)))  # grid config > config.json > 0.004%
 
         # Build Cartesian product of parameter grid
         param_axes = cfg.get("parameters", {})
@@ -426,6 +428,7 @@ class GridRunner:
 
         is_snapshot = apply_orderbook_update(
             ob["bids"], ob["asks"], ob["initialized"], bids_in, asks_in,
+            is_snapshot_hint=(msg_type == "subscribed/order_book"),
         )
         if is_snapshot:
             ob["initialized"] = True

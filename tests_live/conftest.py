@@ -30,10 +30,12 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(config, items):
     """Auto-skip every test in this directory when the live environment is unavailable."""
-    # Check 1: lighter native lib must be importable
+    # Check 1: lighter native lib must be importable.  The SDK can fail with
+    # RuntimeError ("Could not find C standard library") on native Windows,
+    # so catch broadly — any import failure means "live env unavailable".
     try:
         import lighter  # noqa: F401
-    except (ImportError, OSError):
+    except Exception:
         skip = pytest.mark.skip(reason="lighter native library not available (Windows?)")
         for item in items:
             item.add_marker(skip)

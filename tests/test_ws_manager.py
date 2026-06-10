@@ -295,3 +295,114 @@ class TestWsSubscribe(unittest.IsolatedAsyncioTestCase):
         # First delay should be ~1s, second ~2s
         self.assertGreaterEqual(len(connect_times), 2)
         self.assertGreater(connect_times[1], connect_times[0])
+
+
+class TestMessageGuards(unittest.IsolatedAsyncioTestCase):
+    """One bad message or a buggy callback must not tear down the connection."""
+
+    def _single_connect(self, ws):
+        """Side effect for websockets.connect that counts connections."""
+        state = {"count": 0}
+
+        def _connect(*a, **kw):
+            state["count"] += 1
+            return _FakeConnectCM(ws)
+
+        return _connect, state
+
+    @patch("ws_manager.websockets.connect")
+    async def test_fast_path_malformed_json_does_not_reconnect(self, mock_connect):
+        ws = _make_mock_ws(['not json {{{', '{"type":"update","price":7}'])
+        connect, state = self._single_connect(ws)
+        mock_connect.side_effect = connect
+        on_message = MagicMock()
+
+        task = asyncio.create_task(
+            ws_manager.ws_subscribe_fast(
+                channels=[], label="test", on_message=on_message,
+                recv_timeout=0.5, reconnect_base=0.01, reconnect_max=0.02,
+            )
+        )
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        # No reconnect, and the valid message after the bad one was delivered
+        self.assertEqual(state["count"], 1)
+        on_message.assert_called_once()
+        self.assertEqual(on_message.call_args[0][0]["price"], 7)
+
+    @patch("ws_manager.websockets.connect")
+    async def test_fast_path_callback_exception_does_not_reconnect(self, mock_connect):
+        ws = _make_mock_ws(['{"type":"update","n":1}', '{"type":"update","n":2}'])
+        connect, state = self._single_connect(ws)
+        mock_connect.side_effect = connect
+
+        seen = []
+
+        def _bad_callback(data):
+            seen.append(data["n"])
+            if data["n"] == 1:
+                raise RuntimeError("bug in callback")
+
+        task = asyncio.create_task(
+            ws_manager.ws_subscribe_fast(
+                channels=[], label="test", on_message=_bad_callback,
+                recv_timeout=0.5, reconnect_base=0.01, reconnect_max=0.02,
+            )
+        )
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(state["count"], 1)  # no reconnect
+        self.assertEqual(seen, [1, 2])       # stream kept flowing
+
+    @patch("ws_manager.websockets.connect")
+    async def test_fast_path_non_dict_json_does_not_reconnect(self, mock_connect):
+        ws = _make_mock_ws(['42', '{"type":"update","n":1}'])
+        connect, state = self._single_connect(ws)
+        mock_connect.side_effect = connect
+        on_message = MagicMock()
+
+        task = asyncio.create_task(
+            ws_manager.ws_subscribe_fast(
+                channels=[], label="test", on_message=on_message,
+                recv_timeout=0.5, reconnect_base=0.01, reconnect_max=0.02,
+            )
+        )
+        await asyncio.sleep(0.15)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(state["count"], 1)
+        on_message.assert_called_once()
+
+    @patch("ws_manager.websockets.connect")
+    async def test_slow_path_callback_exception_does_not_reconnect(self, mock_connect):
+        ws = _make_mock_ws(['{"type":"update","n":1}', '{"type":"update","n":2}'])
+        connect, state = self._single_connect(ws)
+        mock_connect.side_effect = connect
+
+        seen = []
+
+        def _bad_callback(data):
+            seen.append(data["n"])
+            raise ValueError("callback ValueError must not be mistaken for bad JSON")
+
+        task = asyncio.create_task(
+            ws_manager.ws_subscribe(
+                channels=[], label="test", on_message=_bad_callback,
+                recv_timeout=0.5, reconnect_base=0.01, reconnect_max=0.02,
+            )
+        )
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(state["count"], 1)
+        self.assertEqual(seen, [1, 2])

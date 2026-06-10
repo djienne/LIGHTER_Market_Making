@@ -67,6 +67,7 @@ Fill logic follows POST_ONLY maker semantics with **delta-fill** to avoid double
 - **Fill price** is always the limit price (maker gets their specified price).
 - **Partial fills** occur naturally when available liquidity is less than order size.
 - **Multi-order fairness**: when multiple simulated orders compete for the same book side, orders are processed in **price priority** (most aggressive first). Liquidity consumed by one order is subtracted from what's available to the next within the same tick.
+- **Maker fees**: each fill deducts `size × price × maker_fee_rate` from realized PnL and available capital (exactly once per fill, including on position flips). The rate comes from `trading.maker_fee_rate` in `config.json` (default `0.00004` = 0.004%, the Lighter premium tier; standard accounts are 0).
 
 ### Simulated Latency
 

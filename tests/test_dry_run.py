@@ -647,6 +647,50 @@ class TestBugFixes(unittest.TestCase):
             self.assertAlmostEqual(engine._realized_pnl, 1.0)
             self.assertAlmostEqual(mm.state.account.available_capital, 975.5)
 
+    def test_position_flip_with_fees(self):
+        """Regression: each fill's full fee hits capital exactly once on a flip.
+
+        On the position-flip fill the whole-fill fee flows through
+        realized_delta in the reducing branch — the excess (opening) portion
+        must NOT be charged a second fee, and must not escape the fee either.
+        """
+        with temp_mm_attrs(
+            current_bid_order_id=None, current_ask_order_id=None,
+            current_bid_price=None, current_ask_price=None,
+            current_bid_size=None, current_ask_size=None,
+            _PRICE_TICK_FLOAT=0.1, available_capital=1000.0,
+            portfolio_value=1000.0, current_position_size=0.0,
+            current_mid_price_cached=102.0,
+        ):
+            fee_rate = 0.001
+            engine = _make_engine(leverage=2, maker_fee_rate=fee_rate)
+
+            # Buy 0.5 @ 100: margin 25, fee 0.5*100*0.001 = 0.05
+            self._run(engine.process_batch([
+                mm.BatchOp("buy", 0, "create", 100.0, 0.5, 1, 0),
+            ]))
+            bids, asks = _book({99.0: 2.0}, {100.0: 2.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(mm.state.account.available_capital, 974.95)
+            self.assertAlmostEqual(engine._realized_pnl, -0.05)
+
+            # Sell 1.0 @ 102 (flip): fee on the FULL fill = 1.0*102*0.001 = 0.102
+            # Close 0.5: release 25, PnL +1.0 -> realized_delta = 1.0 - 0.102
+            # Open 0.5 short: consume 25.5 (no extra fee)
+            # capital = 974.95 + 25 + 0.898 - 25.5 = 975.348
+            self._run(engine.process_batch([
+                mm.BatchOp("sell", 0, "create", 102.0, 1.0, 2, 0),
+            ]))
+            bids, asks = _book({102.0: 2.0}, {103.0: 1.0})
+            engine.check_fills(bids, asks)
+            self.assertAlmostEqual(engine._position, -0.5)
+            self.assertAlmostEqual(engine._realized_pnl, 0.848)
+            self.assertAlmostEqual(mm.state.account.available_capital, 975.348)
+            # Sanity: capital differs from the fee-free baseline (975.5) by
+            # exactly the two full-fill fees.
+            self.assertAlmostEqual(975.5 - (0.05 + 0.102),
+                                   mm.state.account.available_capital)
+
     def test_portfolio_value_updates_between_fills(self):
         """Bug 8: portfolio_value must refresh on maybe_log_summary."""
         with temp_mm_attrs(
@@ -1524,6 +1568,7 @@ def _cbook(bids: dict, asks: dict):
     return CBookSide(bids), CBookSide(asks)
 
 
+@unittest.skipUnless(_HAS_CBOOKSIDE, "Cython extension not built")
 class TestCBookSideCreateSell(unittest.IsolatedAsyncioTestCase):
     """Regression: _handle_create for sell orders iterates bids to snapshot
     qualifying depth.  This broke with CBookSide because reversed()/list()
@@ -1580,6 +1625,7 @@ class TestCBookSideCreateSell(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(sim._prev_by_price), 0)
 
 
+@unittest.skipUnless(_HAS_CBOOKSIDE, "Cython extension not built")
 class TestCBookSideFills(unittest.TestCase):
     """Ensure check_fills works with CBookSide (Cython) book sides."""
 
@@ -1648,6 +1694,7 @@ class TestCBookSideFills(unittest.TestCase):
             self.assertAlmostEqual(engine._position, 0.5)
 
 
+@unittest.skipUnless(_HAS_CBOOKSIDE, "Cython extension not built")
 class TestCBookSideModify(unittest.IsolatedAsyncioTestCase):
     """Regression: _handle_modify iterates bids for sell-side depth snapshot.
     Exercises the third iteration site (dry_run.py line 376)."""
