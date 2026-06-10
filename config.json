@@ -11,13 +11,14 @@
         "order_timeout_seconds": 30.0,
         "position_value_threshold_usd": 11.0,
         "min_order_value_usd": 14.5,
+        "maker_fee_rate": 0.00004,
         "vol_obi": {
             "window_steps": 6000,
             "step_ns": 100000000,
-            "vol_to_half_spread": 48.0,
-            "min_half_spread_bps": 8.0,
-            "c1_ticks": 20.0,
-            "skew": 3.0,
+            "vol_to_half_spread": 42.0,
+            "min_half_spread_bps": 4.0,
+            "c1_ticks": 120.0,
+            "skew": 1.5,
             "looking_depth": 0.025,
             "min_warmup_samples": 100,
             "warmup_seconds": 600

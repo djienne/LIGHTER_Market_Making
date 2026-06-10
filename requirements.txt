@@ -1,3 +1,6 @@
+# On native Windows install the PyPI build instead (>=1.1.0 ships the Windows
+# signer DLL; the pinned commit fails with "Could not find C standard library"):
+#   pip install "lighter-sdk>=1.1.0"
 git+https://github.com/elliottech/lighter-python.git@b7fc10b288f317e9c974f318d8de7fcc5cc557e4
 python-dotenv==1.1.0
 numpy==2.3.5

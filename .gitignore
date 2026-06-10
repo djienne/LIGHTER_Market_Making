@@ -13,5 +13,7 @@ logs/
 bot.log
 lighter_data/
 *.so
+*.pyd
 _vol_obi_fast.c
 build/
+.coverage

@@ -5,14 +5,14 @@
   "summary_interval_seconds": 60,
   "sim_latency_s": 0.050,
   "parameters": {
-    "vol_to_half_spread": [6, 8, 10, 12, 15, 18, 21, 24, 30, 36, 42, 48, 54, 60, 70, 80],
-    "skew": [0.1, 0.5, 1.0, 1.5, 2.5, 3.0, 4.0, 5.0]
+    "vol_to_half_spread": [30, 36, 42, 48, 54, 60, 70],
+    "skew": [0.1, 0.5, 1.0, 1.5, 2.5],
+    "c1_ticks": [20, 40, 80, 120, 160]
   },
   "fixed": {
     "min_half_spread_bps": 4,
     "spread_factor_level1": 2.0,
     "capital_usage_percent": 0.12,
-    "num_levels": 2,
-    "c1_ticks": 20.0
+    "num_levels": 2
   }
 }

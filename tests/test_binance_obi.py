@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from binance_obi import (
@@ -40,6 +41,9 @@ class TestSharedAlpha(unittest.TestCase):
         sa = SharedAlpha(min_samples=1)
         sa.update(1.0)
         self.assertFalse(sa.is_stale(threshold_seconds=5.0))
+        # Let the monotonic clock tick so age is strictly > 0 (Windows
+        # timer granularity can be ~15.6ms under load).
+        time.sleep(0.02)
         self.assertTrue(sa.is_stale(threshold_seconds=0.0))
 
     def test_reset(self):
@@ -94,6 +98,9 @@ class TestSharedBBO(unittest.TestCase):
         bbo = SharedBBO(min_samples=1)
         bbo.update(100.0, 101.0, 1.0, 1.0, 1, 0, 0)
         self.assertFalse(bbo.is_stale(threshold_seconds=5.0))
+        # Let the monotonic clock tick so age is strictly > 0 (Windows
+        # timer granularity can be ~15.6ms under load).
+        time.sleep(0.02)
         self.assertTrue(bbo.is_stale(threshold_seconds=0.0))
 
     def test_mid_computation(self):

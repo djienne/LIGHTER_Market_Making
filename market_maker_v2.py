@@ -89,6 +89,10 @@ POSITION_VALUE_THRESHOLD_USD = float(os.getenv(
     "POSITION_VALUE_THRESHOLD_USD",
     _trading.get("position_value_threshold_usd", 15.0)))
 MIN_ORDER_VALUE_USD = float(_trading.get("min_order_value_usd", 14.5))
+# Maker fee rate (0.00004 = 0.004%, Lighter premium tier; standard accounts are 0)
+MAKER_FEE_RATE = float(os.getenv(
+    "MAKER_FEE_RATE",
+    _trading.get("maker_fee_rate", 0.00004)))
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -414,7 +418,8 @@ class MarketState:
     last_order_book_update: float = 0.0
     ws_connection_healthy: bool = False
     local_order_book: dict = field(default_factory=lambda: {
-        'bids': _BookSide(), 'asks': _BookSide(), 'initialized': False
+        'bids': _BookSide(), 'asks': _BookSide(), 'initialized': False,
+        'last_offset': None,
     })
     last_mid_price: Optional[float] = None
     ticker_best_bid: Optional[float] = None
@@ -1484,13 +1489,32 @@ async def stale_order_reconciler_loop(client, market_id: int, account_id: int) -
             logger.error("Unexpected stale-order poller error: %s", exc, exc_info=True)
 
 
-def on_order_book_update(market_id, payload):
+def on_order_book_update(market_id, payload, is_snapshot_hint=None):
     ob = state.market.local_order_book
     global _pending_dry_run_fill_check
     try:
         if market_id == state.config.market_id:
             bids_in = payload.get('bids', [])
             asks_in = payload.get('asks', [])
+            offset = payload.get('offset')
+
+            # Offset sanity: Lighter offsets are a server-side sequence that
+            # advances by arbitrary steps between coalesced deltas (verified
+            # against live feed 2026-06-10), so forward jumps are normal.
+            # Only a NON-advancing offset on a delta is anomalous (stale or
+            # out-of-order replay) — skip it rather than corrupt the book.
+            last_offset = ob.get('last_offset')
+            if (offset is not None and last_offset is not None
+                    and not is_snapshot_hint and ob['initialized']
+                    and offset <= last_offset):
+                logger.warning(
+                    "Orderbook stale/out-of-order delta for market %d: "
+                    "offset %d <= last %d; skipping message",
+                    market_id, offset, last_offset,
+                )
+                return
+            if offset is not None:
+                ob['last_offset'] = offset
 
             is_snapshot = apply_orderbook_update(
                 ob['bids'],
@@ -1498,6 +1522,7 @@ def on_order_book_update(market_id, payload):
                 ob['initialized'],
                 bids_in,
                 asks_in,
+                is_snapshot_hint=is_snapshot_hint,
             )
             if is_snapshot:
                 ob['initialized'] = True
@@ -1557,6 +1582,7 @@ async def subscribe_to_market_data(market_id):
         state.market.mid_price = None
         ob = state.market.local_order_book
         ob['initialized'] = False
+        ob['last_offset'] = None
         ob['bids'].clear()
         ob['asks'].clear()
         # Reset vol_obi calculator to avoid stale volatility data after reconnect
@@ -1571,7 +1597,14 @@ async def subscribe_to_market_data(market_id):
         msg_type = data.get("type", "")
         if msg_type in ("update/order_book", "subscribed/order_book"):
             if 'order_book' in data:
-                on_order_book_update(market_id, data['order_book'])
+                payload = data['order_book']
+                # Offset may sit on the envelope instead of the payload
+                if 'offset' not in payload and 'offset' in data:
+                    payload['offset'] = data['offset']
+                on_order_book_update(
+                    market_id, payload,
+                    is_snapshot_hint=(msg_type == "subscribed/order_book"),
+                )
 
     await ws_subscribe_fast(
         channels=[f"order_book/{market_id}"],
@@ -1982,11 +2015,15 @@ async def restart_websocket():
     _book_seq_event.clear()
     state.market.mid_price = None
     ob['initialized'] = False
+    ob['last_offset'] = None
     ob['bids'].clear()
     ob['asks'].clear()
 
     # Start new task
-    ws_task = asyncio.create_task(subscribe_to_market_data(state.config.market_id))
+    ws_task = _supervise_task(
+        asyncio.create_task(subscribe_to_market_data(state.config.market_id)),
+        "market_data_ws",
+    )
 
     try:
         logger.info("⏳ Waiting for websocket reconnection...")
@@ -2600,6 +2637,7 @@ class TxWebSocket:
                 self._url,
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_INTERVAL,
+                close_timeout=5,
             )
             # Consume the initial "connected" message so recv_loop doesn't queue it
             try:
@@ -2861,62 +2899,16 @@ async def _send_single_op_rest(client, tx_type: int, tx_info, op) -> bool:
         return False
 
 
-async def sign_and_send_batch(client, ops: list):
-    """Sign all BatchOps locally, then send as a single send_tx_batch call."""
-    if not ops:
-        return
+def _sign_ops_sync(client, market_index: int, ops: list):
+    """Sign BatchOps via the native signer (CPU-bound; run in an executor).
 
-    # Free-slot mode: when quota is 0, send only 1 op via REST sendTx
-    free_slot_mode = _volume_quota_remaining is not None and _volume_quota_remaining <= 0
-    if free_slot_mode:
-        # Prioritize: cancels first, then position-reducing side
-        pos = state.account.position_size
-        def _free_slot_priority(op):
-            if op.action == "cancel":
-                return 0
-            if pos > 0 and op.side == "sell":
-                return 1  # long → prefer sell to reduce
-            if pos < 0 and op.side == "buy":
-                return 1  # short → prefer buy to reduce
-            return 2
-        ops = sorted(ops, key=_free_slot_priority)
-        ops = ops[:1]
-        logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx (%s %s)",
-                    ops[0].action, ops[0].side)
-
-    # Drain any events that arrived since collect_order_operations (WS fills,
-    # reconciler updates) so the stale-create guard below sees fresh state.
-    order_manager.drain_events()
-
-    # Safety: drop create ops whose slot got filled since collect_order_operations
-    # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
-    # orphaning the order that now occupies the slot.
-    orders = state.orders
-    safe_ops = []
-    for op in ops:
-        if op.action == "create":
-            slot_id = (orders.bid_order_ids[op.level] if op.side == "buy"
-                       else orders.ask_order_ids[op.level])
-            if slot_id is not None:
-                logger.warning(
-                    "Dropping stale create %s[%d]: slot already has order %d",
-                    op.side, op.level, slot_id,
-                )
-                continue
-        safe_ops.append(op)
-    ops = safe_ops
-    if not ops:
-        return
-
-    if logger.isEnabledFor(logging.DEBUG):
-        ops_desc = ", ".join(f"{o.action} {o.side}[{o.level}] @{o.price}" for o in ops)
-        logger.debug("Batch preparing %d ops: %s", len(ops), ops_desc)
-
-    market_index = state.config.market_id
+    Returns ``(tx_types, tx_infos, signed_ops, signed_nonces)``.  Per-op
+    sign errors are logged, the op skipped and its nonce rolled back.
+    """
     tx_types = []
     tx_infos = []
     signed_ops = []
-    signed_nonces = []  # (api_key_index,) per signed op — for rollback
+    signed_nonces = []  # api_key_index per signed op — for rollback
 
     for op in ops:
         api_key_index, nonce = client.nonce_manager.next_nonce()
@@ -2969,46 +2961,110 @@ async def sign_and_send_batch(client, ops: list):
         signed_ops.append(op)
         signed_nonces.append(api_key_index)
 
-    if not tx_types:
-        logger.warning("All batch ops failed signing; nothing to send")
+    return tx_types, tx_infos, signed_ops, signed_nonces
+
+
+async def sign_and_send_batch(client, ops: list):
+    """Sign all BatchOps locally, then send as a single send_tx_batch call."""
+    if not ops:
         return
 
-    # Mark ops as in-progress
-    for op in signed_ops:
+    # Free-slot mode: when quota is 0, send only 1 op via REST sendTx
+    free_slot_mode = _volume_quota_remaining is not None and _volume_quota_remaining <= 0
+    if free_slot_mode:
+        # Prioritize: cancels first, then position-reducing side
+        pos = state.account.position_size
+        def _free_slot_priority(op):
+            if op.action == "cancel":
+                return 0
+            if pos > 0 and op.side == "sell":
+                return 1  # long → prefer sell to reduce
+            if pos < 0 and op.side == "buy":
+                return 1  # short → prefer buy to reduce
+            return 2
+        ops = sorted(ops, key=_free_slot_priority)
+        ops = ops[:1]
+        logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx (%s %s)",
+                    ops[0].action, ops[0].side)
+
+    # Drain any events that arrived since collect_order_operations (WS fills,
+    # reconciler updates) so the stale-create guard below sees fresh state.
+    order_manager.drain_events()
+
+    # Safety: drop create ops whose slot got filled since collect_order_operations
+    # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
+    # orphaning the order that now occupies the slot.
+    orders = state.orders
+    safe_ops = []
+    for op in ops:
         if op.action == "create":
-            order_manager.mark_status(
-                op.side, SideStatus.PLACING, level=op.level,
-                pending_order_id=op.order_id,
-                target_price=op.price, target_size=op.size,
-            )
-        elif op.action == "modify":
-            order_manager.mark_status(
-                op.side, SideStatus.MODIFYING, level=op.level,
-                pending_order_id=op.order_id,
-                target_price=op.price, target_size=op.size,
-            )
-
-    # Free-slot mode: send single op via REST sendTx (not batch)
-    if free_slot_mode and len(tx_types) == 1:
-        try:
-            async with _sdk_write_lock:
-                if time.monotonic() < _global_backoff_until:
-                    client.nonce_manager.acknowledge_failure(signed_nonces[0])
-                    return
-                _record_ops_sent(1)
-                await _send_single_op_rest(client, tx_types[0], tx_infos[0], signed_ops[0])
-        except Exception as e:
-            logger.error("Free-slot single send exception: %s", e, exc_info=True)
-            client.nonce_manager.acknowledge_failure(signed_nonces[0])
+            slot_id = (orders.bid_order_ids[op.level] if op.side == "buy"
+                       else orders.ask_order_ids[op.level])
+            if slot_id is not None:
+                logger.warning(
+                    "Dropping stale create %s[%d]: slot already has order %d",
+                    op.side, op.level, slot_id,
+                )
+                continue
+        safe_ops.append(op)
+    ops = safe_ops
+    if not ops:
         return
+
+    if logger.isEnabledFor(logging.DEBUG):
+        ops_desc = ", ".join(f"{o.action} {o.side}[{o.level}] @{o.price}" for o in ops)
+        logger.debug("Batch preparing %d ops: %s", len(ops), ops_desc)
+
+    market_index = state.config.market_id
+    signed_nonces = []  # api_key_index per signed op — for rollback on errors
+    _sign_ms = 0.0
 
     try:
         async with _sdk_write_lock:
             if time.monotonic() < _global_backoff_until:
-                logger.debug("Batch aborted: global backoff active (acquired lock too late)")
-                for aki in signed_nonces:
-                    client.nonce_manager.acknowledge_failure(aki)
+                logger.debug("Batch aborted: global backoff active")
                 return
+
+            # Sign off-loop: the native signer calls are CPU-bound and would
+            # freeze the event loop (WS callbacks + hot loop) if run inline.
+            # The write lock is held across sign+send so no other SDK writer
+            # can interleave its nonce acquisition with ours.
+            loop = asyncio.get_running_loop()
+            _t0 = time.perf_counter()
+            tx_types, tx_infos, signed_ops, signed_nonces = await loop.run_in_executor(
+                None, _sign_ops_sync, client, market_index, ops,
+            )
+            _sign_ms = (time.perf_counter() - _t0) * 1000.0
+
+            if not tx_types:
+                logger.warning("All batch ops failed signing; nothing to send")
+                return
+
+            # Mark ops as in-progress
+            for op in signed_ops:
+                if op.action == "create":
+                    order_manager.mark_status(
+                        op.side, SideStatus.PLACING, level=op.level,
+                        pending_order_id=op.order_id,
+                        target_price=op.price, target_size=op.size,
+                    )
+                elif op.action == "modify":
+                    order_manager.mark_status(
+                        op.side, SideStatus.MODIFYING, level=op.level,
+                        pending_order_id=op.order_id,
+                        target_price=op.price, target_size=op.size,
+                    )
+
+            # Free-slot mode: send single op via REST sendTx (not batch)
+            if free_slot_mode and len(tx_types) == 1:
+                try:
+                    _record_ops_sent(1)
+                    await _send_single_op_rest(client, tx_types[0], tx_infos[0], signed_ops[0])
+                except Exception as e:
+                    logger.error("Free-slot single send exception: %s", e, exc_info=True)
+                    client.nonce_manager.acknowledge_failure(signed_nonces[0])
+                return
+
             _record_ops_sent(len(signed_ops))
 
             # Try WS first, fall back to REST
@@ -3084,8 +3140,8 @@ async def sign_and_send_batch(client, ops: list):
 
         # Success
         logger.info(
-            "Batch sent via %s: %d ops OK (quota remaining: %s)",
-            send_method, len(signed_ops), quota_remaining,
+            "Batch sent via %s: %d ops OK (sign %.1fms, quota remaining: %s)",
+            send_method, len(signed_ops), _sign_ms, quota_remaining,
         )
         _record_order_success()
         for op in signed_ops:
@@ -3172,14 +3228,33 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
 _MAX_CONSECUTIVE_LOOP_ERRORS = 10
 
 
-async def _paced_send(client, ops: list) -> None:
-    """Background task: pace then send a batch.  Exceptions logged, not raised."""
+async def _paced_send(client) -> None:
+    """Background sender: drain the ops mailbox, pacing each batch.
+
+    The freshest ops are pulled from the mailbox *after* the pacing gate, so
+    a long rate-limit wait never sends prices computed before the wait.  The
+    drain loop keeps going until the mailbox is empty, so ops posted while a
+    send was in flight go out immediately instead of waiting for the next
+    book tick.  Exceptions logged, not raised.
+    """
+    global _latest_ops
     try:
-        cancel_only = all(o.action == "cancel" for o in ops)
-        if await _wait_for_write_slot(op_count=len(ops), cancel_only=cancel_only):
+        while _latest_ops is not None:
+            # Peek for pacing parameters only — the authoritative pull
+            # happens after the gate (newest ops win, sizes approximate).
+            peek = _latest_ops
+            cancel_only = all(o.action == "cancel" for o in peek)
+            if not await _wait_for_write_slot(op_count=len(peek), cancel_only=cancel_only):
+                logger.debug(
+                    "Paced send: write slot denied, %d ops dropped (recomputed next tick)",
+                    len(peek),
+                )
+                _latest_ops = None
+                return
+            ops, _latest_ops = _latest_ops, None
+            if not ops:
+                return
             await sign_and_send_batch(client, ops)
-        else:
-            logger.debug("Paced send: write slot denied, %d ops deferred to next tick", len(ops))
     except asyncio.CancelledError:
         pass
     except Exception as exc:
@@ -3357,14 +3432,14 @@ async def market_making_loop(client):
                     await _dry_run_engine.process_batch(ops)
             else:
                 # Live: always compute ops — no backpressure gate.  Store in
-                # mailbox; sender drains the latest when ready.
+                # mailbox; the sender task drains the freshest batch after
+                # its pacing gate.
                 ops = collect_order_operations(level_prices, base_amount, _log_debug)
                 if ops:
                     _latest_ops = ops
-                # Dispatch if sender is idle and mailbox has content
-                if _send_task is None and _latest_ops is not None:
-                    _send_task = asyncio.create_task(_paced_send(client, _latest_ops))
-                    _latest_ops = None
+                # Start the sender if idle and the mailbox has content
+                if (_send_task is None or _send_task.done()) and _latest_ops is not None:
+                    _send_task = asyncio.create_task(_paced_send(client))
 
             if _dry_run_engine is not None:
                 _dry_run_engine.maybe_log_summary()  # also flushes trade log + state
@@ -3572,6 +3647,29 @@ async def periodic_orderbook_sanity_check(interval=None, tolerance_pct=None):
 
 # === COLD PATH ===
 
+def _supervise_task(task: asyncio.Task, name: str) -> asyncio.Task:
+    """Surface unexpected background-task death instead of failing silently.
+
+    Long-lived tasks (WS feeds, watchdogs, reconcilers) are fire-and-forget;
+    if one dies the bot keeps running without that subsystem.  Log CRITICAL
+    and pause trading so no quotes rest on a dead feed.
+    """
+    task.set_name(name)
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.critical("Background task %r died: %s", name, exc, exc_info=exc)
+            risk_controller.trigger_pause(f"background task {name} died: {exc}")
+        else:
+            logger.critical("Background task %r exited unexpectedly", name)
+            risk_controller.trigger_pause(f"background task {name} exited")
+    task.add_done_callback(_on_done)
+    return task
+
+
 async def main():
     global ws_task, stale_order_task, order_state_task, _dry_run_engine, _trade_logger
     global _latest_reconcile_event, _pending_trades_scheduled, _pending_dry_run_fill_check
@@ -3661,7 +3759,8 @@ async def main():
                 shared_bbo=shared_bbo,
                 stale_threshold=BINANCE_BBO_STALE_SECONDS,
             )
-            binance_bbo_task = asyncio.create_task(bbo_client.run())
+            binance_bbo_task = _supervise_task(
+                asyncio.create_task(bbo_client.run()), "binance_bbo")
             logger.info("Binance BBO: %s@bookTicker", binance_sym)
 
             # Feed 2: @depth@100ms → SharedAlpha (local book + imbalance alpha)
@@ -3675,7 +3774,8 @@ async def main():
                 stale_threshold=BINANCE_STALE_SECONDS,
                 snapshot_limit=BINANCE_DEPTH_SNAPSHOT_LIMIT,
             )
-            binance_depth_task = asyncio.create_task(depth_client.run())
+            binance_depth_task = _supervise_task(
+                asyncio.create_task(depth_client.run()), "binance_depth")
             logger.info(
                 "Binance depth: %s@depth@100ms | window=%d stale=%.0fs min_samples=%d",
                 binance_sym, BINANCE_OBI_WINDOW, BINANCE_STALE_SECONDS, BINANCE_OBI_MIN_SAMPLES,
@@ -3740,9 +3840,12 @@ async def main():
         await _tx_ws.connect()
 
     # Start WebSocket Tasks
-    ws_task = asyncio.create_task(subscribe_to_market_data(state.config.market_id))
-    ticker_task = asyncio.create_task(subscribe_to_ticker(state.config.market_id))
-    order_state_task = asyncio.create_task(order_state_reconcile_loop())
+    ws_task = _supervise_task(
+        asyncio.create_task(subscribe_to_market_data(state.config.market_id)), "market_data_ws")
+    ticker_task = _supervise_task(
+        asyncio.create_task(subscribe_to_ticker(state.config.market_id)), "ticker_ws")
+    order_state_task = _supervise_task(
+        asyncio.create_task(order_state_reconcile_loop()), "order_state_reconcile")
     logger.info("✅ ticker WS subscription started for market %d", state.config.market_id)
 
     user_stats_task = None
@@ -3789,13 +3892,18 @@ async def main():
         account_state_received.set()
         account_all_received.set()
     else:
-        user_stats_task = asyncio.create_task(subscribe_to_user_stats(ACCOUNT_INDEX))
-        account_all_task = asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX))
+        user_stats_task = _supervise_task(
+            asyncio.create_task(subscribe_to_user_stats(ACCOUNT_INDEX)), "user_stats_ws")
+        account_all_task = _supervise_task(
+            asyncio.create_task(subscribe_to_account_all(ACCOUNT_INDEX)), "account_all_ws")
 
     account_orders_task = None
     if not DRY_RUN and client is not None and API_KEY_PRIVATE_KEY:
-        account_orders_task = asyncio.create_task(
-            subscribe_to_account_orders(client, state.config.market_id, ACCOUNT_INDEX)
+        account_orders_task = _supervise_task(
+            asyncio.create_task(
+                subscribe_to_account_orders(client, state.config.market_id, ACCOUNT_INDEX)
+            ),
+            "account_orders_ws",
         )
         logger.info("✅ account_orders authenticated WS task started")
     else:
@@ -3803,8 +3911,11 @@ async def main():
 
     stale_order_task = None
     if not DRY_RUN and client is not None and API_KEY_PRIVATE_KEY:
-        stale_order_task = asyncio.create_task(
-            stale_order_reconciler_loop(client, state.config.market_id, ACCOUNT_INDEX)
+        stale_order_task = _supervise_task(
+            asyncio.create_task(
+                stale_order_reconciler_loop(client, state.config.market_id, ACCOUNT_INDEX)
+            ),
+            "stale_order_reconciler",
         )
         logger.info(
             "✅ stale-order reconciler task started (interval=%.1fs, debounce=%d)",
@@ -3865,7 +3976,7 @@ async def main():
                     trade_logger=_trade_logger,
                     state_path=_dr_state_path,
                     rejection_callback=_record_order_rejection,
-                    maker_fee_rate=0.0000_4,  # 0.004% maker fee (Lighter premium)
+                    maker_fee_rate=MAKER_FEE_RATE,
                 )
                 _dry_run_engine.capture_initial_state()
             logger.info("DRY-RUN engine initialized — run with --live for real trading")
@@ -3897,10 +4008,14 @@ async def main():
             else:
                 logger.info(f"✅ Successfully set leverage to {LEVERAGE}x")
 
-        balance_task = asyncio.create_task(track_balance())
-        sanity_task = asyncio.create_task(periodic_orderbook_sanity_check())
-        lifecycle_watchdog_task = asyncio.create_task(order_lifecycle_watchdog_loop())
-        quote_telemetry_task = asyncio.create_task(quote_telemetry_loop())
+        balance_task = _supervise_task(
+            asyncio.create_task(track_balance()), "balance_tracker")
+        sanity_task = _supervise_task(
+            asyncio.create_task(periodic_orderbook_sanity_check()), "orderbook_sanity")
+        lifecycle_watchdog_task = _supervise_task(
+            asyncio.create_task(order_lifecycle_watchdog_loop()), "lifecycle_watchdog")
+        quote_telemetry_task = _supervise_task(
+            asyncio.create_task(quote_telemetry_loop()), "quote_telemetry")
 
         # Test mode: auto-exit after configured duration
         if TEST_MODE_DURATION is not None:
@@ -3949,7 +4064,10 @@ async def main():
             tasks_to_cancel.append(order_state_task)
         if 'ticker_task' in locals():
             tasks_to_cancel.append(ticker_task)
-        if 'ws_task' in locals():
+        # ws_task is a module global (declared ``global`` above), so it is
+        # never in locals() — check the global directly or the market-data
+        # task survives cleanup and keeps processing during shutdown.
+        if ws_task is not None:
             tasks_to_cancel.append(ws_task)
         if binance_bbo_task is not None:
             tasks_to_cancel.append(binance_bbo_task)
@@ -3959,7 +4077,26 @@ async def main():
         for task in tasks_to_cancel:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        # Bounded teardown: a task that ignores cancellation must not hang
+        # shutdown forever — in live mode the exchange-order cancel below
+        # still has to run.  A task can wedge inside its own cleanup (e.g. a
+        # WS close handshake that never completes); a second cancel
+        # interrupts that await, so escalate before abandoning.
+        if tasks_to_cancel:
+            _done, _pending = await asyncio.wait(tasks_to_cancel, timeout=15.0)
+            if _pending:
+                for task in _pending:
+                    logger.warning(
+                        "Cleanup: task %r did not exit within 15s — cancelling again",
+                        task.get_name(),
+                    )
+                    task.cancel()
+                _done, _pending = await asyncio.wait(_pending, timeout=5.0)
+                for task in _pending:
+                    logger.error(
+                        "Cleanup: task %r still alive — abandoning it",
+                        task.get_name(),
+                    )
 
         if DRY_RUN:
             if _dry_run_engine is not None:

@@ -1,11 +1,23 @@
+import atexit
 import logging
+import logging.handlers
 import os
+import queue
+
+# Keep a reference per logger name so repeated setup_logging() calls don't
+# leak listener threads (each owns a daemon thread draining its queue).
+_queue_listeners: dict[str, logging.handlers.QueueListener] = {}
 
 
 def setup_logging(name, log_dir="logs", log_filename="debug.log", *,
                   console_level=logging.INFO, file_level=logging.DEBUG,
                   silence_third_party=True, clear_file=True):
-    """Configure and return a logger with file + console handlers.
+    """Configure and return a logger with non-blocking file + console handlers.
+
+    Records are routed through a ``QueueHandler`` into a ``QueueListener``
+    running on a background thread, so log emission never does disk/console
+    I/O on the caller's thread (critical: the asyncio event loop must not
+    block on logging in the trading hot path).
 
     Parameters
     ----------
@@ -41,7 +53,7 @@ def setup_logging(name, log_dir="logs", log_filename="debug.log", *,
         except Exception:
             pass
 
-    file_handler = logging.FileHandler(log_path, mode='w')
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
     file_handler.setLevel(file_level)
     file_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
@@ -52,9 +64,35 @@ def setup_logging(name, log_dir="logs", log_filename="debug.log", *,
     console_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     )
+    # Windows consoles often use cp1252 — render unencodable chars (emoji)
+    # as replacements instead of raising per-record logging errors.
+    _stream = getattr(console_handler, 'stream', None)
+    if hasattr(_stream, 'reconfigure'):
+        try:
+            _stream.reconfigure(errors='replace')
+        except Exception:
+            pass
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    # Tear down a previous listener for this logger name (e.g. tests calling
+    # setup_logging repeatedly) before replacing its handlers.
+    old_listener = _queue_listeners.pop(name, None)
+    if old_listener is not None:
+        try:
+            old_listener.stop()
+        except Exception:
+            pass
+
+    log_queue: queue.SimpleQueue = queue.SimpleQueue()
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    listener = logging.handlers.QueueListener(
+        log_queue, file_handler, console_handler, respect_handler_level=True,
+    )
+    listener.start()
+    _queue_listeners[name] = listener
+    atexit.register(_stop_listener, name)
+
+    logger.handlers.clear()
+    logger.addHandler(queue_handler)
     logger.propagate = False
 
     if silence_third_party:
@@ -65,13 +103,23 @@ def setup_logging(name, log_dir="logs", log_filename="debug.log", *,
     return logger
 
 
+def _stop_listener(name):
+    """Flush and stop the queue listener for *name* (idempotent)."""
+    listener = _queue_listeners.pop(name, None)
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+
+
 def setup_summary_logger(log_dir="logs"):
     """Console + file logger for periodic summaries (used by gather_lighter_data)."""
     os.makedirs(log_dir, exist_ok=True)
 
     log_path = os.path.join(log_dir, "debug.log")
 
-    file_handler = logging.FileHandler(log_path, mode='a')
+    file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')

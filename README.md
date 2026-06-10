@@ -7,7 +7,7 @@ Affiliate link to support this project: [Trade on Lighter](https://app.lighter.x
 ## Quick Start
 
 ### Prerequisites
-- Python 3.13+ (venv recommended)
+- Python 3.10+ (venv recommended)
 - C compiler and Python dev headers — required to build the Cython extension
   - Debian/Ubuntu: `sudo apt install build-essential python3-dev`
   - macOS: `xcode-select --install`
@@ -24,6 +24,8 @@ python setup_cython.py build_ext --inplace
 ```
 
 The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -march=native -ffast-math` for ~30x faster order book and spread computation. **Cython is required** — the bot will refuse to start without it. Set `ALLOW_PYTHON_FALLBACK=1` to bypass for dev/test only.
+
+> **Native Windows**: the git-pinned `lighter` SDK fails to import on Windows ("Could not find C standard library"). Install the PyPI build instead — `pip install "lighter-sdk>=1.1.0"` — which ships the Windows signer DLL.
 
 ### Configuration
 
@@ -66,13 +68,15 @@ orderbook_sanity.py      WS vs REST book cross-check
 ws_manager.py            WebSocket subscription manager (ws_subscribe + ws_subscribe_fast)
 trade_log.py             Buffered CSV trade logger
 utils.py                 Shared helpers (config loading, Parquet I/O)
-logging_config.py        Centralized logging setup
+logging_config.py        Non-blocking logging setup (QueueHandler/QueueListener)
 adjust_leverage.py       CLI tool to set leverage/margin mode
 grid_dry_run.py          Parallel grid dry-run engine (N sims sharing one WS)
+check_grid_results.py    Grid results analyzer (top performers, heatmap)
 deploy.py                Zip + upload to remote VPS
 config.json              Runtime configuration
 grid_config.json         Grid parameter search configuration
-tests/                   Unit tests (pytest)
+tests/                   Unit tests (pytest, exchange mocked)
+tests_live/              Integration tests against live public endpoints
 ```
 
 ## How It Works
@@ -104,12 +108,19 @@ The maximum position size is computed dynamically each loop iteration from live 
 ### Hot/Cold Path Separation
 - **Hot path** (market data): orderbook/ticker use `ws_subscribe_fast()` — a tight `await ws.recv()` loop with no per-message task overhead. Book mutation, mid calc, vol_obi update, and quote diff run synchronously. Base amount and max position are precomputed on capital/mid change events, not per tick.
 - **Cold path** (control plane): account data, reconciliation, REST calls, telemetry, trade logging all run on separate WS channels or background tasks. Trade sort/dedup/log is deferred via `call_soon` to avoid blocking market data ingestion.
+- **Non-blocking logging**: all handlers run behind a `QueueHandler`/`QueueListener`, so disk/console writes happen on a background thread — a `logger.debug()` never stalls the event loop.
+- **Off-loop signing**: transaction signing (CPU-bound native calls) runs in an executor under the SDK write lock; signing duration is reported in the batch log.
+- **Send mailbox**: the hot loop writes desired ops to a single-slot mailbox; the sender task pulls the *freshest* ops after the rate-limit gate and drains until empty. A long pacing wait never sends stale prices, and ops never wait for the next book tick.
 - **Order state ownership**: all order mutations go through a deferred event queue (`_order_event_queue`). WS handlers and the reconciler push events; `OrderManager.drain_events()` is the sole writer, called at defined points in the hot loop.
 
 ### Safety Controls
+- **Book feed integrity**: snapshots vs deltas are decided by the protocol message type (`subscribed/order_book` vs `update/order_book`), not by size — busy deltas can exceed 100 levels and must not clear the book. The payload `offset` sequence is tracked; a non-advancing offset (stale/out-of-order delta) is skipped.
+- **WS resilience**: a malformed message or a callback exception is logged and skipped — it never tears down the connection (a reconnect clears the book and resets volatility state).
 - **Orderbook sanity**: periodic REST snapshots cross-checked against WS book
 - **Stale order poller**: reconciles local vs exchange order state; PLACING orders timeout after 30s
 - **Circuit breaker**: pauses trading after consecutive rejections; force-clears stuck orders after 5 retries
+- **Task supervision**: every long-lived background task is supervised — unexpected death logs CRITICAL and pauses trading so quotes never rest on a dead feed.
+- **Bounded shutdown**: cleanup cancels tasks with a 15s budget, re-cancels stragglers wedged in their own teardown (e.g. a WS close handshake), and never blocks the final exchange-order cancel.
 - **Max live orders**: caps open orders per market
 - **Adaptive backoff**: exponential 429 backoff (15s→120s) with 5-minute time-based auto-decay
 - **Nonce safety**: `acknowledge_failure` + `hard_refresh_nonce` on all error paths
@@ -121,7 +132,7 @@ The maximum position size is computed dynamically each loop iteration from live 
 |-----|---------|-------------|
 | `leverage` | `2` | Leverage set at startup |
 | `margin_mode` | `cross` | `cross` or `isolated` |
-| `levels_per_side` | `1` | Quote levels per side |
+| `levels_per_side` | `2` | Quote levels per side |
 | `base_amount` | `0.0002` | Fallback order size (base currency) |
 | `capital_usage_percent` | `0.12` | Fraction of balance per order |
 | `default_quote_update_threshold_bps` | `10.0` | Base requote threshold (adaptive system may widen) |
@@ -129,16 +140,17 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `order_timeout_seconds` | `30.0` | Order placement timeout |
 | `position_value_threshold_usd` | `11.0` | USD threshold to consider position flat |
 | `min_order_value_usd` | `14.5` | Minimum order value in USD |
+| `maker_fee_rate` | `0.00004` | Maker fee for sims/accounting (0.004% premium tier; standard accounts are 0) |
 
 ### `trading.vol_obi`
 | Key | Default | Description |
 |-----|---------|-------------|
 | `window_steps` | `6000` | Rolling window length |
 | `step_ns` | `100000000` | Step size in nanoseconds (100ms) |
-| `vol_to_half_spread` | `48.0` | Volatility to half-spread multiplier |
-| `min_half_spread_bps` | `8.0` | Minimum half-spread (bps) |
-| `c1_ticks` | `20.0` | OBI skew coefficient in ticks |
-| `skew` | `3.0` | Global skew scaling factor |
+| `vol_to_half_spread` | `42.0` | Volatility to half-spread multiplier |
+| `min_half_spread_bps` | `4.0` | Minimum half-spread (bps) |
+| `c1_ticks` | `120.0` | OBI skew coefficient in ticks |
+| `skew` | `1.5` | Global skew scaling factor |
 | `looking_depth` | `0.025` | Book depth fraction for OBI |
 | `min_warmup_samples` | `100` | Samples before live quoting |
 | `warmup_seconds` | `600` | Warmup period (10 minutes) |
@@ -186,7 +198,7 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `max_consecutive_order_rejections` | `5` | Rejections triggering circuit breaker |
 | `circuit_breaker_cooldown_sec` | `60.0` | Cooldown after circuit breaker trips |
 | `order_reconcile_timeout_sec` | `2.0` | Cancel confirmation timeout |
-| `max_live_orders_per_market` | `2` | Max open orders per market |
+| `max_live_orders_per_market` | `4` | Max open orders per market |
 
 **Config precedence:** env var > `config.json` > hardcoded default.
 

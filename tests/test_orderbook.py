@@ -59,6 +59,56 @@ class TestApplyOrderbookUpdate(unittest.TestCase):
         self.assertNotIn(102.0, asks)
         self.assertEqual(asks[101.0], 3.0)
 
+    def test_snapshot_hint_forces_snapshot_on_small_book(self):
+        """A protocol-marked snapshot must replace the book even when small."""
+        bids = {999.0: 1.0, 100.0: 1.0}
+        asks = {150.0: 1.0}
+        bids_in = [{"price": "100", "size": "2"}]
+        asks_in = [{"price": "101", "size": "3"}]
+
+        is_snapshot = apply_orderbook_update(
+            bids, asks, True, bids_in, asks_in, is_snapshot_hint=True,
+        )
+
+        self.assertTrue(is_snapshot)
+        # Stale levels must be gone — without the hint this would have been
+        # applied as a delta, leaving 999.0/150.0 behind.
+        self.assertEqual(bids, {100.0: 2.0})
+        self.assertEqual(asks, {101.0: 3.0})
+
+    def test_snapshot_hint_false_keeps_delta_semantics(self):
+        """hint=False on a small update is still a delta."""
+        bids = {100.0: 1.0}
+        asks = {101.0: 3.0}
+
+        is_snapshot = apply_orderbook_update(
+            bids, asks, True,
+            [{"price": "99", "size": "2"}], [], is_snapshot_hint=False,
+        )
+
+        self.assertFalse(is_snapshot)
+        self.assertEqual(bids, {100.0: 1.0, 99.0: 2.0})
+
+    def test_snapshot_hint_false_overrides_size_heuristic(self):
+        """A >100-level update/order_book message is still a DELTA.
+
+        Live feed shows busy deltas can exceed the legacy 100-level
+        heuristic; treating them as snapshots would wipe the rest of the
+        book.  The protocol msg type is authoritative when provided.
+        """
+        bids = {50.0: 1.0}   # far level that a wrongly-applied snapshot would wipe
+        asks = {200.0: 1.0}
+        bids_in = [{"price": str(100 + i), "size": "1"} for i in range(124)]
+
+        is_snapshot = apply_orderbook_update(
+            bids, asks, True, bids_in, [], is_snapshot_hint=False,
+        )
+
+        self.assertFalse(is_snapshot)
+        self.assertIn(50.0, bids)        # pre-existing level survived
+        self.assertIn(200.0, asks)
+        self.assertEqual(len(bids), 125)  # 1 old + 124 delta levels
+
     def test_snapshot_ignores_zero_size(self):
         bids, asks = {}, {}
         bids_in = [{"price": "100", "size": "1"}, {"price": "99", "size": "0"}]
@@ -102,7 +152,12 @@ class TestApplyOrderbookUpdateCBookSide(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from _vol_obi_fast import CBookSide
+        try:
+            from _vol_obi_fast import CBookSide
+        except ImportError:
+            raise unittest.SkipTest(
+                "Cython extension not built (python setup_cython.py build_ext --inplace)"
+            )
         cls.CBookSide = CBookSide
 
     def _make(self):

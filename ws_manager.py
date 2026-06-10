@@ -71,6 +71,7 @@ async def ws_subscribe(
                 url,
                 ping_interval=ping_interval,
                 ping_timeout=ping_interval,
+                close_timeout=5,
             ) as ws:
                 logger.info(f"Connected to {url} for {label}")
 
@@ -141,15 +142,24 @@ async def ws_subscribe(
                     try:
                         data = _loads(message)
                         msg_type = data.get("type")
+                    except (ValueError, TypeError, AttributeError):
+                        logger.warning(f"Failed to decode JSON from {label}: {message!r}")
+                        continue
 
-                        if msg_type == "ping":
-                            await ws.send(_PONG_MSG)
-                        elif msg_type == "subscribed":
-                            logger.info(f"Subscribed to channel: {data.get('channel')}")
-                        else:
+                    if msg_type == "ping":
+                        await ws.send(_PONG_MSG)
+                    elif msg_type == "subscribed":
+                        logger.info(f"Subscribed to channel: {data.get('channel')}")
+                    else:
+                        # A buggy callback must not tear down the connection —
+                        # log and keep consuming the stream.
+                        try:
                             on_message(data)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Failed to decode JSON from {label}: {message}")
+                        except Exception:
+                            logger.error(
+                                f"Error in {label} on_message callback; continuing",
+                                exc_info=True,
+                            )
 
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
             logger.info(f"{label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")
@@ -205,6 +215,7 @@ async def ws_subscribe_fast(
                 url,
                 ping_interval=ping_interval,
                 ping_timeout=ping_interval,
+                close_timeout=5,
             ) as ws:
                 logger.info(f"Connected to {url} for {label}")
 
@@ -241,15 +252,29 @@ async def ws_subscribe_fast(
                             on_disconnect()
                         break
 
-                    data = _loads(message)
-                    msg_type = data.get("type")
+                    try:
+                        data = _loads(message)
+                        msg_type = data.get("type")
+                    except (ValueError, TypeError, AttributeError):
+                        logger.warning(f"Failed to decode JSON from {label}: {message!r}")
+                        continue
 
                     if msg_type == "ping":
                         await ws.send(_PONG_MSG)
                     elif msg_type == "subscribed":
                         logger.info(f"Subscribed to channel: {data.get('channel')}")
                     else:
-                        on_message(data)
+                        # A buggy callback must not tear down the connection —
+                        # a reconnect here clears the book and resets the
+                        # volatility state (quoting downtime).  Log and keep
+                        # consuming the stream instead.
+                        try:
+                            on_message(data)
+                        except Exception:
+                            logger.error(
+                                f"Error in {label} on_message callback; continuing",
+                                exc_info=True,
+                            )
 
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
             logger.info(f"{label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")
