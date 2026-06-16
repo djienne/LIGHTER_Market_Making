@@ -1,0 +1,135 @@
+{
+    "trading": {
+        "leverage": 1,
+        "margin_mode": "cross",
+        "levels_per_side": 2,
+        "base_amount": 0.0002,
+        "capital_usage_percent": 0.15,
+        "default_quote_update_threshold_bps": 25.0,
+        "spread_factor_level1": 2.0,
+        "order_timeout_seconds": 30.0,
+        "position_value_threshold_usd": 11.0,
+        "min_order_value_usd": 14.5,
+        "maker_fee_rate": 0.0,
+        "live_quality": {
+            "markout_horizons_sec": [
+                5,
+                30,
+                60
+            ],
+            "window_seconds": 3600,
+            "adaptive_enabled": true,
+            "adaptive_horizon_sec": 30,
+            "adverse_threshold_bps": 2.0,
+            "spread_widen_per_adverse_bps": 0.05,
+            "max_spread_multiplier": 1.5,
+            "size_reduce_per_adverse_bps": 0.06,
+            "min_size_multiplier": 0.55,
+            "metrics_flush_seconds": 10
+        },
+        "inventory_exit_bias": {
+            "enabled": true,
+            "min_ratio": 0.05,
+            "exit_tighten_per_ratio": 0.45,
+            "add_widen_per_ratio": 0.75,
+            "max_exit_tighten": 0.35,
+            "max_add_widen": 0.65,
+            "adverse_boost_per_bps": 0.03
+        },
+        "quote_engine": "cartea_jaimungal",
+        "cartea_jaimungal": {
+            "use_estimator": true,
+            "require_estimator_ready": true,
+            "estimator_blend": 1.0,
+            "lambda": 0.3,
+            "kappa": 0.035,
+            "epsilon": 4.0,
+            "sigma2_per_sec": 0.0,
+            "sigma2_scale": 1.0,
+            "volatility_spread_multiplier": 0.1,
+            "alpha": 0.001,
+            "phi": 0.00008,
+            "horizon_seconds": 60,
+            "q_max": 3,
+            "solver_mode": "asymmetric",
+            "asym_n_steps": 30,
+            "asym_max_iter": 10,
+            "refresh_seconds": 300,
+            "spread_multiplier": 2.5,
+            "min_half_spread_bps": 8.0,
+            "max_half_spread_bps": 120.0,
+            "inventory_unit_base": 0.0002,
+            "max_toxicity": 1.5,
+            "lambda_scale": 1.0,
+            "kappa_scale": 1.0,
+            "epsilon_scale": 1.0
+        },
+        "cj_estimator": {
+            "enabled": true,
+            "window_seconds": 900,
+            "markout_seconds": 5,
+            "min_trades_per_side": 8,
+            "min_markouts_per_side": 4,
+            "kappa_min": 0.005,
+            "kappa_max": 0.25,
+            "min_kappa_points": 4,
+            "min_kappa_r2": 0.15,
+            "epsilon_floor": 0.0,
+            "epsilon_cap": 80.0,
+            "default_lambda": 0.3,
+            "default_kappa": 0.035,
+            "default_epsilon": 4.0
+        },
+        "vol_obi": {
+            "window_steps": 6000,
+            "step_ns": 100000000,
+            "vol_to_half_spread": 48.0,
+            "min_half_spread_bps": 4.0,
+            "c1_ticks": 120.0,
+            "skew": 1.5,
+            "looking_depth": 0.025,
+            "min_warmup_samples": 100,
+            "warmup_seconds": 600
+        },
+        "alpha": {
+            "source": "lighter",
+            "stale_seconds": 5.0,
+            "window_size": 6000,
+            "min_samples": 150,
+            "looking_depth": 0.025,
+            "bbo_min_samples": 10,
+            "bbo_stale_seconds": 5.0,
+            "depth_snapshot_limit": 1000
+        }
+    },
+    "performance": {
+        "min_loop_interval": 0.1,
+        "rate_limit_send_interval": 0.15,
+        "quota_recovery": {
+            "enabled": false,
+            "trigger_threshold": 5,
+            "target_quota": 50,
+            "max_attempts": 0,
+            "max_loss_usd": 0.0,
+            "cooldown_seconds": 120,
+            "post_warmup_grace_seconds": 120
+        }
+    },
+    "websocket": {
+        "ping_interval": 20,
+        "recv_timeout": 30.0,
+        "account_recv_timeout": 1800.0,
+        "reconnect_base_delay": 5,
+        "reconnect_max_delay": 60
+    },
+    "safety": {
+        "stale_order_poller_interval_sec": 3.0,
+        "stale_order_debounce_count": 2,
+        "max_consecutive_order_rejections": 5,
+        "circuit_breaker_cooldown_sec": 60.0,
+        "order_reconcile_timeout_sec": 2.0,
+        "max_live_orders_per_market": 4,
+        "panic_close_on_startup": false,
+        "panic_close_on_shutdown": false
+    }
+}

@@ -24,6 +24,17 @@ _PONG_MSG = '{"type":"pong"}'
 _logger = logging.getLogger(__name__)
 
 
+async def _cancel_and_drain(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosedOK):
+        pass
+
+
 async def ws_subscribe(
     channels,
     label,
@@ -99,17 +110,18 @@ async def ws_subscribe(
                     if event_task is not None:
                         wait_set.add(event_task)
 
-                    done, pending = await asyncio.wait(
-                        wait_set,
-                        timeout=recv_timeout,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    try:
+                        done, pending = await asyncio.wait(
+                            wait_set,
+                            timeout=recv_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except asyncio.CancelledError:
+                        await _cancel_and_drain(recv_task)
+                        await _cancel_and_drain(event_task)
+                        raise
                     for task in pending:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+                        await _cancel_and_drain(task)
 
                     if not done:
                         logger.warning(
@@ -125,11 +137,7 @@ async def ws_subscribe(
                             reconnect_event.clear()
                             logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
                             if not recv_task.done():
-                                recv_task.cancel()
-                                try:
-                                    await recv_task
-                                except asyncio.CancelledError:
-                                    pass
+                                await _cancel_and_drain(recv_task)
                             if on_disconnect:
                                 on_disconnect()
                             break

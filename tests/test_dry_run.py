@@ -1485,9 +1485,13 @@ class TestTradeLog(unittest.TestCase):
                 header = next(reader)
                 row = next(reader)
             self.assertEqual(header[0], "timestamp")
+            self.assertIn("notional_usd", header)
+            self.assertIn("spread_capture_bps", header)
+            self.assertIn("realized_pnl_cumulative", header)
             self.assertEqual(row[1], "BTC")
             self.assertEqual(row[2], "buy")
             self.assertEqual(row[10], "true")
+            self.assertEqual(row[11], "50.000000")
 
     def test_clear_resets_log(self):
         with tempfile.TemporaryDirectory() as tmpdir:

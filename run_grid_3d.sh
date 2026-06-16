@@ -6,21 +6,52 @@
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
-SYMBOL="BTC"
-DURATION_SEC=$((3 * 24 * 3600))
-CHECK_INTERVAL=3600
-MAX_RESTARTS=50
-WARMUP_SEC=660
-LOG_DIR="logs"
+SYMBOL="${MARKET_SYMBOL:-BTC}"
+DURATION_SEC="${DURATION_SEC:-$((3 * 24 * 3600))}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-3600}"
+MAX_RESTARTS="${MAX_RESTARTS:-50}"
+WARMUP_SEC="${WARMUP_SEC:-660}"
+LOG_DIR="${LOG_DIR:-logs}"
 GRID_DIR="$LOG_DIR/grid"
 CONSOLE_LOG="$LOG_DIR/grid_console.log"
 DEBUG_LOG="$LOG_DIR/grid_debug.log"
 MONITOR_LOG="$LOG_DIR/grid_monitor.log"
 PID_FILE="$LOG_DIR/grid_monitor.pid"
-GRID_CONFIG="grid_config.json"
+GRID_CONFIG="${GRID_CONFIG:-grid_config.json}"
 
 mkdir -p "$LOG_DIR" "$GRID_DIR"
 echo $$ > "$PID_FILE"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x "venv/bin/python" ]]; then
+        PYTHON_BIN="venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    else
+        echo "No Python interpreter found. Set PYTHON_BIN=/path/to/python." >&2
+        exit 1
+    fi
+fi
+
+EXPECTED_SLOTS=$("$PYTHON_BIN" - "$GRID_CONFIG" <<'PY'
+import itertools
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+
+axes = cfg.get("parameters", {})
+if not axes:
+    print(0)
+else:
+    total = 1
+    for values in axes.values():
+        total *= len(values)
+    print(total)
+PY
+)
 
 START_TS=$(date +%s)
 END_TS=$((START_TS + DURATION_SEC))
@@ -42,7 +73,7 @@ trap cleanup EXIT INT TERM
 
 start_bot() {
     log "Starting grid dry-run (symbol=$SYMBOL, config=$GRID_CONFIG)..."
-    python -u market_maker_v2.py --symbol "$SYMBOL" --grid "$GRID_CONFIG" \
+    "$PYTHON_BIN" -u market_maker_v2.py --symbol "$SYMBOL" --grid "$GRID_CONFIG" \
         >> "$CONSOLE_LOG" 2>&1 &
     BOT_PID=$!
     log "Grid bot started (PID $BOT_PID)."
@@ -100,10 +131,10 @@ check_health() {
         fi
     fi
 
-    # 5) Count state files (should be 64)
+    # 5) Count state files (one persisted wallet per challenger slot)
     local state_count
     state_count=$(ls "$GRID_DIR"/state_*.json 2>/dev/null | wc -l)
-    log "State files: $state_count/64"
+    log "State files: $state_count/$EXPECTED_SLOTS"
 
     $ok
 }

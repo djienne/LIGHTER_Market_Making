@@ -12,6 +12,31 @@
         "position_value_threshold_usd": 11.0,
         "min_order_value_usd": 14.5,
         "maker_fee_rate": 0.00004,
+        "live_quality": {
+            "markout_horizons_sec": [
+                5,
+                30,
+                60
+            ],
+            "window_seconds": 3600,
+            "adaptive_enabled": true,
+            "adaptive_horizon_sec": 30,
+            "adverse_threshold_bps": 2.0,
+            "spread_widen_per_adverse_bps": 0.05,
+            "max_spread_multiplier": 1.5,
+            "size_reduce_per_adverse_bps": 0.06,
+            "min_size_multiplier": 0.55,
+            "metrics_flush_seconds": 10
+        },
+        "inventory_exit_bias": {
+            "enabled": true,
+            "min_ratio": 0.05,
+            "exit_tighten_per_ratio": 0.45,
+            "add_widen_per_ratio": 0.75,
+            "max_exit_tighten": 0.35,
+            "max_add_widen": 0.65,
+            "adverse_boost_per_bps": 0.03
+        },
         "vol_obi": {
             "window_steps": 6000,
             "step_ns": 100000000,
@@ -50,7 +75,7 @@
     "websocket": {
         "ping_interval": 20,
         "recv_timeout": 30.0,
-        "account_recv_timeout": 300.0,
+        "account_recv_timeout": 1800.0,
         "reconnect_base_delay": 5,
         "reconnect_max_delay": 60
     },
@@ -60,6 +85,8 @@
         "max_consecutive_order_rejections": 5,
         "circuit_breaker_cooldown_sec": 60.0,
         "order_reconcile_timeout_sec": 2.0,
-        "max_live_orders_per_market": 4
+        "max_live_orders_per_market": 4,
+        "panic_close_on_startup": false,
+        "panic_close_on_shutdown": false
     }
 }
