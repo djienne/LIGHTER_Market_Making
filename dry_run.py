@@ -46,6 +46,16 @@ class SimulatedOrder:
     _pending_prev_by_price: Optional[dict] = None
 
 
+@dataclass
+class PendingMarkout:
+    side: str
+    fill_price: float
+    fill_size: float
+    mid_at_fill: float
+    horizon: float
+    due_at: float
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -98,6 +108,25 @@ class DryRunEngine:
         self._initial_capital: float = 0.0
         self._initial_portfolio_value: float = 0.0
         self._entry_price_before: float = 0.0
+        self._started_at_wall: str = datetime.now(timezone.utc).isoformat()
+
+        # Fill-quality metrics
+        self._maker_fill_count: int = 0
+        self._taker_fill_count: int = 0
+        self._spread_capture_bps_sum: float = 0.0
+        self._spread_capture_count: int = 0
+        self._pending_markouts: list[PendingMarkout] = []
+        self._markout_horizons = (1.0, 5.0, 30.0)
+        self._markout_sum_bps = {str(h): 0.0 for h in self._markout_horizons}
+        self._markout_adverse_sum_bps = {str(h): 0.0 for h in self._markout_horizons}
+        self._markout_counts = {str(h): 0 for h in self._markout_horizons}
+        self._inventory_abs_usd_seconds: float = 0.0
+        self._inventory_boundary_seconds: float = 0.0
+        self._inventory_sample_seconds: float = 0.0
+        self._inventory_max_usd_seen: float = 0.0
+        self._inventory_boundary_usd: float = 0.0
+        self._last_inventory_sample: float = time.monotonic()
+        self._external_quality_metrics: dict = {}
 
         # Periodic summary
         self._last_summary: float = 0.0
@@ -157,6 +186,22 @@ class DryRunEngine:
             "total_volume": self._total_volume,
             "initial_capital": self._initial_capital,
             "initial_portfolio_value": self._initial_portfolio_value,
+            "started_at": self._started_at_wall,
+            "maker_fill_count": self._maker_fill_count,
+            "taker_fill_count": self._taker_fill_count,
+            "spread_capture_bps_avg": self.spread_capture_bps_avg,
+            "markout_bps_avg": self.markout_bps_avg,
+            "adverse_markout_bps_avg": self.adverse_markout_bps_avg,
+            "markout_sum_bps": self._markout_sum_bps,
+            "markout_adverse_sum_bps": self._markout_adverse_sum_bps,
+            "markout_counts": self._markout_counts,
+            "inventory_abs_usd_seconds": self._inventory_abs_usd_seconds,
+            "inventory_boundary_seconds": self._inventory_boundary_seconds,
+            "inventory_sample_seconds": self._inventory_sample_seconds,
+            "inventory_max_usd_seen": self._inventory_max_usd_seen,
+            "inventory_boundary_usd": self._inventory_boundary_usd,
+            "inventory_boundary_ratio": self.inventory_boundary_ratio,
+            **self._external_quality_metrics,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -215,6 +260,21 @@ class DryRunEngine:
         engine._realized_pnl = data.get("realized_pnl", 0.0)
         engine._fill_count = data.get("fill_count", 0)
         engine._total_volume = data.get("total_volume", 0.0)
+        engine._started_at_wall = data.get("started_at", engine._started_at_wall)
+        engine._maker_fill_count = data.get("maker_fill_count", engine._fill_count)
+        engine._taker_fill_count = data.get("taker_fill_count", 0)
+        engine._inventory_abs_usd_seconds = data.get("inventory_abs_usd_seconds", 0.0)
+        engine._inventory_boundary_seconds = data.get("inventory_boundary_seconds", 0.0)
+        engine._inventory_sample_seconds = data.get("inventory_sample_seconds", 0.0)
+        engine._inventory_max_usd_seen = data.get("inventory_max_usd_seen", 0.0)
+        engine._inventory_boundary_usd = data.get("inventory_boundary_usd", 0.0)
+        engine._markout_sum_bps.update(data.get("markout_sum_bps", {}))
+        engine._markout_adverse_sum_bps.update(data.get("markout_adverse_sum_bps", {}))
+        engine._markout_counts.update(data.get("markout_counts", {}))
+        engine._external_quality_metrics = {
+            key: value for key, value in data.items()
+            if key.startswith("cj_") or key.startswith("estimator_")
+        }
 
         # Sync restored state into the global state object
         state.account.available_capital = data.get("available_capital", engine._initial_capital)
@@ -447,10 +507,14 @@ class DryRunEngine:
         Called on every WS orderbook delta (~100 ms) for lowest latency.
         ``bids`` / ``asks`` are ``_BookSide`` (SortedDict-like) objects.
         """
+        now = time.monotonic()
+        self._update_inventory_time(now=now)
+        mid = self._state.market.mid_price
+        if mid is not None and mid > 0:
+            self._resolve_markouts(now, mid)
+
         if not self._live_orders:
             return
-
-        now = time.monotonic()
 
         # Track total available liquidity consumed by earlier orders in this
         # tick so that multiple simulated orders don't over-consume the same book.
@@ -710,6 +774,12 @@ class DryRunEngine:
 
         # Trade log (buffer only — no disk I/O on hot path)
         if self._trade_logger is not None:
+            mid_at_fill = self._state.market.mid_price
+            spread_capture_bps = None
+            inventory_after_usd = None
+            if mid_at_fill is not None and mid_at_fill > 0:
+                spread_capture_bps = self._spread_capture_for_fill(sim.side, fill_price, mid_at_fill)
+                inventory_after_usd = self._position * mid_at_fill
             self._trade_logger.log_fill(
                 side=sim.side,
                 price=fill_price,
@@ -720,7 +790,19 @@ class DryRunEngine:
                 available_capital=self._state.account.available_capital,
                 portfolio_value=self._state.account.portfolio_value,
                 simulated=True,
+                notional_usd=fill_size * fill_price,
+                fee_usd=fee,
+                entry_vwap_after=self._entry_vwap,
+                realized_pnl_cumulative=self._realized_pnl,
+                mid_at_fill=mid_at_fill,
+                spread_capture_bps=spread_capture_bps,
+                inventory_after_usd=inventory_after_usd,
+                client_order_index=sim.client_order_id,
+                exchange_order_index=sim.synthetic_exchange_id,
+                fill_source="dry_run_maker",
             )
+
+        self._record_fill_quality(sim.side, fill_price, fill_size)
 
     @staticmethod
     def _is_reducing(side: str, old_pos: float) -> bool:
@@ -777,6 +859,123 @@ class DryRunEngine:
     @property
     def total_pnl(self) -> float:
         return self._realized_pnl + self.unrealized_pnl
+
+    def set_inventory_boundary_usd(self, value: float) -> None:
+        self._inventory_boundary_usd = max(float(value or 0.0), 0.0)
+
+    def set_external_quality_metrics(self, metrics: dict) -> None:
+        clean = {}
+        for key, value in metrics.items():
+            if isinstance(key, str) and (key.startswith("cj_") or key.startswith("estimator_")):
+                clean[key] = value
+        self._external_quality_metrics.update(clean)
+
+    def _update_inventory_time(self, *, now: Optional[float] = None) -> None:
+        now = time.monotonic() if now is None else now
+        dt = max(0.0, min(now - self._last_inventory_sample, 5.0))
+        self._last_inventory_sample = now
+        mid = self._state.market.mid_price
+        if dt <= 0 or mid is None or mid <= 0:
+            return
+        self._inventory_sample_seconds += dt
+        inv_usd = abs(self._position) * mid
+        self._inventory_abs_usd_seconds += inv_usd * dt
+        self._inventory_max_usd_seen = max(self._inventory_max_usd_seen, inv_usd)
+        if self._inventory_boundary_usd > 0 and inv_usd >= 0.85 * self._inventory_boundary_usd:
+            self._inventory_boundary_seconds += dt
+
+    @property
+    def inventory_boundary_ratio(self) -> float:
+        if self._inventory_boundary_seconds <= 0 or self._inventory_sample_seconds <= 0:
+            return 0.0
+        return min(self._inventory_boundary_seconds / self._inventory_sample_seconds, 1.0)
+
+    @staticmethod
+    def _spread_capture_for_fill(side: str, fill_price: float, mid_at_fill: float) -> float:
+        if mid_at_fill <= 0:
+            return 0.0
+        if side == "buy":
+            return (mid_at_fill - fill_price) / mid_at_fill * 10_000.0
+        return (fill_price - mid_at_fill) / mid_at_fill * 10_000.0
+
+    def _record_fill_quality(self, side: str, fill_price: float, fill_size: float) -> None:
+        self._maker_fill_count += 1
+        mid = self._state.market.mid_price
+        if mid is None or mid <= 0:
+            return
+        spread_capture = self._spread_capture_for_fill(side, fill_price, mid)
+        self._spread_capture_bps_sum += spread_capture
+        self._spread_capture_count += 1
+        now = time.monotonic()
+        for horizon in self._markout_horizons:
+            self._pending_markouts.append(
+                PendingMarkout(
+                    side=side,
+                    fill_price=fill_price,
+                    fill_size=fill_size,
+                    mid_at_fill=mid,
+                    horizon=horizon,
+                    due_at=now + horizon,
+                )
+            )
+
+    def _resolve_markouts(self, now: float, mid: float) -> None:
+        if not self._pending_markouts:
+            return
+        pending: list[PendingMarkout] = []
+        for item in self._pending_markouts:
+            if item.due_at > now:
+                pending.append(item)
+                continue
+            if item.fill_price <= 0:
+                continue
+            if item.side == "buy":
+                markout = (mid - item.fill_price) / item.fill_price * 10_000.0
+            else:
+                markout = (item.fill_price - mid) / item.fill_price * 10_000.0
+            adverse = max(0.0, -markout)
+            key = str(item.horizon)
+            self._markout_sum_bps[key] = self._markout_sum_bps.get(key, 0.0) + markout
+            self._markout_adverse_sum_bps[key] = self._markout_adverse_sum_bps.get(key, 0.0) + adverse
+            self._markout_counts[key] = self._markout_counts.get(key, 0) + 1
+        self._pending_markouts = pending
+
+    @property
+    def spread_capture_bps_avg(self) -> float:
+        if self._spread_capture_count <= 0:
+            return 0.0
+        return self._spread_capture_bps_sum / self._spread_capture_count
+
+    @property
+    def markout_bps_avg(self) -> dict[str, float]:
+        return {
+            key: (self._markout_sum_bps.get(key, 0.0) / count if count > 0 else 0.0)
+            for key, count in self._markout_counts.items()
+        }
+
+    @property
+    def adverse_markout_bps_avg(self) -> dict[str, float]:
+        return {
+            key: (self._markout_adverse_sum_bps.get(key, 0.0) / count if count > 0 else 0.0)
+            for key, count in self._markout_counts.items()
+        }
+
+    def quality_metrics(self) -> dict:
+        self._update_inventory_time()
+        return {
+            "maker_fill_count": self._maker_fill_count,
+            "taker_fill_count": self._taker_fill_count,
+            "spread_capture_bps_avg": self.spread_capture_bps_avg,
+            "markout_bps_avg": self.markout_bps_avg,
+            "adverse_markout_bps_avg": self.adverse_markout_bps_avg,
+            "inventory_abs_usd_seconds": self._inventory_abs_usd_seconds,
+            "inventory_boundary_seconds": self._inventory_boundary_seconds,
+            "inventory_sample_seconds": self._inventory_sample_seconds,
+            "inventory_max_usd_seen": self._inventory_max_usd_seen,
+            "inventory_boundary_usd": self._inventory_boundary_usd,
+            "inventory_boundary_ratio": self.inventory_boundary_ratio,
+            **self._external_quality_metrics,
+        }
 
     def maybe_log_summary(self) -> None:
         """Log periodic PnL summary (call from main loop)."""

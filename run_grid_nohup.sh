@@ -5,14 +5,27 @@ set -euo pipefail
 
 CONFIG="${1:-grid_config.json}"
 SYMBOL="${MARKET_SYMBOL:-BTC}"
-LOG_DIR="logs"
+LOG_DIR="${LOG_DIR:-logs}"
 
 mkdir -p "$LOG_DIR"
 
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -x "venv/bin/python" ]]; then
+        PYTHON_BIN="venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    else
+        echo "No Python interpreter found. Set PYTHON_BIN=/path/to/python." >&2
+        exit 1
+    fi
+fi
+
 # Build Cython if not compiled
-if ! python -c "import _vol_obi_fast" 2>/dev/null; then
+if ! "$PYTHON_BIN" -c "import _vol_obi_fast" 2>/dev/null; then
     echo "Building Cython extension..."
-    python setup_cython.py build_ext --inplace
+    "$PYTHON_BIN" setup_cython.py build_ext --inplace
 fi
 
 # Check not already running
@@ -24,7 +37,7 @@ if pgrep -f "market_maker_v2.py.*--grid" > /dev/null 2>&1; then
 fi
 
 echo "Starting grid dry-run (symbol=$SYMBOL, config=$CONFIG)..."
-nohup python -u market_maker_v2.py --symbol "$SYMBOL" --grid "$CONFIG" \
+nohup "$PYTHON_BIN" -u market_maker_v2.py --symbol "$SYMBOL" --grid "$CONFIG" \
     > "$LOG_DIR/grid_console.log" 2>&1 &
 PID=$!
 echo "Started (PID $PID). Logs:"

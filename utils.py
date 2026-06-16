@@ -80,8 +80,9 @@ async def get_market_details_async(symbol: str) -> Tuple[Optional[int], float, O
         return None, price_tick_size, None
 
 def load_config_params():
-    """Load parameters from config.json (resolved relative to this file's directory)."""
-    config_path = Path(__file__).resolve().parent / 'config.json'
+    """Load parameters from LIGHTER_MM_CONFIG or config.json."""
+    env_path = os.getenv('LIGHTER_MM_CONFIG')
+    config_path = Path(env_path).expanduser() if env_path else Path(__file__).resolve().parent / 'config.json'
     try:
         with open(config_path, 'r') as f:
             return json.load(f)

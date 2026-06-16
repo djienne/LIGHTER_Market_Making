@@ -27,6 +27,16 @@ _HEADER = [
     "available_capital",
     "portfolio_value",
     "simulated",
+    "notional_usd",
+    "fee_usd",
+    "entry_vwap_after",
+    "realized_pnl_cumulative",
+    "mid_at_fill",
+    "spread_capture_bps",
+    "inventory_after_usd",
+    "client_order_index",
+    "exchange_order_index",
+    "fill_source",
 ]
 
 
@@ -48,9 +58,21 @@ class TradeLogger:
 
     def _ensure_header(self) -> None:
         """Write CSV header if file doesn't exist or is empty."""
-        if os.path.exists(self._path) and os.path.getsize(self._path) > 0:
-            return
         with self._write_lock:
+            if os.path.exists(self._path) and os.path.getsize(self._path) > 0:
+                with open(self._path, newline="") as f:
+                    rows = list(csv.reader(f))
+                if rows and rows[0] == _HEADER:
+                    return
+                if rows and rows[0] and rows[0] != _HEADER:
+                    padded_rows = [rows[0] + [h for h in _HEADER[len(rows[0]):]]]
+                    for row in rows[1:]:
+                        padded_rows.append(row + [""] * max(0, len(_HEADER) - len(row)))
+                    with open(self._path, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(_HEADER)
+                        writer.writerows(padded_rows[1:])
+                    return
             with open(self._path, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(_HEADER)
@@ -71,9 +93,20 @@ class TradeLogger:
         available_capital: float,
         portfolio_value: float,
         simulated: bool,
+        notional_usd: float | None = None,
+        fee_usd: float | None = None,
+        entry_vwap_after: float | None = None,
+        realized_pnl_cumulative: float | None = None,
+        mid_at_fill: float | None = None,
+        spread_capture_bps: float | None = None,
+        inventory_after_usd: float | None = None,
+        client_order_index: int | str | None = None,
+        exchange_order_index: int | str | None = None,
+        fill_source: str = "",
     ) -> None:
         """Buffer one fill row (no disk I/O)."""
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        notional = price * size if notional_usd is None else notional_usd
         row = [
             ts,
             self._symbol,
@@ -86,6 +119,16 @@ class TradeLogger:
             f"{available_capital:.2f}",
             f"{portfolio_value:.2f}",
             str(simulated).lower(),
+            "" if notional is None else f"{notional:.6f}",
+            "" if fee_usd is None else f"{fee_usd:.8f}",
+            "" if entry_vwap_after is None else f"{entry_vwap_after:.10g}",
+            "" if realized_pnl_cumulative is None else f"{realized_pnl_cumulative:.6f}",
+            "" if mid_at_fill is None else f"{mid_at_fill:.10g}",
+            "" if spread_capture_bps is None else f"{spread_capture_bps:.4f}",
+            "" if inventory_after_usd is None else f"{inventory_after_usd:.6f}",
+            "" if client_order_index is None else str(client_order_index),
+            "" if exchange_order_index is None else str(exchange_order_index),
+            fill_source,
         ]
         with self._lock:
             self._buffer.append(row)

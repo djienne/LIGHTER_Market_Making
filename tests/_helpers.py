@@ -19,6 +19,8 @@ _STATE_MAP = {
     'MARKET_ID':               lambda: (mm.state.config, 'market_id'),
     '_PRICE_TICK_FLOAT':       lambda: (mm.state.config, 'price_tick_float'),
     '_AMOUNT_TICK_FLOAT':      lambda: (mm.state.config, 'amount_tick_float'),
+    'min_base_amount':         lambda: (mm.state.config, 'min_base_amount'),
+    'min_quote_amount':        lambda: (mm.state.config, 'min_quote_amount'),
     'local_order_book':        lambda: (mm.state.market, 'local_order_book'),
     'current_mid_price_cached':lambda: (mm.state.market, 'mid_price'),
     'ws_connection_healthy':   lambda: (mm.state.market, 'ws_connection_healthy'),
@@ -54,8 +56,23 @@ def temp_mm_attrs(**overrides):
     mm._latest_reconcile_event = None
     mm._reconcile_pending_event.clear()
     mm._pending_trades.clear()
+    mm._pending_live_fill_contexts.clear()
+    mm._processed_account_trade_ids.clear()
     mm._pending_trades_scheduled = False
     mm._pending_dry_run_fill_check = False
+    mm._live_fill_accounting_started = False
+    mm._live_fill_position_size = 0.0
+    mm._live_fill_entry_vwap = 0.0
+    mm._live_fill_realized_pnl = 0.0
+    mm._live_fill_count = 0
+    mm._live_volume_usd = 0.0
+    mm._live_state_store = None
+    mm._live_metrics = None
+    mm._live_fill_seq = 0
+    mm._last_quality_adjustment_log = 0.0
+    mm._account_trade_accept_after_ms = 0
+    mm._last_live_accounting_sync_log = 0.0
+    mm._last_inventory_exit_bias_log = 0.0
     # Save/restore local_order_book by replacing with a fresh empty book on teardown.
     # Cannot deepcopy because CBookSide (Cython) doesn't support __reduce__.
     saved_ob = mm.state.market.local_order_book
@@ -89,8 +106,23 @@ def temp_mm_attrs(**overrides):
         mm._latest_reconcile_event = None
         mm._reconcile_pending_event.clear()
         mm._pending_trades.clear()
+        mm._pending_live_fill_contexts.clear()
+        mm._processed_account_trade_ids.clear()
         mm._pending_trades_scheduled = False
         mm._pending_dry_run_fill_check = False
+        mm._live_fill_accounting_started = False
+        mm._live_fill_position_size = 0.0
+        mm._live_fill_entry_vwap = 0.0
+        mm._live_fill_realized_pnl = 0.0
+        mm._live_fill_count = 0
+        mm._live_volume_usd = 0.0
+        mm._live_state_store = None
+        mm._live_metrics = None
+        mm._live_fill_seq = 0
+        mm._last_quality_adjustment_log = 0.0
+        mm._account_trade_accept_after_ms = 0
+        mm._last_live_accounting_sync_log = 0.0
+        mm._last_inventory_exit_bias_log = 0.0
         # Restore original if it was replaced, or reset to fresh empty book
         # if tests mutated the object in-place.
         if 'local_order_book' in overrides:
