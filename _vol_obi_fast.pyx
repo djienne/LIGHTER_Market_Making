@@ -542,6 +542,7 @@ cdef class VolObiCalculator:
     cdef bint _has_prev_mid
     cdef double _volatility
     cdef double _alpha
+    cdef double _local_alpha
     cdef double _alpha_override
     cdef bint _has_alpha_override
     cdef bint _warmed_up
@@ -579,6 +580,7 @@ cdef class VolObiCalculator:
         self._has_prev_mid = False
         self._volatility = 0.0
         self._alpha = 0.0
+        self._local_alpha = 0.0
         self._alpha_override = 0.0
         self._has_alpha_override = False
         self._warmed_up = False
@@ -627,13 +629,14 @@ cdef class VolObiCalculator:
                 logger.info(
                     "Vol+OBI warmed up after %d samples | vol_scale=%.3f",
                     self._total_samples, self._vol_scale,
-                )
+            )
             vol_raw = self._mid_stats.c_std()
             self._volatility = vol_raw * self._vol_scale
+            self._local_alpha = self._imb_stats.c_zscore(imbalance)
             if self._has_alpha_override:
                 self._alpha = self._alpha_override
             else:
-                self._alpha = self._imb_stats.c_zscore(imbalance)
+                self._alpha = self._local_alpha
 
     cdef double _compute_imbalance(self, double mid_price, object bids, object asks):
         """Dispatch to C-fast or Python-slow path based on book type."""
@@ -742,9 +745,13 @@ cdef class VolObiCalculator:
         """
         if alpha is None:
             self._has_alpha_override = False
+            if self._warmed_up:
+                self._alpha = self._local_alpha
         else:
             self._has_alpha_override = True
             self._alpha_override = <double>alpha
+            if self._warmed_up:
+                self._alpha = self._alpha_override
 
     # ----- accessors -----
 
@@ -776,6 +783,7 @@ cdef class VolObiCalculator:
         self._has_prev_mid = False
         self._volatility = 0.0
         self._alpha = 0.0
+        self._local_alpha = 0.0
         self._has_alpha_override = False
         self._warmed_up = False
         self._total_samples = 0

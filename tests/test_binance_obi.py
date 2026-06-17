@@ -312,6 +312,20 @@ class TestBinanceDiffDepthClientSnapshot(unittest.TestCase):
             client._update_alpha()
         self.assertGreater(sa.sample_count, 0)
 
+    def test_update_alpha_invokes_callback(self):
+        calls = []
+        client, sa = self._make_client(on_alpha_update=lambda: calls.append(sa.alpha))
+        client._apply_snapshot({
+            'lastUpdateId': 500,
+            'bids': [["50000.0", "10.0"], ["49999.0", "5.0"]],
+            'asks': [["50001.0", "1.0"], ["50002.0", "1.0"]],
+        })
+
+        client._update_alpha()
+
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0], sa.alpha)
+
     def test_imbalance_balanced_book(self):
         client, _ = self._make_client()
         client._apply_snapshot({

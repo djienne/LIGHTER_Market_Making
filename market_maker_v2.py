@@ -193,7 +193,7 @@ ORDER_TIMEOUT = float(os.getenv(
     _trading.get("order_timeout_seconds", 5.0)))
 DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv(
     "DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS",
-    _trading.get("default_quote_update_threshold_bps", 10.0)))
+    _trading.get("default_quote_update_threshold_bps", 5.0)))
 QUOTE_UPDATE_THRESHOLD_BPS = DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS  # backward-compatible alias
 SPREAD_FACTOR_LEVEL1 = float(os.getenv(
     "SPREAD_FACTOR_LEVEL1",
@@ -658,8 +658,34 @@ BINANCE_DEPTH_SNAPSHOT_LIMIT = int(os.getenv("BINANCE_DEPTH_SNAPSHOT_LIMIT", _al
 
 # Global events and task refs (not part of state — asyncio primitives)
 order_book_received = asyncio.Event()    # legacy: used by startup wait + tests
-_book_seq: int = 0                       # monotonic counter, bumped by WS callback
-_book_seq_event = asyncio.Event()        # signaled on every bump for hot-loop wakeup
+_book_seq: int = 0                       # monotonic counter, bumped by Lighter book callback
+_quote_seq: int = 0                      # bumped by any market-data input that can change quotes
+_quote_seq_event = asyncio.Event()       # signaled on every quote-relevant market-data bump
+
+
+def _bump_quote_signal() -> None:
+    global _quote_seq
+    _quote_seq += 1
+    _quote_seq_event.set()
+
+
+def _refresh_external_alpha_override() -> None:
+    calc = state.vol_obi_state.calculator
+    if calc is None:
+        return
+    if QUOTE_ENGINE == "cartea_jaimungal":
+        calc.set_alpha_override(None)
+        return
+    ba = state.binance_alpha
+    if ba is not None and ba.warmed_up and not ba.is_stale(BINANCE_STALE_SECONDS):
+        calc.set_alpha_override(ba.alpha)
+    else:
+        calc.set_alpha_override(None)
+
+
+def _on_external_alpha_update() -> None:
+    _refresh_external_alpha_override()
+    _bump_quote_signal()
 account_state_received = asyncio.Event()
 account_all_received = asyncio.Event()
 ws_reconnect_event = asyncio.Event()
@@ -2540,16 +2566,7 @@ def on_order_book_update(market_id, payload, is_snapshot_hint=None):
                 # Feed vol_obi calculator on every book update (hot path)
                 calc = state.vol_obi_state.calculator
                 if calc is not None:
-                    # CJ uses Lighter public trades/orderbook only.  The
-                    # legacy Vol+OBI engine may optionally inject Binance alpha.
-                    if QUOTE_ENGINE == "cartea_jaimungal":
-                        calc.set_alpha_override(None)
-                    else:
-                        ba = state.binance_alpha
-                        if ba is not None and ba.warmed_up and not ba.is_stale(BINANCE_STALE_SECONDS):
-                            calc.set_alpha_override(ba.alpha)
-                        else:
-                            calc.set_alpha_override(None)
+                    _refresh_external_alpha_override()
                     calc.on_book_update(mid, ob['bids'], ob['asks'])
 
                 if _dry_run_engine is not None and not _pending_dry_run_fill_check:
@@ -2559,7 +2576,7 @@ def on_order_book_update(market_id, payload, is_snapshot_hint=None):
                 order_book_received.set()
                 global _book_seq
                 _book_seq += 1
-                _book_seq_event.set()
+                _bump_quote_signal()
             else:
                 # Book is one-sided — clear stale mid_price to prevent
                 # the trading loop from quoting at an outdated level.
@@ -3146,7 +3163,7 @@ async def restart_websocket():
     # Reset market data state (order state is managed by account_orders WS)
     ob = state.market.local_order_book
     order_book_received.clear()
-    _book_seq_event.clear()
+    _quote_seq_event.clear()
     state.market.mid_price = None
     ob['initialized'] = False
     ob['last_offset'] = None
@@ -4698,7 +4715,7 @@ async def order_state_reconcile_loop() -> None:
 
 
 async def market_making_loop(client):
-    global _pause_cleanup_running, _send_task, _latest_ops, _book_seq
+    global _pause_cleanup_running, _send_task, _latest_ops, _quote_seq
     logger.info("Starting 2-sided market making loop...")
     _log_info = logger.isEnabledFor(logging.INFO)
     _log_debug = logger.isEnabledFor(logging.DEBUG)
@@ -4707,7 +4724,7 @@ async def market_making_loop(client):
     _warmup_logged = False
     _last_warmup_log_min = -1
     _warmup_complete_logged = False
-    _last_seen_seq = _book_seq  # track last-processed book sequence
+    _last_seen_seq = _quote_seq  # track last-processed quote-relevant market-data sequence
 
     while True:
         try:
@@ -4782,15 +4799,15 @@ async def market_making_loop(client):
                 await asyncio.sleep(MIN_LOOP_INTERVAL)
                 continue
 
-            # Wait for fresh order book data via monotonic sequence counter.
-            # Only wait if no new update arrived since last iteration.
-            if _book_seq == _last_seen_seq:
-                _book_seq_event.clear()
+            # Wait for fresh market data via monotonic sequence counter.
+            # Lighter book changes and external alpha changes both wake this path.
+            if _quote_seq == _last_seen_seq:
+                _quote_seq_event.clear()
                 try:
-                    await asyncio.wait_for(_book_seq_event.wait(), timeout=ORDER_TIMEOUT)
+                    await asyncio.wait_for(_quote_seq_event.wait(), timeout=ORDER_TIMEOUT)
                 except asyncio.TimeoutError:
                     pass
-            _last_seen_seq = _book_seq
+            _last_seen_seq = _quote_seq
 
             # Process only hot slot mutations here. Reconcile snapshots are
             # coalesced and handled by the cold reconcile task.
@@ -4833,6 +4850,7 @@ async def market_making_loop(client):
                     continue
 
             _refresh_cj_params_if_needed()
+            _refresh_external_alpha_override()
 
             level_prices = calculate_order_prices(
                 snap_mid, position_size=snap_position,
@@ -5287,6 +5305,7 @@ async def main():
                 looking_depth=BINANCE_OBI_LOOKING_DEPTH,
                 stale_threshold=BINANCE_STALE_SECONDS,
                 snapshot_limit=BINANCE_DEPTH_SNAPSHOT_LIMIT,
+                on_alpha_update=_on_external_alpha_update,
             )
             binance_depth_task = _supervise_task(
                 asyncio.create_task(depth_client.run()), "binance_depth")

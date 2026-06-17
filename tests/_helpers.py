@@ -31,6 +31,7 @@ _STATE_MAP = {
     'account_positions':       lambda: (mm.state.account, 'positions'),
     'recent_trades':           lambda: (mm.state.account, 'recent_trades'),
     'vol_obi_calc':            lambda: (mm.state.vol_obi_state, 'calculator'),
+    'binance_alpha':           lambda: (mm.state, 'binance_alpha'),
     '_tx_ws':                  lambda: (mm, '_tx_ws'),
     '_last_send_time':             lambda: (mm, '_last_send_time'),
     '_last_sdk_write_time':        lambda: (mm, '_last_send_time'),  # compat alias

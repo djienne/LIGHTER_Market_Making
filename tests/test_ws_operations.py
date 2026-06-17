@@ -975,6 +975,32 @@ class TestCollectOrderOperations(unittest.TestCase):
 
             self.assertEqual(len(ops), 0)
 
+    def test_collect_threshold_is_independent_per_side(self):
+        """Bid and ask replacement thresholds are evaluated independently."""
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            _PRICE_TICK_FLOAT=0.01,
+            _AMOUNT_TICK_FLOAT=0.001,
+            QUOTE_UPDATE_THRESHOLD_BPS=5.0,
+            _volume_quota_remaining=None,
+        ):
+            mm.state.orders.bid_order_ids[0] = 42
+            mm.state.orders.bid_prices[0] = 100.0
+            mm.state.orders.bid_sizes[0] = 1.0
+            mm.state.orders.ask_order_ids[0] = 43
+            mm.state.orders.ask_prices[0] = 101.0
+            mm.state.orders.ask_sizes[0] = 1.0
+            mm._client_to_exchange_id[42] = 420
+            mm._client_to_exchange_id[43] = 430
+
+            # Bid changes by about 6 bps, ask by about 3 bps.
+            ops = mm.collect_order_operations([(99.94, 101.03)], base_amount=1.0)
+
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(ops[0].action, "modify")
+            self.assertEqual(ops[0].side, "buy")
+            self.assertAlmostEqual(ops[0].price, 99.94)
+
     def test_collect_modifies_when_size_changes(self):
         """Existing order with unchanged price but different size -> modify op."""
         with temp_mm_attrs(
@@ -1093,6 +1119,37 @@ class TestCollectOrderOperations(unittest.TestCase):
             self.assertEqual(ops[0].side, "sell")
             self.assertEqual(mm.state.orders.bid_order_ids[0], 42)
             self.assertEqual(lc.status, mm.SideStatus.PLACING)
+
+
+class TestQuoteSignal(unittest.TestCase):
+
+    def test_external_alpha_update_applies_alpha_and_bumps_quote_signal(self):
+        class _Calc:
+            def __init__(self):
+                self.overrides = []
+
+            def set_alpha_override(self, alpha):
+                self.overrides.append(alpha)
+
+        class _Alpha:
+            alpha = 2.5
+            warmed_up = True
+
+            def is_stale(self, _threshold):
+                return False
+
+        calc = _Calc()
+        with temp_mm_attrs(
+            _quote_seq=10,
+            QUOTE_ENGINE="vol_obi",
+            vol_obi_calc=calc,
+            binance_alpha=_Alpha(),
+        ), temp_event_state(mm._quote_seq_event, set_value=False):
+            mm._on_external_alpha_update()
+
+            self.assertEqual(mm._quote_seq, 11)
+            self.assertTrue(mm._quote_seq_event.is_set())
+            self.assertEqual(calc.overrides, [2.5])
 
 
 class TestOrderLifecycleWatchdog(unittest.IsolatedAsyncioTestCase):

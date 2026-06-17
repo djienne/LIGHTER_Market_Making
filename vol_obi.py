@@ -119,7 +119,8 @@ class VolObiCalculator:
 
     __slots__ = (
         '_mid_stats', '_imb_stats', '_prev_mid',
-        '_volatility', '_alpha', '_alpha_override', '_warmed_up', '_total_samples',
+        '_volatility', '_alpha', '_local_alpha', '_alpha_override',
+        '_warmed_up', '_total_samples',
         # config
         '_tick_size', '_vol_scale',
         '_vol_to_half_spread', '_min_half_spread_bps',
@@ -147,6 +148,7 @@ class VolObiCalculator:
         self._prev_mid = None
         self._volatility = 0.0
         self._alpha = 0.0
+        self._local_alpha = 0.0
         self._alpha_override = None
         self._warmed_up = False
         self._total_samples = 0
@@ -196,10 +198,11 @@ class VolObiCalculator:
                 )
             vol_raw = self._mid_stats.std()              # [DOLLARS]
             self._volatility = vol_raw * self._vol_scale  # [DOLLARS]  (Rust obi.rs:360)
+            self._local_alpha = self._imb_stats.zscore(imbalance)  # [dimensionless]
             if self._alpha_override is not None:
                 self._alpha = self._alpha_override
             else:
-                self._alpha = self._imb_stats.zscore(imbalance)  # [dimensionless]
+                self._alpha = self._local_alpha
 
     def _compute_imbalance(self, mid_price: float, bids, asks) -> float:
         """Sum bid/ask sizes within looking_depth of mid_price."""
@@ -285,6 +288,8 @@ class VolObiCalculator:
         Pass ``None`` to revert to Lighter-computed imbalance.
         """
         self._alpha_override = alpha
+        if self._warmed_up:
+            self._alpha = self._local_alpha if alpha is None else alpha
 
     # ----- accessors -----
 
@@ -315,6 +320,7 @@ class VolObiCalculator:
         self._prev_mid = None
         self._volatility = 0.0
         self._alpha = 0.0
+        self._local_alpha = 0.0
         self._alpha_override = None
         self._warmed_up = False
         self._total_samples = 0

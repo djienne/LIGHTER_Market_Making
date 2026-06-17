@@ -313,6 +313,7 @@ class BinanceDiffDepthClient:
         reconnect_max: float = 60.0,
         snapshot_limit: int = 1000,
         snapshot_timeout: float = 10.0,
+        on_alpha_update=None,
     ):
         self._symbol = binance_symbol.lower()
         self._shared_alpha = shared_alpha
@@ -323,6 +324,7 @@ class BinanceDiffDepthClient:
         self._reconnect_max = reconnect_max
         self._snapshot_limit = snapshot_limit
         self._snapshot_timeout = snapshot_timeout
+        self._on_alpha_update = on_alpha_update
 
         # Local book
         self._bids = _BookSide()
@@ -541,6 +543,8 @@ class BinanceDiffDepthClient:
         self._imb_stats.push(imbalance)
         alpha = self._imb_stats.zscore(imbalance)
         self._shared_alpha.update(alpha)
+        if self._on_alpha_update is not None:
+            self._on_alpha_update()
 
     def _compute_imbalance(self, mid: float) -> float:
         lower = mid * (1.0 - self._looking_depth)

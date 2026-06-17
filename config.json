@@ -5,7 +5,7 @@
         "levels_per_side": 2,
         "base_amount": 0.0002,
         "capital_usage_percent": 0.12,
-        "default_quote_update_threshold_bps": 10.0,
+        "default_quote_update_threshold_bps": 5.0,
         "_comment_threshold": "base value at full quota; adaptive system widens under quota pressure",
         "spread_factor_level1": 2.0,
         "order_timeout_seconds": 30.0,

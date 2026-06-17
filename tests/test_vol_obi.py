@@ -223,13 +223,14 @@ class TestVolObiCalculator(unittest.TestCase):
         self.assertTrue(calc.warmed_up)
 
         # With override, alpha should be the injected value
+        local_alpha = calc.alpha
         calc.set_alpha_override(3.0)
-        bids, asks = _make_book(2999.95, 3000.05)
-        calc.on_book_update(3000.0, bids, asks)
         self.assertAlmostEqual(calc.alpha, 3.0)
 
         # Revert to Lighter-computed alpha
         calc.set_alpha_override(None)
+        self.assertAlmostEqual(calc.alpha, local_alpha)
+        bids, asks = _make_book(2999.95, 3000.05)
         calc.on_book_update(3000.0, bids, asks)
         self.assertNotAlmostEqual(calc.alpha, 3.0)
 
@@ -336,10 +337,11 @@ class TestVolObiCalculatorCBookSide(unittest.TestCase):
     def test_alpha_override_injection(self):
         calc = self._make_calc()
         _warm_up_calculator_c(calc, mid=3000.0, spread=0.2)
+        local_alpha = calc.alpha
         calc.set_alpha_override(3.0)
-        bids, asks = _make_book_c(2999.95, 3000.05)
-        calc.on_book_update(3000.0, bids, asks)
         self.assertAlmostEqual(calc.alpha, 3.0)
         calc.set_alpha_override(None)
+        self.assertAlmostEqual(calc.alpha, local_alpha)
+        bids, asks = _make_book_c(2999.95, 3000.05)
         calc.on_book_update(3000.0, bids, asks)
         self.assertNotAlmostEqual(calc.alpha, 3.0)

@@ -91,12 +91,12 @@ A background WebSocket streams Binance Futures depth data. The OBI signal biases
 
 ### Adaptive Quote Threshold
 The quote update threshold scales with volume quota pressure:
-| Quota remaining | Multiplier | Effect at 10bp base |
+| Quota remaining | Multiplier | Effect at 5bp base |
 |----------------|-----------|---------------------|
-| >= 500         | 1x        | 10bp                |
-| 50 - 499       | 2x        | 20bp                |
-| 10 - 49        | 3.5x      | 35bp                |
-| 0 - 9          | 5x        | 50bp                |
+| >= 500         | 1x        | 5bp                 |
+| 50 - 499       | 2x        | 10bp                |
+| 10 - 49        | 3.5x      | 17.5bp              |
+| 0 - 9          | 5x        | 25bp                |
 
 This conserves quota when it's scarce by only requoting on larger price moves.
 
@@ -137,7 +137,7 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `levels_per_side` | `2` | Quote levels per side |
 | `base_amount` | `0.0002` | Fallback order size (base currency) |
 | `capital_usage_percent` | `0.12` | Fraction of balance per order |
-| `default_quote_update_threshold_bps` | `10.0` | Base requote threshold (adaptive system may widen) |
+| `default_quote_update_threshold_bps` | `5.0` | Base requote threshold (adaptive system may widen) |
 | `spread_factor_level1` | `2.0` | Level 1 spread multiplier |
 | `order_timeout_seconds` | `30.0` | Order placement timeout |
 | `position_value_threshold_usd` | `11.0` | USD threshold to consider position flat |
