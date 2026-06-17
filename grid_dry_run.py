@@ -33,7 +33,9 @@ from binance_obi import (
     SharedBBO,
     lighter_to_binance_symbol,
 )
+from cartea_jaimungal import CarteaJaimungalCalculator, CarteaJaimungalParams
 from dry_run import DryRunEngine
+from lighter_estimators import CJSnapshot, LighterCJEstimator
 from logging_config import setup_logging
 from orderbook import apply_orderbook_update
 from trade_log import TradeLogger
@@ -111,13 +113,25 @@ MIN_ORDER_VALUE_USD = float(_trading.get("min_order_value_usd", 14.5))
 
 # Recognised parameter names that can appear in grid config "parameters" or "fixed"
 _KNOWN_PARAMS = {
+    "quote_engine",
     "vol_to_half_spread", "min_half_spread_bps", "skew",
     "spread_factor_level1", "capital_usage_percent", "num_levels", "c1_ticks",
+    "cj_lambda", "cj_lambda_plus", "cj_lambda_minus",
+    "cj_kappa", "cj_kappa_plus", "cj_kappa_minus",
+    "cj_epsilon", "cj_epsilon_plus", "cj_epsilon_minus",
+    "cj_sigma2_per_sec", "cj_sigma2_scale", "cj_volatility_spread_multiplier",
+    "cj_alpha", "cj_phi", "cj_horizon_seconds", "cj_q_max",
+    "cj_spread_multiplier", "cj_min_half_spread_bps", "cj_max_half_spread_bps",
+    "cj_inventory_unit_base", "cj_max_toxicity", "cj_solver_mode",
+    "cj_asym_n_steps", "cj_asym_max_iter", "cj_use_estimator",
+    "cj_estimator_blend", "cj_lambda_scale", "cj_kappa_scale",
+    "cj_epsilon_scale", "cj_refresh_seconds",
 }
 
 
 @dataclass
 class GridParams:
+    quote_engine: str = "vol_obi"
     vol_to_half_spread: float = 48.0
     min_half_spread_bps: float = 8.0
     skew: float = 3.0
@@ -125,11 +139,52 @@ class GridParams:
     capital_usage_percent: float = 0.12
     num_levels: int = 2
     c1_ticks: float = 20.0
+    cj_lambda: float = 0.30
+    cj_lambda_plus: float = 0.0
+    cj_lambda_minus: float = 0.0
+    cj_kappa: float = 0.035
+    cj_kappa_plus: float = 0.0
+    cj_kappa_minus: float = 0.0
+    cj_epsilon: float = 4.0
+    cj_epsilon_plus: float = 0.0
+    cj_epsilon_minus: float = 0.0
+    cj_sigma2_per_sec: float = 0.0
+    cj_sigma2_scale: float = 1.0
+    cj_volatility_spread_multiplier: float = 0.0
+    cj_alpha: float = 0.001
+    cj_phi: float = 0.0001
+    cj_horizon_seconds: float = 60.0
+    cj_q_max: int = 3
+    cj_spread_multiplier: float = 1.0
+    cj_min_half_spread_bps: float = 4.0
+    cj_max_half_spread_bps: float = 80.0
+    cj_inventory_unit_base: float = 0.0002
+    cj_max_toxicity: float = 1.5
+    cj_solver_mode: str = "asymmetric"
+    cj_asym_n_steps: int = 40
+    cj_asym_max_iter: int = 12
+    cj_use_estimator: bool = False
+    cj_estimator_blend: float = 1.0
+    cj_lambda_scale: float = 1.0
+    cj_kappa_scale: float = 1.0
+    cj_epsilon_scale: float = 1.0
+    cj_refresh_seconds: float = 300.0
     label: str = ""
 
 
 def _param_key(p: GridParams) -> str:
     """Deterministic, human-readable key from parameter values."""
+    if p.quote_engine == "cartea_jaimungal":
+        dyn = "_dyn" if p.cj_use_estimator else ""
+        return (
+            f"cj{dyn}_{p.cj_solver_mode}"
+            f"_lp{p.cj_lambda_plus or p.cj_lambda}_lm{p.cj_lambda_minus or p.cj_lambda}"
+            f"_kp{p.cj_kappa_plus or p.cj_kappa}_km{p.cj_kappa_minus or p.cj_kappa}"
+            f"_ep{p.cj_epsilon_plus or p.cj_epsilon}_em{p.cj_epsilon_minus or p.cj_epsilon}"
+            f"_a{p.cj_alpha}_ph{p.cj_phi}_sm{p.cj_spread_multiplier}_vs{p.cj_volatility_spread_multiplier}"
+            f"_ls{p.cj_lambda_scale}_ks{p.cj_kappa_scale}_es{p.cj_epsilon_scale}_ss{p.cj_sigma2_scale}"
+            f"_c{p.capital_usage_percent}_l{p.num_levels}"
+        )
     return (
         f"v{p.vol_to_half_spread}_m{p.min_half_spread_bps}"
         f"_s{p.skew}_f{p.spread_factor_level1}"
@@ -198,6 +253,8 @@ class GridSlot:
     client_to_exchange_id: dict
     spread_factors: list
     last_cid: int = 0
+    last_cj_refresh: float = 0.0
+    last_cj_estimator_ready: bool = False
 
     def next_client_order_index(self) -> int:
         new_id = time.time_ns() % _MAX_CLIENT_ORDER_INDEX
@@ -256,6 +313,13 @@ class GridRunner:
             for name, val in zip(axis_names, combo):
                 kw[name] = val
             kw["num_levels"] = int(kw.get("num_levels", 2))
+            engine = str(kw.get("quote_engine", "vol_obi")).strip().lower()
+            if engine in {"cj", "cartea", "cartea_jaimungal", "cartea-jaimungal"}:
+                kw["quote_engine"] = "cartea_jaimungal"
+            elif engine in {"vol_obi", "obi", "vol-obi"}:
+                kw["quote_engine"] = "vol_obi"
+            else:
+                raise ValueError(f"Unknown quote_engine: {kw.get('quote_engine')!r}")
             kw["label"] = f"s{i:03d}"
             self._param_combos.append(GridParams(**kw))
 
@@ -274,6 +338,29 @@ class GridRunner:
         self._log_dir = os.getenv("LOG_DIR", "logs")
         self._grid_dir = os.path.join(self._log_dir, "grid")
         self._start_time = 0.0
+        estimator_cfg = cfg.get("cj_estimator", {}) if isinstance(cfg.get("cj_estimator", {}), dict) else {}
+        self._cj_estimator_enabled = bool(
+            estimator_cfg.get("enabled", False)
+            or fixed.get("cj_use_estimator", False)
+            or any(p.cj_use_estimator for p in self._param_combos)
+        )
+        self._cj_estimator: LighterCJEstimator | None = None
+        if self._cj_estimator_enabled:
+            self._cj_estimator = LighterCJEstimator(
+                window_seconds=float(estimator_cfg.get("window_seconds", 900.0)),
+                markout_seconds=float(estimator_cfg.get("markout_seconds", 5.0)),
+                min_trades_per_side=int(estimator_cfg.get("min_trades_per_side", 8)),
+                min_markouts_per_side=int(estimator_cfg.get("min_markouts_per_side", 4)),
+                kappa_min=float(estimator_cfg.get("kappa_min", 0.005)),
+                kappa_max=float(estimator_cfg.get("kappa_max", 0.25)),
+                min_kappa_points=int(estimator_cfg.get("min_kappa_points", 4)),
+                min_kappa_r2=float(estimator_cfg.get("min_kappa_r2", 0.15)),
+                epsilon_floor=float(estimator_cfg.get("epsilon_floor", 0.0)),
+                epsilon_cap=float(estimator_cfg.get("epsilon_cap", 80.0)),
+                default_lambda=float(estimator_cfg.get("default_lambda", 0.30)),
+                default_kappa=float(estimator_cfg.get("default_kappa", 0.035)),
+                default_epsilon=float(estimator_cfg.get("default_epsilon", 4.0)),
+            )
 
         logger.info(
             "Grid config: %d parameter combos, capital=$%.0f, leverage=%d",
@@ -283,6 +370,100 @@ class GridRunner:
     # ------------------------------------------------------------------
     # Slot creation with persistence
     # ------------------------------------------------------------------
+
+    def _base_cj_params(self, params: GridParams) -> CarteaJaimungalParams:
+        lambda_plus = params.cj_lambda_plus or params.cj_lambda
+        lambda_minus = params.cj_lambda_minus or params.cj_lambda
+        kappa_plus = params.cj_kappa_plus or params.cj_kappa
+        kappa_minus = params.cj_kappa_minus or params.cj_kappa
+        epsilon_plus = params.cj_epsilon_plus or params.cj_epsilon
+        epsilon_minus = params.cj_epsilon_minus or params.cj_epsilon
+        solver_mode = str(params.cj_solver_mode or "asymmetric").strip().lower()
+        if solver_mode not in {"symmetric", "asymmetric"}:
+            solver_mode = "asymmetric"
+        return CarteaJaimungalParams(
+            lambda_plus=float(lambda_plus),
+            lambda_minus=float(lambda_minus),
+            kappa_plus=float(kappa_plus),
+            kappa_minus=float(kappa_minus),
+            epsilon_plus=float(epsilon_plus),
+            epsilon_minus=float(epsilon_minus),
+            sigma2_per_sec=float(params.cj_sigma2_per_sec),
+            alpha=float(params.cj_alpha),
+            phi=float(params.cj_phi),
+            horizon_seconds=float(params.cj_horizon_seconds),
+            q_max=int(params.cj_q_max),
+            spread_multiplier=float(params.cj_spread_multiplier),
+            min_half_spread_bps=float(params.cj_min_half_spread_bps),
+            max_half_spread_bps=float(params.cj_max_half_spread_bps),
+            maker_fee_rate=self._maker_fee_rate,
+            inventory_unit_base=float(params.cj_inventory_unit_base),
+            max_toxicity=float(params.cj_max_toxicity),
+            volatility_spread_multiplier=float(params.cj_volatility_spread_multiplier),
+            solver_mode=solver_mode,
+            asym_n_steps=int(params.cj_asym_n_steps),
+            asym_max_iter=int(params.cj_asym_max_iter),
+        )
+
+    @staticmethod
+    def _blend(base: float, dynamic: float, blend: float) -> float:
+        blend = min(max(float(blend), 0.0), 1.0)
+        return (float(base) * (1.0 - blend)) + (float(dynamic) * blend)
+
+    def _dynamic_cj_params(self, params: GridParams, snapshot: CJSnapshot | None) -> CarteaJaimungalParams:
+        base = self._base_cj_params(params)
+        if snapshot is None or not snapshot.ready:
+            return base
+        blend = float(params.cj_estimator_blend)
+        return CarteaJaimungalParams(
+            lambda_plus=self._blend(base.lambda_plus, snapshot.lambda_plus * params.cj_lambda_scale, blend),
+            lambda_minus=self._blend(base.lambda_minus, snapshot.lambda_minus * params.cj_lambda_scale, blend),
+            kappa_plus=self._blend(base.kappa_plus, snapshot.kappa_plus * params.cj_kappa_scale, blend),
+            kappa_minus=self._blend(base.kappa_minus, snapshot.kappa_minus * params.cj_kappa_scale, blend),
+            epsilon_plus=self._blend(base.epsilon_plus, snapshot.epsilon_plus * params.cj_epsilon_scale, blend),
+            epsilon_minus=self._blend(base.epsilon_minus, snapshot.epsilon_minus * params.cj_epsilon_scale, blend),
+            sigma2_per_sec=self._blend(base.sigma2_per_sec, snapshot.sigma2_per_sec * params.cj_sigma2_scale, blend),
+            alpha=base.alpha,
+            phi=base.phi,
+            horizon_seconds=base.horizon_seconds,
+            q_max=base.q_max,
+            spread_multiplier=base.spread_multiplier,
+            min_half_spread_bps=base.min_half_spread_bps,
+            max_half_spread_bps=base.max_half_spread_bps,
+            maker_fee_rate=base.maker_fee_rate,
+            inventory_unit_base=base.inventory_unit_base,
+            max_toxicity=base.max_toxicity,
+            volatility_spread_multiplier=base.volatility_spread_multiplier,
+            solver_mode=base.solver_mode,
+            asym_n_steps=base.asym_n_steps,
+            asym_max_iter=base.asym_max_iter,
+        )
+
+    def _create_quote_calculator(self, params: GridParams, tick: float):
+        engine = str(params.quote_engine or "vol_obi").strip().lower()
+        if engine in {"cj", "cartea", "cartea_jaimungal", "cartea-jaimungal"}:
+            cj_params = self._base_cj_params(params)
+            return CarteaJaimungalCalculator(
+                tick_size=tick,
+                params=cj_params,
+                min_warmup_samples=VOL_OBI_MIN_WARMUP_SAMPLES,
+            )
+
+        if engine != "vol_obi":
+            raise ValueError("Unknown quote_engine: %r" % params.quote_engine)
+
+        return VolObiCalculator(
+            tick_size=tick,
+            window_steps=VOL_OBI_WINDOW_STEPS,
+            step_ns=VOL_OBI_STEP_NS,
+            vol_to_half_spread=params.vol_to_half_spread,
+            min_half_spread_bps=params.min_half_spread_bps,
+            c1_ticks=params.c1_ticks,
+            skew=params.skew,
+            looking_depth=VOL_OBI_LOOKING_DEPTH,
+            min_warmup_samples=VOL_OBI_MIN_WARMUP_SAMPLES,
+            max_position_dollar=500.0,
+        )
 
     def _create_slots(self) -> list[GridSlot]:
         os.makedirs(self._grid_dir, exist_ok=True)
@@ -319,19 +500,9 @@ class GridRunner:
                 portfolio_value=self._capital,
             )
 
-            # Per-slot vol_obi calculator
-            calc = VolObiCalculator(
-                tick_size=tick,
-                window_steps=VOL_OBI_WINDOW_STEPS,
-                step_ns=VOL_OBI_STEP_NS,
-                vol_to_half_spread=params.vol_to_half_spread,
-                min_half_spread_bps=params.min_half_spread_bps,
-                c1_ticks=params.c1_ticks,
-                skew=params.skew,
-                looking_depth=VOL_OBI_LOOKING_DEPTH,
-                min_warmup_samples=VOL_OBI_MIN_WARMUP_SAMPLES,
-                max_position_dollar=500.0,
-            )
+            # Per-slot quote calculator.  The field name is historical; it can
+            # hold either Vol+OBI or Cartea-Jaimungal compatible calculators.
+            calc = self._create_quote_calculator(params, tick)
 
             slot_state = SlotState(
                 market=self._shared_market,
@@ -444,6 +615,8 @@ class GridRunner:
         best_ask = ob["asks"].peekitem(0)[0]
         mid = (best_bid + best_ask) / 2
         self._shared_market.mid_price = mid
+        if self._cj_estimator is not None:
+            self._cj_estimator.on_book_update(mid)
 
         # Fan-out: feed all slot calculators + check fills
         ba = self._shared_alpha
@@ -481,6 +654,21 @@ class GridRunner:
             self._shared_market.ticker_updated_at = time.monotonic()
         except (ValueError, TypeError):
             pass
+
+    def _on_trade_message(self, data):
+        """WS callback for public Lighter trades used by the CJ estimator."""
+        if self._cj_estimator is None:
+            return
+        msg_type = data.get("type", "")
+        if "trade" not in msg_type:
+            return
+        trades = data.get("trades") or []
+        if not isinstance(trades, list):
+            return
+        mid = self._shared_market.mid_price if self._shared_market is not None else None
+        for trade in trades:
+            if isinstance(trade, dict):
+                self._cj_estimator.on_trade(trade, mid)
 
     def _on_ws_disconnect(self):
         self._shared_market.ws_connection_healthy = False
@@ -544,11 +732,47 @@ class GridRunner:
             return
 
         max_pos = self._compute_max_pos(mid, capital, base_amount, params.num_levels)
+        ss.account.precomputed_max_pos_usd = max_pos
+        ss.account.precomputed_base_amount = base_amount
+        slot.dry_engine.set_inventory_boundary_usd(max_pos)
         calc = ss.vol_obi_state.calculator
         if calc is None or not calc.warmed_up:
             return
+        if (
+            params.quote_engine == "cartea_jaimungal"
+            and params.cj_use_estimator
+            and self._cj_estimator is not None
+        ):
+            now = time.monotonic()
+            if now - slot.last_cj_refresh >= max(float(params.cj_refresh_seconds), 1.0):
+                snapshot = self._cj_estimator.snapshot()
+                dynamic_params = self._dynamic_cj_params(params, snapshot)
+                update_params = getattr(calc, "update_params", None)
+                if callable(update_params):
+                    try:
+                        update_params(dynamic_params)
+                        slot.last_cj_estimator_ready = bool(snapshot.ready)
+                        slot.dry_engine.set_external_quality_metrics({
+                            "cj_estimator_ready": bool(snapshot.ready),
+                            "cj_kappa_fit_quality": round(snapshot.kappa_fit_quality, 6),
+                            "cj_kappa_r2_plus": round(snapshot.kappa_r2_plus, 6),
+                            "cj_kappa_r2_minus": round(snapshot.kappa_r2_minus, 6),
+                            "cj_kappa_points_plus": snapshot.kappa_points_plus,
+                            "cj_kappa_points_minus": snapshot.kappa_points_minus,
+                            "cj_estimated_sigma2_per_sec": round(snapshot.sigma2_per_sec, 10),
+                        })
+                    except (ValueError, OverflowError):
+                        logger.warning(
+                            "CJ dynamic params rejected for %s; keeping previous surface",
+                            slot.param_key,
+                            exc_info=True,
+                        )
+                slot.last_cj_refresh = now
         if max_pos > 0:
             calc.set_max_position_dollar(max_pos)
+        set_inventory_unit = getattr(calc, "set_inventory_unit_base", None)
+        if callable(set_inventory_unit):
+            set_inventory_unit(base_amount)
 
         try:
             buy_0, sell_0 = calc.quote(mid, ss.account.position_size)
@@ -651,6 +875,28 @@ class GridRunner:
     # Summary logging
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _quality_score(total_pnl: float, fill_count: int, total_volume: float, quality: dict) -> float:
+        if fill_count <= 0:
+            return -999.0
+        adverse_5s = float(quality.get("adverse_markout_bps_avg", {}).get("5.0", 0.0))
+        spread_capture = float(quality.get("spread_capture_bps_avg", 0.0))
+        boundary_ratio = float(quality.get("inventory_boundary_ratio", 0.0))
+        fit_quality = quality.get("cj_kappa_fit_quality")
+        pnl_bps = (total_pnl / total_volume * 10_000.0) if total_volume > 0 else 0.0
+        fill_bonus = min(math.log1p(fill_count), 5.0)
+        fit_penalty = 0.0
+        if fit_quality is not None:
+            fit_penalty = max(0.0, 0.30 - float(fit_quality)) * 15.0
+        return (
+            pnl_bps
+            + 0.25 * spread_capture
+            + fill_bonus
+            - 0.75 * adverse_5s
+            - 25.0 * boundary_ratio
+            - fit_penalty
+        )
+
     def _maybe_log_grid_summary(self):
         now = time.monotonic()
         if now - self._last_summary < self._summary_interval:
@@ -662,8 +908,31 @@ class GridRunner:
         mid = self._shared_market.mid_price or 0.0
 
         lines = [f"GRID SUMMARY ({len(self._slots)} slots, {elapsed_str} elapsed, mid=${mid:.2f})"]
-        lines.append(f"{'Slot':<5} | {'v2hs':>5} | {'mhbp':>5} | {'skew':>5} | {'Fills':>5} | {'Realized':>9} | {'Unrealzd':>9} | {'Total':>9} | {'Volume':>9}")
-        lines.append("-" * 85)
+        if self._cj_estimator is not None:
+            snap = self._cj_estimator.snapshot()
+            lines.append(
+                "CJ estimator: ready=%s lp=%.3f lm=%.3f kp=%.4f km=%.4f "
+                "r2=%.2f/%.2f fit=%.2f ep=%.2f em=%.2f sigma2=%.6f trades=%d/%d markouts=%d/%d"
+                % (
+                    snap.ready,
+                    snap.lambda_plus,
+                    snap.lambda_minus,
+                    snap.kappa_plus,
+                    snap.kappa_minus,
+                    snap.kappa_r2_plus,
+                    snap.kappa_r2_minus,
+                    snap.kappa_fit_quality,
+                    snap.epsilon_plus,
+                    snap.epsilon_minus,
+                    snap.sigma2_per_sec,
+                    snap.trade_count_plus,
+                    snap.trade_count_minus,
+                    snap.markout_count_plus,
+                    snap.markout_count_minus,
+                )
+            )
+        lines.append(f"{'Slot':<5} | {'Engine':>5} | {'shape':>8} | {'sk/eps':>6} | {'Fills':>5} | {'Total':>9} | {'Score':>7} | {'Sprd':>6} | {'Adv5':>6} | {'Inv%':>5}")
+        lines.append("-" * 94)
 
         best_slot = None
         best_pnl = float("-inf")
@@ -676,10 +945,17 @@ class GridRunner:
             )
             total = e.total_pnl
             p = slot.params
+            engine = "CJ" if p.quote_engine == "cartea_jaimungal" else "OBI"
+            shape = f"k{p.cj_kappa_plus or p.cj_kappa:g}" if engine == "CJ" else f"v{p.vol_to_half_spread:g}"
+            skew_or_eps = (p.cj_epsilon_plus or p.cj_epsilon) if engine == "CJ" else p.skew
+            quality = e.quality_metrics()
+            score = self._quality_score(total, e._fill_count, e._total_volume, quality)
+            adv5 = float(quality.get("adverse_markout_bps_avg", {}).get("5.0", 0.0))
             lines.append(
-                f"{p.label:<5} | {p.vol_to_half_spread:>5.1f} | {p.min_half_spread_bps:>5.1f} | {p.skew:>5.1f} | "
-                f"{e._fill_count:>5d} | ${e._realized_pnl:>8.4f} | ${e.unrealized_pnl:>8.4f} | "
-                f"${total:>8.4f} | ${e._total_volume:>8.2f}"
+                f"{p.label:<5} | {engine:>5} | {shape:>8} | {skew_or_eps:>6.1f} | "
+                f"{e._fill_count:>5d} | ${total:>8.4f} | {score:>7.2f} | "
+                f"{quality.get('spread_capture_bps_avg', 0.0):>6.2f} | {adv5:>6.2f} | "
+                f"{quality.get('inventory_boundary_ratio', 0.0) * 100:>4.0f}%"
             )
             if total > best_pnl:
                 best_pnl = total
@@ -687,10 +963,16 @@ class GridRunner:
 
         if best_slot is not None:
             bp = best_slot.params
-            lines.append(
-                f"Best: {bp.label} (v2hs={bp.vol_to_half_spread}, mhbp={bp.min_half_spread_bps}, "
-                f"skew={bp.skew}) total=${best_pnl:.4f}"
-            )
+            if bp.quote_engine == "cartea_jaimungal":
+                lines.append(
+                    f"Best: {bp.label} (engine=CJ, kappa={bp.cj_kappa_plus or bp.cj_kappa}, "
+                    f"epsilon={bp.cj_epsilon_plus or bp.cj_epsilon}, phi={bp.cj_phi}) total=${best_pnl:.4f}"
+                )
+            else:
+                lines.append(
+                    f"Best: {bp.label} (engine=OBI, v2hs={bp.vol_to_half_spread}, "
+                    f"mhbp={bp.min_half_spread_bps}, skew={bp.skew}) total=${best_pnl:.4f}"
+                )
 
         summary_text = "\n".join(lines)
         logger.info("\n%s", summary_text)
@@ -710,11 +992,22 @@ class GridRunner:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         csv_path = os.path.join(self._grid_dir, f"results_{self._symbol}_{ts}.csv")
         fieldnames = [
-            "slot", "param_key",
+            "slot", "param_key", "quote_engine",
             "vol_to_half_spread", "min_half_spread_bps", "skew",
             "spread_factor_level1", "capital_usage_percent", "num_levels", "c1_ticks",
+            "cj_lambda_plus", "cj_lambda_minus", "cj_kappa_plus", "cj_kappa_minus",
+            "cj_epsilon_plus", "cj_epsilon_minus", "cj_sigma2_per_sec",
+            "cj_sigma2_scale", "cj_volatility_spread_multiplier", "cj_alpha", "cj_phi",
+            "cj_horizon_seconds", "cj_q_max", "cj_spread_multiplier",
             "fills", "realized_pnl", "unrealized_pnl", "total_pnl",
-            "total_volume", "portfolio_value",
+            "total_volume", "portfolio_value", "quality_score",
+            "maker_fill_count", "taker_fill_count", "spread_capture_bps_avg",
+            "markout_1s_bps_avg", "markout_5s_bps_avg", "markout_30s_bps_avg",
+            "adverse_markout_1s_bps_avg", "adverse_markout_5s_bps_avg",
+            "adverse_markout_30s_bps_avg", "inventory_boundary_ratio",
+            "inventory_max_usd_seen", "cj_estimator_ready",
+            "cj_kappa_fit_quality", "cj_kappa_r2_plus", "cj_kappa_r2_minus",
+            "cj_kappa_points_plus", "cj_kappa_points_minus", "cj_estimated_sigma2_per_sec",
         ]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -722,9 +1015,14 @@ class GridRunner:
             for slot in self._slots:
                 e = slot.dry_engine
                 p = slot.params
+                quality = e.quality_metrics()
+                markout = quality.get("markout_bps_avg", {})
+                adverse = quality.get("adverse_markout_bps_avg", {})
+                quality_score = self._quality_score(e.total_pnl, e._fill_count, e._total_volume, quality)
                 writer.writerow({
                     "slot": p.label,
                     "param_key": slot.param_key,
+                    "quote_engine": p.quote_engine,
                     "vol_to_half_spread": p.vol_to_half_spread,
                     "min_half_spread_bps": p.min_half_spread_bps,
                     "skew": p.skew,
@@ -732,12 +1030,45 @@ class GridRunner:
                     "capital_usage_percent": p.capital_usage_percent,
                     "num_levels": p.num_levels,
                     "c1_ticks": p.c1_ticks,
+                    "cj_lambda_plus": p.cj_lambda_plus or p.cj_lambda,
+                    "cj_lambda_minus": p.cj_lambda_minus or p.cj_lambda,
+                    "cj_kappa_plus": p.cj_kappa_plus or p.cj_kappa,
+                    "cj_kappa_minus": p.cj_kappa_minus or p.cj_kappa,
+                    "cj_epsilon_plus": p.cj_epsilon_plus or p.cj_epsilon,
+                    "cj_epsilon_minus": p.cj_epsilon_minus or p.cj_epsilon,
+                    "cj_sigma2_per_sec": p.cj_sigma2_per_sec,
+                    "cj_sigma2_scale": p.cj_sigma2_scale,
+                    "cj_volatility_spread_multiplier": p.cj_volatility_spread_multiplier,
+                    "cj_alpha": p.cj_alpha,
+                    "cj_phi": p.cj_phi,
+                    "cj_horizon_seconds": p.cj_horizon_seconds,
+                    "cj_q_max": p.cj_q_max,
+                    "cj_spread_multiplier": p.cj_spread_multiplier,
                     "fills": e._fill_count,
                     "realized_pnl": round(e._realized_pnl, 6),
                     "unrealized_pnl": round(e.unrealized_pnl, 6),
                     "total_pnl": round(e.total_pnl, 6),
                     "total_volume": round(e._total_volume, 2),
                     "portfolio_value": round(slot.slot_state.account.portfolio_value or 0, 2),
+                    "quality_score": round(quality_score, 6),
+                    "maker_fill_count": quality.get("maker_fill_count", 0),
+                    "taker_fill_count": quality.get("taker_fill_count", 0),
+                    "spread_capture_bps_avg": round(quality.get("spread_capture_bps_avg", 0.0), 6),
+                    "markout_1s_bps_avg": round(markout.get("1.0", 0.0), 6),
+                    "markout_5s_bps_avg": round(markout.get("5.0", 0.0), 6),
+                    "markout_30s_bps_avg": round(markout.get("30.0", 0.0), 6),
+                    "adverse_markout_1s_bps_avg": round(adverse.get("1.0", 0.0), 6),
+                    "adverse_markout_5s_bps_avg": round(adverse.get("5.0", 0.0), 6),
+                    "adverse_markout_30s_bps_avg": round(adverse.get("30.0", 0.0), 6),
+                    "inventory_boundary_ratio": round(quality.get("inventory_boundary_ratio", 0.0), 6),
+                    "inventory_max_usd_seen": round(quality.get("inventory_max_usd_seen", 0.0), 6),
+                    "cj_estimator_ready": slot.last_cj_estimator_ready,
+                    "cj_kappa_fit_quality": quality.get("cj_kappa_fit_quality", ""),
+                    "cj_kappa_r2_plus": quality.get("cj_kappa_r2_plus", ""),
+                    "cj_kappa_r2_minus": quality.get("cj_kappa_r2_minus", ""),
+                    "cj_kappa_points_plus": quality.get("cj_kappa_points_plus", ""),
+                    "cj_kappa_points_minus": quality.get("cj_kappa_points_minus", ""),
+                    "cj_estimated_sigma2_per_sec": quality.get("cj_estimated_sigma2_per_sec", ""),
                 })
         logger.info("Final results written to %s", csv_path)
 
@@ -902,10 +1233,24 @@ class GridRunner:
             reconnect_max=WS_RECONNECT_MAX,
             logger=logger,
         ))
+        trade_task = None
+        if self._cj_estimator is not None:
+            trade_task = asyncio.create_task(ws_subscribe_fast(
+                channels=[f"trade/{market_id}"],
+                label="grid public trades",
+                on_message=self._on_trade_message,
+                url=WEBSOCKET_URL,
+                ping_interval=WS_PING_INTERVAL,
+                recv_timeout=WS_RECV_TIMEOUT,
+                reconnect_base=WS_RECONNECT_BASE,
+                reconnect_max=WS_RECONNECT_MAX,
+                logger=logger,
+            ))
+            logger.info("CJ estimator enabled: subscribed to trade/%s", market_id)
 
         main_task = asyncio.create_task(self._main_loop())
 
-        all_tasks = [ob_task, ticker_task, main_task] + binance_tasks
+        all_tasks = [ob_task, ticker_task, main_task] + ([trade_task] if trade_task is not None else []) + binance_tasks
 
         # Signal handling
         loop = asyncio.get_running_loop()

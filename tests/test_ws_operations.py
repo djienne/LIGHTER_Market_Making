@@ -319,6 +319,22 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
         # sign_create_order was called
         self.assertEqual(len(client.sign_create_calls), 1)
 
+    async def test_create_op_passes_reduce_only_to_signer(self):
+        """Inventory-reducing creates must be signed as reduce-only."""
+        client = DummyClient()
+        op = _make_create_op(side="sell", price=101.0)
+        op.reduce_only = True
+
+        with temp_mm_attrs(
+            MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
+            _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
+        ):
+            await mm.sign_and_send_batch(client, [op])
+
+        self.assertEqual(len(client.sign_create_calls), 1)
+        self.assertIs(client.sign_create_calls[0]["reduce_only"], True)
+
     async def test_batch_falls_back_to_rest(self):
         """_tx_ws disconnected -> REST client.send_tx_batch used."""
         client = DummyClient()
@@ -1166,6 +1182,300 @@ class TestAccountOrdersSnapshot(unittest.TestCase):
             mm.risk_controller = mm.RiskController(mm.state.risk)
             mm.order_manager = mm.OrderManager(mm.state.order_manager)
 
+    def test_filled_bid_enriches_trade_log_side_and_pnl(self):
+        """A filled bid from account_orders should turn account_all trade into a buy row."""
+        original_orders = mm.OrderState(**vars(mm.state.orders))
+        original_risk = mm.RiskState(**vars(mm.state.risk))
+        saved_ready = mm._account_orders_ws_ready
+        saved_logger = mm._trade_logger
+        saved_dry_run = mm._dry_run_engine
+
+        class FakeTradeLogger:
+            def __init__(self):
+                self.rows = []
+
+            def log_fill(self, **kwargs):
+                self.rows.append(kwargs)
+
+        fake_logger = FakeTradeLogger()
+
+        try:
+            mm._account_orders_ws_ready = True
+            mm._trade_logger = fake_logger
+            mm._dry_run_engine = None
+
+            with temp_mm_attrs(
+                MARKET_ID=1,
+                current_bid_order_id=300,
+                current_bid_price=99.5,
+                current_bid_size=0.2,
+                current_ask_order_id=400,
+                current_ask_price=101.0,
+                current_ask_size=0.2,
+                current_mid_price_cached=100.0,
+                available_capital=980.0,
+                portfolio_value=1000.0,
+                current_position_size=0.0,
+                MAKER_FEE_RATE=0.0,
+            ):
+                data = {"orders": {"1": [
+                    {
+                        "client_order_index": 300,
+                        "order_index": 8888,
+                        "status": "filled",
+                        "is_ask": False,
+                        "price": "99.5",
+                        "initial_base_amount": "0.2",
+                    }
+                ]}}
+                mm.on_account_orders_update(account_id=1, market_id=1, data=data)
+                mm.state.account.position_size = 0.2
+                mm._pending_trades.append({"1": [
+                    {"market_id": 1, "type": "trade", "size": "0.2", "price": "99.5"}
+                ]})
+                mm._process_pending_trades()
+
+                self.assertEqual(len(fake_logger.rows), 1)
+                row = fake_logger.rows[0]
+                self.assertEqual(row["side"], "buy")
+                self.assertEqual(row["client_order_index"], 300)
+                self.assertEqual(row["exchange_order_index"], 8888)
+                self.assertAlmostEqual(row["mid_at_fill"], 100.0)
+                self.assertAlmostEqual(row["spread_capture_bps"], 50.0)
+                self.assertAlmostEqual(row["entry_vwap_after"], 99.5)
+                self.assertAlmostEqual(row["realized_pnl"], 0.0)
+        finally:
+            mm.state.orders = original_orders
+            mm.state.risk = original_risk
+            mm._account_orders_ws_ready = saved_ready
+            mm._trade_logger = saved_logger
+            mm._dry_run_engine = saved_dry_run
+            mm.risk_controller = mm.RiskController(mm.state.risk)
+            mm.order_manager = mm.OrderManager(mm.state.order_manager)
+
+    def test_account_all_trade_infers_side_from_lighter_maker_side_and_dedupes(self):
+        """Fallback account_all fills should infer our side from is_maker_ask."""
+        saved_logger = mm._trade_logger
+        saved_dry_run = mm._dry_run_engine
+
+        class FakeTradeLogger:
+            def __init__(self):
+                self.rows = []
+
+            def log_fill(self, **kwargs):
+                self.rows.append(kwargs)
+
+        fake_logger = FakeTradeLogger()
+        trade = {
+            "market_id": 1,
+            "trade_id": "lighter-fill-1",
+            "type": "trade",
+            "is_maker_ask": "false",
+            "size": "0.2",
+            "price": "99.5",
+        }
+
+        try:
+            mm._trade_logger = fake_logger
+            mm._dry_run_engine = None
+
+            with temp_mm_attrs(
+                MARKET_ID=1,
+                current_mid_price_cached=100.0,
+                available_capital=980.0,
+                portfolio_value=1000.0,
+                current_position_size=0.2,
+                MAKER_FEE_RATE=0.0,
+            ):
+                mm._pending_trades.append({"1": [dict(trade)]})
+                mm._process_pending_trades()
+                mm._pending_trades.append({"1": [dict(trade)]})
+                mm._process_pending_trades()
+
+                self.assertEqual(len(fake_logger.rows), 1)
+                row = fake_logger.rows[0]
+                self.assertEqual(row["side"], "buy")
+                self.assertEqual(row["fill_source"], "account_all_ws")
+                self.assertIsNone(row["client_order_index"])
+                self.assertAlmostEqual(row["mid_at_fill"], 100.0)
+                self.assertAlmostEqual(row["spread_capture_bps"], 50.0)
+                self.assertAlmostEqual(row["entry_vwap_after"], 99.5)
+        finally:
+            mm._trade_logger = saved_logger
+            mm._dry_run_engine = saved_dry_run
+
+    def test_account_all_trade_without_id_gets_synthetic_dedupe_key(self):
+        """Lighter account_all echoes without trade_id should not double-count."""
+        saved_logger = mm._trade_logger
+        saved_dry_run = mm._dry_run_engine
+
+        class FakeTradeLogger:
+            def __init__(self):
+                self.rows = []
+
+            def log_fill(self, **kwargs):
+                self.rows.append(kwargs)
+
+        fake_logger = FakeTradeLogger()
+        trade = {
+            "market_id": 1,
+            "type": "trade",
+            "is_maker_ask": "false",
+            "size": "0.2",
+            "price": "99.5",
+            "timestamp": 1_765_000_000_000,
+        }
+
+        try:
+            mm._trade_logger = fake_logger
+            mm._dry_run_engine = None
+
+            with temp_mm_attrs(
+                MARKET_ID=1,
+                current_mid_price_cached=100.0,
+                available_capital=980.0,
+                portfolio_value=1000.0,
+                current_position_size=0.2,
+                MAKER_FEE_RATE=0.0,
+            ):
+                mm._pending_trades.append({"1": [dict(trade), dict(trade)]})
+                mm._process_pending_trades()
+
+                self.assertEqual(len(fake_logger.rows), 1)
+                self.assertEqual(fake_logger.rows[0]["side"], "buy")
+        finally:
+            mm._trade_logger = saved_logger
+            mm._dry_run_engine = saved_dry_run
+
+    def test_inventory_exit_bias_tightens_reducing_side_and_widens_adding_side(self):
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            _PRICE_TICK_FLOAT=0.1,
+        ):
+            short_levels = mm._apply_inventory_exit_bias(
+                [(990.0, 1010.0)],
+                mid_price=1000.0,
+                position_size=-0.1,
+                max_pos_usd=200.0,
+                quality_adjustment=mm.QualityAdjustment(adverse_bps=0.0),
+            )
+            long_levels = mm._apply_inventory_exit_bias(
+                [(990.0, 1010.0)],
+                mid_price=1000.0,
+                position_size=0.1,
+                max_pos_usd=200.0,
+                quality_adjustment=mm.QualityAdjustment(adverse_bps=0.0),
+            )
+
+            self.assertGreater(short_levels[0][0], 990.0)
+            self.assertGreater(short_levels[0][1], 1010.0)
+            self.assertLess(long_levels[0][0], 990.0)
+            self.assertLess(long_levels[0][1], 1010.0)
+
+    def test_startup_trade_echo_is_ignored_and_resyncs_accounting(self):
+        """Recent-trade echoes from account_all must not double-count after restart."""
+        saved_logger = mm._trade_logger
+        saved_dry_run = mm._dry_run_engine
+
+        class FakeTradeLogger:
+            def __init__(self):
+                self.rows = []
+
+            def log_fill(self, **kwargs):
+                self.rows.append(kwargs)
+
+        fake_logger = FakeTradeLogger()
+        stale_trade = {
+            "market_id": 1,
+            "trade_id": "old-fill-1",
+            "type": "trade",
+            "is_maker_ask": "true",
+            "size": "0.1",
+            "price": "101.0",
+            "timestamp": 1,
+        }
+
+        try:
+            mm._trade_logger = fake_logger
+            mm._dry_run_engine = None
+
+            with temp_mm_attrs(
+                MARKET_ID=1,
+                current_mid_price_cached=100.0,
+                current_position_size=0.0,
+                available_capital=1000.0,
+                portfolio_value=1000.0,
+                MAKER_FEE_RATE=0.0,
+            ):
+                mm._live_fill_accounting_started = True
+                mm._live_fill_position_size = -0.1
+                mm._live_fill_entry_vwap = 101.0
+                mm._live_fill_realized_pnl = 1.23
+                mm._account_trade_accept_after_ms = 2_000
+
+                mm._pending_trades.append({"1": [stale_trade]})
+                mm._process_pending_trades()
+
+                self.assertEqual(fake_logger.rows, [])
+                self.assertAlmostEqual(mm._live_fill_position_size, 0.0)
+                self.assertAlmostEqual(mm._live_fill_entry_vwap, 0.0)
+                self.assertAlmostEqual(mm._live_fill_realized_pnl, 1.23)
+        finally:
+            mm._trade_logger = saved_logger
+            mm._dry_run_engine = saved_dry_run
+
+    def test_position_update_without_trade_batch_resyncs_live_accounting(self):
+        """Foreign/manual position changes should not leave stale durable inventory."""
+        saved_dry_run = mm._dry_run_engine
+
+        try:
+            mm._dry_run_engine = None
+            with temp_mm_attrs(
+                MARKET_ID=1,
+                current_position_size=0.0,
+                account_positions={},
+                current_mid_price_cached=100.0,
+            ):
+                mm._live_fill_accounting_started = True
+                mm._live_fill_position_size = -0.2
+                mm._live_fill_entry_vwap = 99.0
+
+                mm.on_account_all_update(
+                    mm.ACCOUNT_INDEX,
+                    {"positions": {"1": {"position": "0.0", "sign": 1}}},
+                )
+
+                self.assertAlmostEqual(mm._live_fill_position_size, 0.0)
+                self.assertAlmostEqual(mm._live_fill_entry_vwap, 0.0)
+        finally:
+            mm._dry_run_engine = saved_dry_run
+
+    def test_live_fill_accounting_seeds_existing_position(self):
+        """Restart accounting should treat the first reduce fill as realized PnL."""
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            current_position_size=0.2,
+            current_mid_price_cached=101.0,
+            account_positions={
+                "1": {
+                    "position": "0.2",
+                    "sign": 1,
+                    "avg_entry_price": "100.0",
+                }
+            },
+            MAKER_FEE_RATE=0.0,
+        ):
+            mm._initialize_live_fill_accounting_from_account()
+            pos_after, realized_delta, realized_cum, entry_after, fee_usd = (
+                mm._apply_live_fill_accounting("sell", 101.0, 0.1)
+            )
+
+            self.assertAlmostEqual(pos_after, 0.1)
+            self.assertAlmostEqual(realized_delta, 0.1)
+            self.assertAlmostEqual(realized_cum, 0.1)
+            self.assertAlmostEqual(entry_after, 100.0)
+            self.assertAlmostEqual(fee_usd, 0.0)
+
 
 # ---------------------------------------------------------------------------
 # 13b) restart_websocket — order state preservation
@@ -1676,6 +1986,58 @@ class TestQuotaRecoveryAsync(unittest.IsolatedAsyncioTestCase):
             result = await mm._attempt_quota_recovery(mock_client)
 
         self.assertFalse(result)
+
+
+class TestEmergencyCloseAsync(unittest.IsolatedAsyncioTestCase):
+
+    async def test_emergency_close_skips_uncloseable_dust(self):
+        """Dust below Lighter minima should not send an invalid close order."""
+        mock_client = MagicMock()
+        mock_client.create_order = AsyncMock()
+
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            current_position_size=-0.00001,
+            current_mid_price_cached=66_700.0,
+            _PRICE_TICK_FLOAT=0.1,
+            _AMOUNT_TICK_FLOAT=0.00001,
+            min_base_amount=0.0002,
+            min_quote_amount=10.0,
+            local_order_book={
+                "bids": SortedDict({66_690.0: 1.0}),
+                "asks": SortedDict({66_710.0: 1.0}),
+                "initialized": True,
+            },
+        ):
+            result = await mm.emergency_close_position(mock_client, reason="test")
+
+        self.assertTrue(result)
+        mock_client.create_order.assert_not_called()
+
+    async def test_emergency_close_uses_internal_min_order_value_when_exchange_min_quote_missing(self):
+        """Dust should still be skipped if Lighter does not expose min_quote_amount."""
+        mock_client = MagicMock()
+        mock_client.create_order = AsyncMock()
+
+        with temp_mm_attrs(
+            MARKET_ID=1,
+            MIN_ORDER_VALUE_USD=14.5,
+            current_position_size=-0.00001,
+            current_mid_price_cached=66_700.0,
+            _PRICE_TICK_FLOAT=0.1,
+            _AMOUNT_TICK_FLOAT=0.00001,
+            min_base_amount=0.0,
+            min_quote_amount=0.0,
+            local_order_book={
+                "bids": SortedDict({66_690.0: 1.0}),
+                "asks": SortedDict({66_710.0: 1.0}),
+                "initialized": True,
+            },
+        ):
+            result = await mm.emergency_close_position(mock_client, reason="test")
+
+        self.assertTrue(result)
+        mock_client.create_order.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

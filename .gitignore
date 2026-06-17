@@ -16,4 +16,8 @@ lighter_data/
 *.pyd
 _vol_obi_fast.c
 build/
+.runtime/
+dashboard/.svelte-kit/
+dashboard/build/
+dashboard/node_modules/
 .coverage
