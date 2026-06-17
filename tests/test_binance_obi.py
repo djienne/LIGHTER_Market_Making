@@ -185,6 +185,19 @@ class TestBinanceBookTickerClientParsing(unittest.TestCase):
         client._on_message(self._make_msg(b="0", a="50001.0"))
         self.assertEqual(bbo.sample_count, 0)
 
+    def test_non_finite_values_ignored(self):
+        invalid_messages = [
+            self._make_msg(b="nan", a="50001.0"),
+            self._make_msg(b="50000.0", a="inf"),
+            self._make_msg(B="nan"),
+            self._make_msg(A="-1"),
+        ]
+        for raw in invalid_messages:
+            with self.subTest(raw=raw):
+                client, bbo = self._make_client()
+                client._on_message(raw)
+                self.assertEqual(bbo.sample_count, 0)
+
     def test_bad_json_ignored(self):
         client, bbo = self._make_client()
         client._on_message(b"not json!!!")
@@ -235,6 +248,16 @@ class TestBinanceDiffDepthClientSnapshot(unittest.TestCase):
         self.assertAlmostEqual(client._bids.peekitem(-1)[0], 50000.0)
         self.assertAlmostEqual(client._asks.peekitem(0)[0], 50001.0)
 
+    def test_apply_snapshot_rejects_invalid_depth_level(self):
+        client, _ = self._make_client()
+        snapshot = {
+            'lastUpdateId': 500,
+            'bids': [["nan", "1.0"]],
+            'asks': [["50001.0", "1.5"]],
+        }
+        with self.assertRaises(ValueError):
+            client._apply_snapshot(snapshot)
+
     def test_apply_diff_insert_and_update(self):
         client, _ = self._make_client()
         client._apply_snapshot({
@@ -263,6 +286,19 @@ class TestBinanceDiffDepthClientSnapshot(unittest.TestCase):
         client._apply_diff(event)
         self.assertEqual(len(client._bids), 1)
         self.assertNotIn(49999.0, client._bids)
+
+    def test_apply_diff_rejects_invalid_depth_level(self):
+        client, _ = self._make_client()
+        client._apply_snapshot({
+            'lastUpdateId': 500,
+            'bids': [["50000.0", "1.0"]],
+            'asks': [["50001.0", "1.5"]],
+        })
+        event = {'U': 501, 'u': 501, 'pu': 0,
+                 'b': [["50000.0", "-1.0"]],
+                 'a': []}
+        with self.assertRaises(ValueError):
+            client._apply_diff(event)
 
     def test_update_alpha_computes_imbalance(self):
         client, sa = self._make_client()

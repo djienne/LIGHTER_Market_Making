@@ -363,6 +363,20 @@ class BatchOp:
     reduce_only: bool = False
 
 
+class TxSendStatus(str, Enum):
+    OK = "ok"
+    REJECTED = "rejected"
+    NOT_SENT = "not_sent"
+    UNKNOWN = "unknown"
+
+
+@dataclass(slots=True)
+class TxSendResult:
+    status: TxSendStatus
+    response: Optional[dict] = None
+    reason: str = ""
+
+
 def _to_raw_price(price: float) -> int:
     """Convert a human-readable price to the raw integer the SDK expects."""
     tick = state.config.price_tick_float
@@ -2554,6 +2568,12 @@ def on_order_book_update(market_id, payload, is_snapshot_hint=None):
     except (KeyError, IndexError, ValueError, TypeError, ZeroDivisionError) as e:
         logger.error(f"Error in order book callback: {e}", exc_info=True)
         state.market.ws_connection_healthy = False
+        state.market.mid_price = None
+        ob = state.market.local_order_book
+        ob['initialized'] = False
+        ob['last_offset'] = None
+        ob['bids'].clear()
+        ob['asks'].clear()
 
 async def subscribe_to_market_data(market_id):
     """Connects to the websocket, subscribes to orderbook updates."""
@@ -3835,19 +3855,56 @@ class TxWebSocket:
                 pass
             self._recv_task = None
 
-    async def send_batch(self, tx_types: list, tx_infos: list) -> Optional[dict]:
-        """Send a transaction batch via WS and return the parsed response.
+    def _drain_recv_queue(self) -> None:
+        """Drop stale responses before a new transaction send."""
+        while not self._recv_queue.empty():
+            try:
+                self._recv_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-        Returns None if WS is down (caller should fall back to REST).
+    @staticmethod
+    def _code_message_from_response(resp: dict) -> tuple[int, str]:
+        ws_error = resp.get("error")
+        if isinstance(ws_error, dict):
+            raw_code = ws_error.get("code", -1)
+            message = str(ws_error.get("message", ""))
+        elif ws_error is not None:
+            raw_code = -1
+            message = str(ws_error)
+        else:
+            raw_code = resp.get("code", resp.get("status_code", 0))
+            message = str(resp.get("message", ""))
+        try:
+            code = int(raw_code) if raw_code is not None else 0
+        except (TypeError, ValueError):
+            code = -1
+        if code == 200:
+            code = 0
+        return code, message
+
+    @staticmethod
+    def _status_from_response(resp: dict) -> TxSendStatus:
+        code, _message = TxWebSocket._code_message_from_response(resp)
+        if code == 0:
+            return TxSendStatus.OK
+        return TxSendStatus.REJECTED
+
+    async def send_batch(self, tx_types: list, tx_infos: list) -> TxSendResult:
+        """Send a transaction batch via WS and return transport outcome.
+
+        ``NOT_SENT`` means no frame was written and REST fallback is safe.
+        ``UNKNOWN`` means a frame may have reached Lighter; callers must not
+        retry the same batch directly.
         """
         async with self._lock:
             if not self.is_connected:
                 try:
                     await self.connect()
                 except Exception:
-                    return None
+                    return TxSendResult(TxSendStatus.NOT_SENT, reason="connect_failed")
                 if not self.is_connected:
-                    return None
+                    return TxSendResult(TxSendStatus.NOT_SENT, reason="not_connected")
 
             # SDK sends tx_types/tx_infos as JSON-encoded strings
             _tx_types_str = json.dumps(tx_types)
@@ -3866,41 +3923,77 @@ class TxWebSocket:
             if isinstance(msg_str, bytes):
                 msg_str = msg_str.decode()
 
-            async def _send_and_recv() -> Optional[dict]:
-                """Send batch message and read response from recv queue."""
-                await self._ws.send(msg_str)
-                resp = await asyncio.wait_for(self._recv_queue.get(), timeout=10.0)
-                if resp is None:
-                    # Sentinel — connection lost
-                    return None
-                return resp
+            self._drain_recv_queue()
 
             try:
-                resp = await _send_and_recv()
-                if resp is not None:
-                    return resp
-                # Connection was lost (sentinel) — reconnect and retry once
-                logger.warning("TxWebSocket connection lost; reconnecting and retrying once")
-                await self.connect()
-                if not self.is_connected:
-                    return None
-                return await _send_and_recv()
-            except Exception as e:
-                logger.warning("TxWebSocket send failed (%s); reconnecting and retrying once", e)
+                await self._ws.send(msg_str)
+            except Exception as exc:
                 self._connected = False
-                try:
-                    await self.connect()
-                    if not self.is_connected:
-                        return None
-                    return await _send_and_recv()
-                except Exception as e2:
-                    logger.warning("TxWebSocket retry also failed (%s); falling back to REST", e2)
-                    self._connected = False
-                    return None
+                logger.warning("TxWebSocket send failed after attempt; outcome unknown: %s", exc)
+                return TxSendResult(TxSendStatus.UNKNOWN, reason=f"send_failed:{exc}")
+
+            try:
+                resp = await asyncio.wait_for(self._recv_queue.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                self._connected = False
+                logger.warning("TxWebSocket send timed out after frame write; outcome unknown")
+                await self.close()
+                return TxSendResult(TxSendStatus.UNKNOWN, reason="response_timeout")
+            except Exception as exc:
+                self._connected = False
+                logger.warning("TxWebSocket response wait failed after frame write; outcome unknown: %s", exc)
+                await self.close()
+                return TxSendResult(TxSendStatus.UNKNOWN, reason=f"response_failed:{exc}")
+
+            if resp is None:
+                self._connected = False
+                logger.warning("TxWebSocket disconnected after frame write; outcome unknown")
+                return TxSendResult(TxSendStatus.UNKNOWN, reason="disconnected_after_send")
+            if not isinstance(resp, dict):
+                logger.warning("TxWebSocket returned malformed response after frame write: %r", resp)
+                return TxSendResult(TxSendStatus.UNKNOWN, reason="malformed_response")
+            return TxSendResult(self._status_from_response(resp), response=resp)
 
 
 # Module-level TxWebSocket instance (initialized in main())
 _tx_ws: Optional[TxWebSocket] = None
+_unknown_outcome_reconcile_tasks: set[asyncio.Task] = set()
+
+
+def _consume_background_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.warning("Background reconcile task failed: %s", exc, exc_info=True)
+
+
+def _schedule_unknown_outcome_reconcile(client, source: str) -> None:
+    try:
+        task = asyncio.create_task(reconcile_orders_with_exchange(client, source=source))
+    except RuntimeError:
+        logger.warning("Unable to schedule reconciliation for %s: no running event loop", source)
+        return
+    _unknown_outcome_reconcile_tasks.add(task)
+    task.add_done_callback(_unknown_outcome_reconcile_tasks.discard)
+    task.add_done_callback(_consume_background_task_result)
+
+
+def _handle_unknown_tx_outcome(client, signed_nonces: list, reason: str) -> None:
+    logger.error(
+        "Transaction batch outcome is UNKNOWN (%s). Pausing trading and forcing reconciliation.",
+        reason,
+    )
+    risk_controller.mark_reconcile(ok=False, reason=f"tx_unknown:{reason}")
+    risk_controller.trigger_pause(f"tx_unknown_outcome:{reason}")
+    seen_keys = set()
+    for aki in signed_nonces:
+        if aki in seen_keys:
+            continue
+        client.nonce_manager.hard_refresh_nonce(aki)
+        seen_keys.add(aki)
+    _schedule_unknown_outcome_reconcile(client, source="tx_unknown_outcome")
 
 # === HOT PATH ===
 
@@ -4111,9 +4204,9 @@ async def sign_and_send_batch(client, ops: list):
         logger.info("Free-slot mode (quota=0): sending 1 op via REST sendTx (%s %s)",
                     ops[0].action, ops[0].side)
 
-    # Drain any events that arrived since collect_order_operations (WS fills,
-    # reconciler updates) so the stale-create guard below sees fresh state.
-    order_manager.drain_events()
+    # Drain hot slot mutations only. Full reconcile snapshots are handled by
+    # order_state_reconcile_loop so the send lane does not process cold state.
+    order_manager.drain_hot_events()
 
     # Safety: drop create ops whose slot got filled since collect_order_operations
     # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
@@ -4191,26 +4284,20 @@ async def sign_and_send_batch(client, ops: list):
 
             _record_ops_sent(len(signed_ops))
 
-            # Try WS first, fall back to REST
-            ws_resp = None
+            # Try WS first. REST fallback is safe only if no WS frame was sent.
+            ws_result = None
             if _tx_ws is not None and _tx_ws.is_connected:
-                ws_resp = await _tx_ws.send_batch(tx_types, tx_infos)
+                ws_result = await _tx_ws.send_batch(tx_types, tx_infos)
 
-            if ws_resp is not None:
+            if ws_result is not None and ws_result.status == TxSendStatus.UNKNOWN:
+                _handle_unknown_tx_outcome(client, signed_nonces, ws_result.reason)
+                return
+
+            if ws_result is not None and ws_result.status in (TxSendStatus.OK, TxSendStatus.REJECTED):
                 # Parse WS response
+                ws_resp = ws_result.response or {}
                 logger.debug("WS batch raw response: %s", ws_resp)
-                # Check for error envelope: {"error": {"code": ..., "message": ...}}
-                ws_error = ws_resp.get("error")
-                if isinstance(ws_error, dict):
-                    raw_code = ws_error.get("code", -1)
-                    message = str(ws_error.get("message", ""))
-                else:
-                    raw_code = ws_resp.get("code", ws_resp.get("status_code", 0))
-                    message = str(ws_resp.get("message", ""))
-                code = int(raw_code) if raw_code is not None else 0
-                # WS uses HTTP-style codes: 200 = success, 0 = success
-                if code == 200:
-                    code = 0
+                code, message = TxWebSocket._code_message_from_response(ws_resp)
                 quota_remaining = ws_resp.get("volume_quota_remaining", "?")
                 send_method = "WS"
                 _update_volume_quota(quota_remaining)

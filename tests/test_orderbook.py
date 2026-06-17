@@ -18,7 +18,7 @@ class TestApplyOrderbookUpdate(unittest.TestCase):
     def test_snapshot_on_large_update(self):
         bids, asks = {999.0: 1.0}, {150.0: 1.0}
         # More than 100 items triggers snapshot
-        bids_in = [{"price": str(i), "size": "1"} for i in range(101)]
+        bids_in = [{"price": str(i), "size": "1"} for i in range(1, 102)]
         asks_in = [{"price": "200", "size": "5"}]
 
         is_snapshot = apply_orderbook_update(bids, asks, True, bids_in, asks_in)
@@ -27,7 +27,7 @@ class TestApplyOrderbookUpdate(unittest.TestCase):
         # Old entries should be gone (cleared on snapshot)
         self.assertNotIn(999.0, bids)
         self.assertNotIn(150.0, asks)
-        self.assertEqual(len(bids), 101)  # 0..100 all have size 1
+        self.assertEqual(len(bids), 101)  # 1..101 all have size 1
         self.assertEqual(asks, {200.0: 5.0})
 
     def test_delta_update(self):
@@ -219,7 +219,7 @@ class TestApplyOrderbookUpdateCBookSide(unittest.TestCase):
     def test_snapshot_clears_old_entries(self):
         bids = self.CBookSide({999.0: 1.0})
         asks = self.CBookSide({150.0: 1.0})
-        bids_in = [{"price": str(i), "size": "1"} for i in range(101)]
+        bids_in = [{"price": str(i), "size": "1"} for i in range(1, 102)]
         asks_in = [{"price": "200", "size": "5"}]
 
         is_snapshot = apply_orderbook_update(bids, asks, True, bids_in, asks_in)

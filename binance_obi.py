@@ -11,6 +11,7 @@ Shared state objects:
 
 import asyncio
 import logging
+import math
 import time
 
 import requests as _requests
@@ -32,6 +33,23 @@ except ImportError:
     _HAS_CBOOKSIDE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_positive(value: float) -> bool:
+    return math.isfinite(value) and value > 0.0
+
+
+def _validate_depth_levels(levels: list) -> list[list[float]]:
+    parsed = []
+    for level in levels:
+        price = float(level[0])
+        qty = float(level[1])
+        if not _finite_positive(price):
+            raise ValueError(f"invalid Binance depth price: {price}")
+        if not math.isfinite(qty) or qty < 0.0:
+            raise ValueError(f"invalid Binance depth quantity: {qty}")
+        parsed.append([price, qty])
+    return parsed
 
 # ---------------------------------------------------------------------------
 # Symbol mapping
@@ -251,7 +269,13 @@ class BinanceBookTickerClient:
         except (KeyError, ValueError, TypeError):
             return
 
-        if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+        if (
+            not _finite_positive(best_bid)
+            or not _finite_positive(best_ask)
+            or not _finite_positive(bid_qty)
+            or not _finite_positive(ask_qty)
+            or best_ask <= best_bid
+        ):
             return
 
         self._shared_bbo.update(
@@ -459,8 +483,8 @@ class BinanceDiffDepthClient:
         return resp.json()
 
     def _apply_snapshot(self, data: dict) -> None:
-        bids_raw = data.get('bids', [])
-        asks_raw = data.get('asks', [])
+        bids_raw = _validate_depth_levels(data.get('bids', []))
+        asks_raw = _validate_depth_levels(data.get('asks', []))
         if _HAS_CBOOKSIDE:
             self._bids.apply_snapshot_from_binance(bids_raw)
             self._asks.apply_snapshot_from_binance(asks_raw)
@@ -479,8 +503,8 @@ class BinanceDiffDepthClient:
         self._prev_u = 0  # will be set by first diff event
 
     def _apply_diff(self, event: dict) -> None:
-        bids_raw = event.get('b', [])
-        asks_raw = event.get('a', [])
+        bids_raw = _validate_depth_levels(event.get('b', []))
+        asks_raw = _validate_depth_levels(event.get('a', []))
         if _HAS_CBOOKSIDE:
             if bids_raw:
                 self._bids.apply_delta_from_binance(bids_raw)
@@ -510,7 +534,7 @@ class BinanceDiffDepthClient:
         except (IndexError, KeyError):
             return
         mid = (best_bid + best_ask) * 0.5
-        if mid <= 0.0:
+        if not math.isfinite(mid) or mid <= 0.0 or best_ask <= best_bid:
             return
 
         imbalance = self._compute_imbalance(mid)

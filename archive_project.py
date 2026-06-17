@@ -10,7 +10,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 INCLUDE_EXTENSIONS = {
     # Code
-    ".py", ".rs", ".toml",
+    ".py", ".pyx", ".pxd", ".rs", ".toml",
     # Config / data
     ".json", ".yml", ".yaml", ".cfg", ".ini",
     # Docs / text

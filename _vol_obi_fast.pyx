@@ -8,7 +8,7 @@ for the orderbook, making _compute_imbalance a pure-C loop.
 """
 
 from cpython.mem cimport PyMem_Malloc, PyMem_Realloc, PyMem_Free
-from libc.math cimport sqrt, floor, ceil
+from libc.math cimport sqrt, floor, ceil, isfinite
 from libc.string cimport memmove
 
 import logging
@@ -83,23 +83,40 @@ cdef class CBookSide:
                 hi = mid
         return lo
 
+    cdef inline bint _valid_price(self, double price):
+        return isfinite(price) and price > 0.0
+
+    cdef inline bint _valid_size(self, double size):
+        return isfinite(size) and size >= 0.0
+
+    cdef void _validate_level(self, double price, double size):
+        if not self._valid_price(price):
+            raise ValueError(f"invalid order book price: {price}")
+        if not self._valid_size(size):
+            raise ValueError(f"invalid order book size: {size}")
+
     cdef void _ensure_capacity(self):
         """Double capacity if full."""
-        cdef int new_cap
-        cdef double* tmp
         if self._count >= self._capacity:
-            new_cap = self._capacity * 2
-            # Realloc prices first — update self._prices immediately so it stays
-            # valid even if the second realloc fails and raises MemoryError.
-            tmp = <double*>PyMem_Realloc(self._prices, new_cap * sizeof(double))
-            if tmp is NULL:
-                raise MemoryError("Failed to grow CBookSide")
-            self._prices = tmp
-            tmp = <double*>PyMem_Realloc(self._sizes, new_cap * sizeof(double))
-            if tmp is NULL:
-                raise MemoryError("Failed to grow CBookSide")
-            self._sizes = tmp
-            self._capacity = new_cap
+            self._reserve(self._count + 1)
+
+    cdef void _reserve(self, int required):
+        """Ensure capacity for at least *required* entries."""
+        cdef int new_cap = self._capacity
+        cdef double* tmp
+        if required <= self._capacity:
+            return
+        while new_cap < required:
+            new_cap *= 2
+        tmp = <double*>PyMem_Realloc(self._prices, new_cap * sizeof(double))
+        if tmp is NULL:
+            raise MemoryError("Failed to grow CBookSide prices")
+        self._prices = tmp
+        tmp = <double*>PyMem_Realloc(self._sizes, new_cap * sizeof(double))
+        if tmp is NULL:
+            raise MemoryError("Failed to grow CBookSide sizes")
+        self._sizes = tmp
+        self._capacity = new_cap
 
     cdef void _c_insert(self, double price, double size):
         """Insert or update a (price, size) pair, maintaining sorted order."""
@@ -157,6 +174,16 @@ cdef class CBookSide:
 
     def __bool__(self):
         return self._count > 0
+
+    def __iter__(self):
+        cdef int i
+        for i in range(self._count):
+            yield self._prices[i]
+
+    def __reversed__(self):
+        cdef int i
+        for i in range(self._count - 1, -1, -1):
+            yield self._prices[i]
 
     def pop(self, price, *args):
         """Remove and return the size at *price*. Supports a default argument."""
@@ -269,6 +296,7 @@ cdef class CBookSide:
         for item in levels:
             price = <double>float(item['price'])
             size = <double>float(item['size'])
+            self._validate_level(price, size)
             if size == 0.0:
                 self._c_remove(price)
             else:
@@ -282,7 +310,7 @@ cdef class CBookSide:
         binary-search + memmove that ``_c_insert`` would do for each
         level during a large snapshot.
         """
-        cdef int n, i, j
+        cdef int n, i, read, write
         cdef double price, size
 
         # Parse levels into a Python list of (price, size) tuples,
@@ -291,6 +319,7 @@ cdef class CBookSide:
         for item in levels:
             price = <double>float(item['price'])
             size = <double>float(item['size'])
+            self._validate_level(price, size)
             if size > 0.0:
                 parsed.append((price, size))
 
@@ -299,22 +328,22 @@ cdef class CBookSide:
             self._count = 0
             return
 
-        # Sort by price ascending
-        parsed.sort()
+        parsed.sort(key=lambda level: level[0])
+        self._reserve(n)
 
-        # Ensure capacity for n entries.
-        # _ensure_capacity() only doubles when _count >= _capacity,
-        # so we must keep _count in sync after each resize.
-        self._count = self._capacity
-        while self._capacity < n:
-            self._ensure_capacity()
-            self._count = self._capacity
-        for i in range(n):
-            price = parsed[i][0]
-            size = parsed[i][1]
-            self._prices[i] = price
-            self._sizes[i] = size
-        self._count = n
+        write = 0
+        read = 0
+        while read < n:
+            price = <double>parsed[read][0]
+            size = <double>parsed[read][1]
+            read += 1
+            while read < n and <double>parsed[read][0] == price:
+                size = <double>parsed[read][1]
+                read += 1
+            self._prices[write] = price
+            self._sizes[write] = size
+            write += 1
+        self._count = write
 
     # -- Binance-format bulk methods ([[price_str, qty_str], ...]) --
 
@@ -327,6 +356,7 @@ cdef class CBookSide:
         for item in levels:
             price = <double>float(item[0])
             size = <double>float(item[1])
+            self._validate_level(price, size)
             if size == 0.0:
                 self._c_remove(price)
             else:
@@ -337,13 +367,14 @@ cdef class CBookSide:
 
         Same sort-once/fill-direct approach as ``apply_snapshot_from_wire``.
         """
-        cdef int n, i
+        cdef int n, i, read, write
         cdef double price, size
 
         parsed = []
         for item in levels:
             price = <double>float(item[0])
             size = <double>float(item[1])
+            self._validate_level(price, size)
             if size > 0.0:
                 parsed.append((price, size))
 
@@ -352,18 +383,22 @@ cdef class CBookSide:
             self._count = 0
             return
 
-        parsed.sort()
+        parsed.sort(key=lambda level: level[0])
+        self._reserve(n)
 
-        self._count = self._capacity
-        while self._capacity < n:
-            self._ensure_capacity()
-            self._count = self._capacity
-        for i in range(n):
-            price = parsed[i][0]
-            size = parsed[i][1]
-            self._prices[i] = price
-            self._sizes[i] = size
-        self._count = n
+        write = 0
+        read = 0
+        while read < n:
+            price = <double>parsed[read][0]
+            size = <double>parsed[read][1]
+            read += 1
+            while read < n and <double>parsed[read][0] == price:
+                size = <double>parsed[read][1]
+                read += 1
+            self._prices[write] = price
+            self._sizes[write] = size
+            write += 1
+        self._count = write
 
 
 # ---------------------------------------------------------------------------

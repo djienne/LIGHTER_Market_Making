@@ -158,6 +158,7 @@ class _NonceMgr:
     def __init__(self):
         self._counter = 0
         self.failures = []
+        self.hard_refreshes = []
 
     def next_nonce(self):
         self._counter += 1
@@ -167,7 +168,7 @@ class _NonceMgr:
         self.failures.append(api_key_index)
 
     def hard_refresh_nonce(self, api_key_index):
-        pass
+        self.hard_refreshes.append(api_key_index)
 
 
 class DummyClient:

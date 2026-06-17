@@ -149,16 +149,10 @@ class TestCBookSideIteration(unittest.TestCase):
         rev = list(reversed(b.items()))
         self.assertEqual(rev, [(300.0, 3.0), (200.0, 2.0), (100.0, 1.0)])
 
-    def test_list_and_reversed_raise_keyerror(self):
-        """CBookSide __getitem__ expects price keys, not int indices.
-        list(bookside) and reversed(bookside) fail because Python falls
-        back to __getitem__(0), __getitem__(1), etc.
-        See: dry_run.py CBookSide iteration fix."""
+    def test_list_and_reversed_yield_prices(self):
         b = CBookSide({100.0: 1.0, 200.0: 2.0, 300.0: 3.0})
-        with self.assertRaises(KeyError):
-            list(b)
-        with self.assertRaises((KeyError, TypeError)):
-            list(reversed(b))
+        self.assertEqual(list(b), [100.0, 200.0, 300.0])
+        self.assertEqual(list(reversed(b)), [300.0, 200.0, 100.0])
 
 
 class TestCBookSideCapacityGrowth(unittest.TestCase):
@@ -302,6 +296,18 @@ class TestCBookSideBulkWire(unittest.TestCase):
         self.assertEqual(len(b), 2)
         self.assertNotIn(200.0, b)
 
+    def test_snapshot_deduplicates_duplicate_prices_last_wins(self):
+        b = CBookSide()
+        levels = [
+            {"price": "100", "size": "1"},
+            {"price": "101", "size": "3"},
+            {"price": "100", "size": "2"},
+        ]
+        b.apply_snapshot_from_wire(levels)
+        self.assertEqual(len(b), 2)
+        self.assertEqual(b.keys(), [100.0, 101.0])
+        self.assertEqual(b[100.0], 2.0)
+
     def test_snapshot_empty(self):
         b = CBookSide({100.0: 1.0})
         b.apply_snapshot_from_wire([])
@@ -325,6 +331,25 @@ class TestCBookSideBulkWire(unittest.TestCase):
         self.assertNotIn(100.0, b)
         self.assertEqual(b[200.0], 2.0)
 
+    def test_delta_rejects_invalid_wire_levels(self):
+        invalid_levels = [
+            [{"price": "nan", "size": "1"}],
+            [{"price": "inf", "size": "1"}],
+            [{"price": "-100", "size": "1"}],
+            [{"price": "100", "size": "nan"}],
+            [{"price": "100", "size": "-1"}],
+        ]
+        for levels in invalid_levels:
+            with self.subTest(levels=levels):
+                b = CBookSide()
+                with self.assertRaises(ValueError):
+                    b.apply_delta_from_wire(levels)
+
+    def test_snapshot_rejects_invalid_wire_levels(self):
+        b = CBookSide()
+        with self.assertRaises(ValueError):
+            b.apply_snapshot_from_wire([{"price": "0", "size": "0"}])
+
     def test_snapshot_large(self):
         """Snapshot with >512 entries (triggers one capacity growth)."""
         levels = [{"price": str(i), "size": str(i * 10)} for i in range(1, 601)]
@@ -337,10 +362,8 @@ class TestCBookSideBulkWire(unittest.TestCase):
     def test_snapshot_very_large(self):
         """Snapshot with >1024 entries (triggers multiple capacity growths).
 
-        Regression: when n > 2*initial_capacity, the growth loop in
-        apply_snapshot_from_wire must keep _count in sync with _capacity
-        after each _ensure_capacity() call, otherwise the resize guard
-        (_count >= _capacity) becomes false and capacity stops growing.
+        Regression: bulk snapshot reserve must grow enough capacity without
+        corrupting _count.
         """
         levels = [{"price": str(i), "size": str(i)} for i in range(1, 2001)]
         b = CBookSide()
@@ -368,6 +391,14 @@ class TestCBookSideBinanceFormat(unittest.TestCase):
         self.assertEqual(len(b), 2)
         self.assertNotIn(200.0, b)
 
+    def test_snapshot_deduplicates_duplicate_binance_prices_last_wins(self):
+        b = CBookSide()
+        levels = [["100", "1"], ["101", "3"], ["100", "2"]]
+        b.apply_snapshot_from_binance(levels)
+        self.assertEqual(len(b), 2)
+        self.assertEqual(b.keys(), [100.0, 101.0])
+        self.assertEqual(b[100.0], 2.0)
+
     def test_snapshot_empty(self):
         b = CBookSide({100.0: 1.0})
         b.apply_snapshot_from_binance([])
@@ -387,6 +418,25 @@ class TestCBookSideBinanceFormat(unittest.TestCase):
         self.assertEqual(len(b), 1)
         self.assertNotIn(100.0, b)
         self.assertEqual(b[200.0], 2.0)
+
+    def test_delta_rejects_invalid_binance_levels(self):
+        invalid_levels = [
+            [["nan", "1"]],
+            [["inf", "1"]],
+            [["-100", "1"]],
+            [["100", "nan"]],
+            [["100", "-1"]],
+        ]
+        for levels in invalid_levels:
+            with self.subTest(levels=levels):
+                b = CBookSide()
+                with self.assertRaises(ValueError):
+                    b.apply_delta_from_binance(levels)
+
+    def test_snapshot_rejects_invalid_binance_levels(self):
+        b = CBookSide()
+        with self.assertRaises(ValueError):
+            b.apply_snapshot_from_binance([["0", "0"]])
 
     def test_snapshot_large(self):
         """Snapshot with >1024 entries (triggers multiple capacity growths)."""

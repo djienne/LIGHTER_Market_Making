@@ -39,6 +39,30 @@ def _make_cancel_op(side="buy", level=0, order_id=10, exchange_id=10):
     )
 
 
+class _OpenState:
+    name = "OPEN"
+
+
+class _FakeTxTransport:
+    def __init__(self, on_send=None, send_exc=None):
+        self.state = _OpenState()
+        self.sent = []
+        self.closed = False
+        self.on_send = on_send
+        self.send_exc = send_exc
+
+    async def send(self, message):
+        if self.send_exc is not None:
+            raise self.send_exc
+        self.sent.append(message)
+        if self.on_send is not None:
+            self.on_send(message)
+
+    async def close(self):
+        self.closed = True
+        self.state.name = "CLOSED"
+
+
 # ---------------------------------------------------------------------------
 # 1) Ticker handler — on_ticker_update
 # ---------------------------------------------------------------------------
@@ -291,7 +315,109 @@ class TestCancelConfirm(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# 5a) WS batch send — sign_and_send_batch
+# 5a) TxWebSocket transport outcomes
+# ---------------------------------------------------------------------------
+
+class TestTxWebSocketOutcomes(unittest.IsolatedAsyncioTestCase):
+
+    def _make_tx_ws(self, on_send=None, send_exc=None):
+        tx_ws = mm.TxWebSocket("ws://unit-test")
+        fake = _FakeTxTransport(on_send=on_send, send_exc=send_exc)
+        tx_ws._ws = fake
+        tx_ws._connected = True
+        return tx_ws, fake
+
+    async def test_success_response_returns_ok(self):
+        tx_ws, fake = self._make_tx_ws(
+            on_send=lambda _msg: tx_ws._recv_queue.put_nowait({"code": 0, "volume_quota_remaining": "50"})
+        )
+
+        result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.OK)
+        self.assertEqual(result.response["volume_quota_remaining"], "50")
+        self.assertEqual(len(fake.sent), 1)
+
+    async def test_rejected_response_returns_rejected(self):
+        tx_ws, fake = self._make_tx_ws(
+            on_send=lambda _msg: tx_ws._recv_queue.put_nowait({"code": 3, "message": "rejected"})
+        )
+
+        result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.REJECTED)
+        self.assertEqual(result.response["message"], "rejected")
+        self.assertEqual(len(fake.sent), 1)
+
+    async def test_string_error_response_returns_rejected(self):
+        tx_ws, fake = self._make_tx_ws(
+            on_send=lambda _msg: tx_ws._recv_queue.put_nowait({"error": "rate limited"})
+        )
+
+        result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.REJECTED)
+        self.assertEqual(len(fake.sent), 1)
+
+    async def test_malformed_response_after_send_returns_unknown(self):
+        tx_ws, fake = self._make_tx_ws(
+            on_send=lambda _msg: tx_ws._recv_queue.put_nowait("not-json-object")
+        )
+
+        result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.UNKNOWN)
+        self.assertEqual(result.reason, "malformed_response")
+        self.assertEqual(len(fake.sent), 1)
+
+    async def test_unavailable_before_send_returns_not_sent(self):
+        tx_ws = mm.TxWebSocket("ws://unit-test")
+        with patch.object(tx_ws, "connect", new=AsyncMock()):
+            result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.NOT_SENT)
+
+    async def test_timeout_after_send_returns_unknown(self):
+        tx_ws, fake = self._make_tx_ws()
+
+        async def _timeout(awaitable, timeout=None):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError
+
+        with patch.object(mm.asyncio, "wait_for", new=_timeout):
+            result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.UNKNOWN)
+        self.assertEqual(result.reason, "response_timeout")
+        self.assertEqual(len(fake.sent), 1)
+        self.assertTrue(fake.closed)
+
+    async def test_disconnect_after_send_returns_unknown(self):
+        tx_ws, fake = self._make_tx_ws(
+            on_send=lambda _msg: tx_ws._recv_queue.put_nowait(None)
+        )
+
+        result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.UNKNOWN)
+        self.assertEqual(result.reason, "disconnected_after_send")
+        self.assertEqual(len(fake.sent), 1)
+
+    async def test_stale_queued_response_is_dropped_before_send(self):
+        tx_ws, _fake = self._make_tx_ws(
+            on_send=lambda _msg: tx_ws._recv_queue.put_nowait({"code": 0, "message": "fresh"})
+        )
+        tx_ws._recv_queue.put_nowait({"code": 1, "message": "stale"})
+
+        result = await tx_ws.send_batch([1], ["tx"])
+
+        self.assertEqual(result.status, mm.TxSendStatus.OK)
+        self.assertEqual(result.response["message"], "fresh")
+
+
+# ---------------------------------------------------------------------------
+# 5b) WS batch send — sign_and_send_batch
 # ---------------------------------------------------------------------------
 
 class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
@@ -303,7 +429,10 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
 
         mock_tx_ws = MagicMock()
         mock_tx_ws.is_connected = True
-        mock_tx_ws.send_batch = AsyncMock(return_value={"code": 0, "volume_quota_remaining": "50"})
+        mock_tx_ws.send_batch = AsyncMock(return_value=mm.TxSendResult(
+            mm.TxSendStatus.OK,
+            {"code": 0, "volume_quota_remaining": "50"},
+        ))
 
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
@@ -318,6 +447,73 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.send_tx_batch_calls), 0)
         # sign_create_order was called
         self.assertEqual(len(client.sign_create_calls), 1)
+
+    async def test_ws_unknown_outcome_does_not_fallback_or_bind_live(self):
+        """Unknown WS outcome must not retry through REST or bind local live state."""
+        client = DummyClient()
+        op = _make_create_op(order_id=123)
+
+        mock_tx_ws = MagicMock()
+        mock_tx_ws.is_connected = True
+        mock_tx_ws.send_batch = AsyncMock(return_value=mm.TxSendResult(
+            mm.TxSendStatus.UNKNOWN,
+            reason="response_timeout",
+        ))
+
+        saved_risk = (
+            mm.state.risk.paused_until,
+            mm.state.risk.pause_reason,
+            mm.state.risk.last_reconcile_ok,
+            mm.state.risk.last_reconcile_reason,
+            mm.state.risk.mismatch_streak,
+        )
+        try:
+            with temp_mm_attrs(
+                MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
+                _tx_ws=mock_tx_ws, _global_backoff_until=0.0, _last_send_time=0.0,
+                current_bid_order_id=None,
+            ):
+                with patch.object(mm, "reconcile_orders_with_exchange", new=AsyncMock(return_value=True)) as mock_reconcile:
+                    await mm.sign_and_send_batch(client, [op])
+                    await asyncio.sleep(0)
+
+                self.assertEqual(len(client.send_tx_batch_calls), 0)
+                bind_events = [
+                    e for e in mm._order_event_queue
+                    if e.event_type == mm.OrderEventType.BIND_LIVE
+                ]
+                self.assertEqual(bind_events, [])
+                self.assertEqual(client.nonce_manager.hard_refreshes, [0])
+                mock_reconcile.assert_called_once()
+                self.assertIn("tx_unknown_outcome", mm.state.risk.pause_reason)
+        finally:
+            (
+                mm.state.risk.paused_until,
+                mm.state.risk.pause_reason,
+                mm.state.risk.last_reconcile_ok,
+                mm.state.risk.last_reconcile_reason,
+                mm.state.risk.mismatch_streak,
+            ) = saved_risk
+
+    async def test_sign_and_send_drains_only_hot_events(self):
+        """A pending RECONCILE snapshot must stay on the cold-path slot."""
+        client = DummyClient()
+        op = _make_create_op()
+
+        with temp_mm_attrs(
+            MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
+            _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
+        ):
+            mm._enqueue_order_event(mm.OrderEvent(
+                event_type=mm.OrderEventType.RECONCILE,
+                remote_orders=[],
+                source="unit",
+            ))
+            await mm.sign_and_send_batch(client, [op])
+
+            self.assertIsNotNone(mm._latest_reconcile_event)
+            self.assertEqual(mm._latest_reconcile_event.source, "unit")
 
     async def test_create_op_passes_reduce_only_to_signer(self):
         """Inventory-reducing creates must be signed as reduce-only."""

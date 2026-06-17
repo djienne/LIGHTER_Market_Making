@@ -23,7 +23,7 @@ pip install -r requirements.txt
 python setup_cython.py build_ext --inplace
 ```
 
-The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -march=native -ffast-math` for ~30x faster order book and spread computation. **Cython is required** — the bot will refuse to start without it. Set `ALLOW_PYTHON_FALLBACK=1` to bypass for dev/test only.
+The last command compiles the Cython extension (`_vol_obi_fast.so`) with `-O3 -march=native` for much faster order book and spread computation. **Cython is required** — the bot will refuse to start without it. Set `ALLOW_PYTHON_FALLBACK=1` to bypass for dev/test only. `CYTHON_FAST_MATH=1` can opt into `-ffast-math` for local benchmarking, but strict floating-point behavior is the production default.
 
 > **Native Windows**: the git-pinned `lighter` SDK fails to import on Windows ("Could not find C standard library"). Install the PyPI build instead — `pip install "lighter-sdk>=1.1.0"` — which ships the Windows signer DLL.
 
