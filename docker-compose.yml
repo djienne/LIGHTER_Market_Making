@@ -1,0 +1,23 @@
+services:
+  market-maker-btc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lighter-mm:latest
+    container_name: lighter-mm-btc
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 45s
+    env_file:
+      - .env
+    environment:
+      ALLOW_PYTHON_FALLBACK: "0"
+      LIGHTER_MM_CONFIG: /app/config.json
+      LOG_DIR: /app/logs
+      MARKET_SYMBOL: BTC
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./logs:/app/logs
+      - ./config.json:/app/config.json:ro
+    command: ["python", "-u", "market_maker_v2.py", "--symbol", "BTC", "--live"]

@@ -193,7 +193,7 @@ ORDER_TIMEOUT = float(os.getenv(
     _trading.get("order_timeout_seconds", 5.0)))
 DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv(
     "DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS",
-    _trading.get("default_quote_update_threshold_bps", 5.0)))
+    _trading.get("default_quote_update_threshold_bps", 8.0)))
 QUOTE_UPDATE_THRESHOLD_BPS = DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS  # backward-compatible alias
 SPREAD_FACTOR_LEVEL1 = float(os.getenv(
     "SPREAD_FACTOR_LEVEL1",

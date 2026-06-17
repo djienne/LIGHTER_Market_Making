@@ -7,7 +7,7 @@ Affiliate link to support this project: [Trade on Lighter](https://app.lighter.x
 ## Quick Start
 
 ### Prerequisites
-- Python 3.10+ (venv recommended)
+- Python 3.11+ (venv recommended for a fresh install with the pinned requirements)
 - C compiler and Python dev headers — required to build the Cython extension
   - Debian/Ubuntu: `sudo apt install build-essential python3-dev`
   - macOS: `xcode-select --install`
@@ -49,6 +49,15 @@ python -u market_maker_v2.py --symbol BTC
 # Grid dry-run: test N parameter combos in parallel (paper trading, no .env needed)
 python -u market_maker_v2.py --symbol BTC --grid grid_config.json
 ```
+
+### Docker
+```bash
+docker compose build market-maker-btc
+docker compose up -d market-maker-btc
+docker compose logs -f --tail=100 market-maker-btc
+```
+
+The Compose service uses `.env` at runtime, mounts `logs/`, runs the canonical root `config.json`, and sends `SIGINT` on stop so the bot can cancel live orders during shutdown. The image builds `_vol_obi_fast` during `docker build` and runs with `ALLOW_PYTHON_FALLBACK=0`.
 
 See [GRID_QUICKSTART.md](GRID_QUICKSTART.md) for full grid configuration and monitoring details.
 
@@ -136,13 +145,13 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `margin_mode` | `cross` | `cross` or `isolated` |
 | `levels_per_side` | `2` | Quote levels per side |
 | `base_amount` | `0.0002` | Fallback order size (base currency) |
-| `capital_usage_percent` | `0.12` | Fraction of balance per order |
-| `default_quote_update_threshold_bps` | `5.0` | Base requote threshold (adaptive system may widen) |
+| `capital_usage_percent` | `0.15` | Fraction of balance per order |
+| `default_quote_update_threshold_bps` | `8.0` | Base requote threshold (adaptive system may widen) |
 | `spread_factor_level1` | `2.0` | Level 1 spread multiplier |
 | `order_timeout_seconds` | `30.0` | Order placement timeout |
 | `position_value_threshold_usd` | `11.0` | USD threshold to consider position flat |
 | `min_order_value_usd` | `14.5` | Minimum order value in USD |
-| `maker_fee_rate` | `0.00004` | Maker fee for sims/accounting (0.004% premium tier; standard accounts are 0) |
+| `maker_fee_rate` | `0.0` | Maker fee for sims/accounting; override with `MAKER_FEE_RATE` if your account pays maker fees |
 
 ### `trading.live_quality`
 | Key | Default | Description |
@@ -232,7 +241,7 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `panic_close_on_startup` | `false` | Emergency close any startup inventory before quoting |
 | `panic_close_on_shutdown` | `false` | Emergency close any shutdown inventory after cancelling orders |
 
-**Config precedence:** env var > `config.json` > hardcoded default.
+**Config precedence:** env var > canonical root `config.json` > hardcoded default. Keep normal live/default parameters in `config.json`; use `configs/` only for intentionally separate experiments.
 
 ## Tests
 

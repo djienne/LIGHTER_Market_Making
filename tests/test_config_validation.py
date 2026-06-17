@@ -7,6 +7,7 @@ and gather_lighter_data config loading (CRYPTO_TICKERS).
 import json
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from utils import load_config_params
@@ -58,6 +59,21 @@ class TestLoadConfigParams(unittest.TestCase):
 
         safety = result.get("safety", {})
         self.assertEqual(safety.get("max_consecutive_order_rejections", 5), 5)
+
+    def test_root_config_is_canonical_live_config(self):
+        """Normal live/default parameters should live in one root config file."""
+        root = Path(__file__).resolve().parents[1]
+        self.assertTrue((root / "config.json").exists())
+        self.assertFalse((root / "configs" / "btc_live_100.json").exists())
+
+        cfg = json.loads((root / "config.json").read_text())
+        trading = cfg["trading"]
+        vol_obi = trading["vol_obi"]
+        self.assertEqual(trading["quote_engine"], "vol_obi")
+        self.assertEqual(trading["default_quote_update_threshold_bps"], 8.0)
+        self.assertEqual(vol_obi["vol_to_half_spread"], 60.0)
+        self.assertEqual(vol_obi["skew"], 0.1)
+        self.assertEqual(vol_obi["c1_ticks"], 40.0)
 
 
 class TestConfigKeyTypes(unittest.TestCase):

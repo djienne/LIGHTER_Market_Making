@@ -25,7 +25,7 @@ function seedStrategies(): MarketMakerStrategy[] {
 			serviceName: 'lighter-mm-btc.service',
 			host: '51.83.253.195',
 			accountIndex: '281474976538716',
-			configPath: 'configs/btc_live_100.json',
+			configPath: 'config.json',
 			startedAt: nowIso(),
 			capitalUsd: 100,
 			maxPositionUsd: 64,

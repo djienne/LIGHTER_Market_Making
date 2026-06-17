@@ -712,7 +712,7 @@ print(json.dumps({
 }))
 PY
 )
-ORDERS_JSON=$(set +e; . venv/bin/activate >/dev/null 2>&1 && set -a && . ./.env >/dev/null 2>&1 && set +a && LIGHTER_MM_CONFIG="${remoteDir}/configs/btc_live_100.json" python - <<'PY'
+ORDERS_JSON=$(set +e; . venv/bin/activate >/dev/null 2>&1 && set -a && . ./.env >/dev/null 2>&1 && set +a && LIGHTER_MM_CONFIG="${remoteDir}/config.json" python - <<'PY'
 import asyncio, json, os, requests
 import market_maker_v2 as mm
 
