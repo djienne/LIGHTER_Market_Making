@@ -13,7 +13,7 @@ Affiliate link to support this project: [Trade on Lighter](https://app.lighter.x
   - macOS: `xcode-select --install`
   - Windows (MinGW — recommended): install [MinGW-w64](https://www.mingw-w64.org/) (or via [WinLibs](https://winlibs.com/)), add its `bin/` to `PATH`, then build with `python setup_cython.py build_ext --inplace --compiler=mingw32`
   - Windows (MSVC — alternative): install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload
-- Lighter API credentials (private key, public key, account index, API key index). For live trading on a premium account, prefer Lighter's new [maker-only API key](https://apidocs.lighter.xyz/docs/api-keys) feature: maker-only keys are restricted to post-only orders, modify, cancel, and cancel-all, which matches the bot's normal quoting path and avoids accidental taker/administrative transactions.
+- Lighter API credentials (private key, public key, account index, API key index). For live trading on a premium account, prefer Lighter's new [maker-only API key](https://apidocs.lighter.xyz/docs/api-keys) feature: maker-only keys are restricted to post-only orders, modify, cancel, and cancel-all, which matches the bot's normal quoting path, avoids accidental taker/administrative transactions, and keeps quote/cancel traffic on the optimized 0ms maker/cancel path with much lower quota/rate-limit pressure.
 
 ### Installation
 ```bash
