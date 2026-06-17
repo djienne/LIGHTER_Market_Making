@@ -314,6 +314,7 @@ class BatchOp:
     size: float        # target size (not used for cancel)
     order_id: int      # existing order_id (for modify/cancel) or new client_order_index (for create)
     exchange_id: int   # resolved exchange order_index (for modify/cancel)
+    reduce_only: bool = False
 
 
 def _to_raw_price(price: float) -> int:
@@ -2013,6 +2014,12 @@ def _size_change_requires_update(existing_size: Optional[float], new_size: Optio
     tick = state.config.amount_tick_float
     tolerance = tick if tick > 0 else EPSILON
     return abs(existing_size - new_size) >= max(tolerance, EPSILON)
+
+
+def _is_reducing_side(side: str, position_size: float) -> bool:
+    return (position_size > EPSILON and side == "sell") or (
+        position_size < -EPSILON and side == "buy"
+    )
 
 
 def _sync_tracked_order_from_remote(side: str, level: int, order: dict) -> None:
@@ -3758,6 +3765,7 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
         for is_buy, new_price in [(True, buy_price), (False, sell_price)]:
             side = "buy" if is_buy else "sell"
             new_size = base_amount
+            reduce_only = _is_reducing_side(side, state.account.position_size)
 
             if new_price is None:
                 # Position limit suppressed this side — cancel any live order
@@ -3817,6 +3825,7 @@ def collect_order_operations(level_prices, base_amount, _log_debug=False):
                     side=side, level=level, action="create",
                     price=new_price, size=new_size,
                     order_id=new_order_id, exchange_id=0,
+                    reduce_only=reduce_only,
                 ))
     return ops
 
@@ -3888,6 +3897,7 @@ def _sign_ops_sync(client, market_index: int, ops: list):
                 is_ask=is_ask,
                 order_type=lighter.SignerClient.ORDER_TYPE_LIMIT,
                 time_in_force=lighter.SignerClient.ORDER_TIME_IN_FORCE_POST_ONLY,
+                reduce_only=op.reduce_only,
                 nonce=nonce,
                 api_key_index=api_key_index,
             )
@@ -4146,6 +4156,8 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
     """
     none_levels = [(None, None)] * NUM_LEVELS
     if not _cj_estimator_gate_allows_quote():
+        if abs(position_size) >= EPSILON:
+            return _fallback_reduce_only_quote_levels(mid_price, position_size)
         return none_levels
 
     calc = state.vol_obi_state.calculator
@@ -4162,11 +4174,15 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
 
             buy_0, sell_0 = calc.quote(mid_price, position_size)
             if buy_0 is None and sell_0 is None:
+                if abs(position_size) >= EPSILON:
+                    return _fallback_reduce_only_quote_levels(mid_price, position_size)
                 return none_levels
 
             # Hard position limit: suppress side that would increase exposure
             if max_pos_usd <= 0:
                 # Can't compute position limit (missing capital?) — suppress all quoting
+                if abs(position_size) >= EPSILON:
+                    return _fallback_reduce_only_quote_levels(mid_price, position_size)
                 return none_levels
             pos_value_usd = abs(position_size) * mid_price
             if pos_value_usd >= max_pos_usd:
@@ -4175,7 +4191,7 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
                 elif position_size < 0:
                     sell_0 = None  # Short at limit — suppress sells
                 if buy_0 is None and sell_0 is None:
-                    return none_levels
+                    return _fallback_reduce_only_quote_levels(mid_price, position_size)
 
             levels = [(buy_0, sell_0)]
             # Derive wider levels by scaling the spread from mid
@@ -4194,8 +4210,13 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
             return levels
         except (ValueError, ZeroDivisionError, OverflowError) as e:
             logger.error("Error in %s quote: %s", QUOTE_ENGINE, e, exc_info=True)
+            if abs(position_size) >= EPSILON:
+                return _fallback_reduce_only_quote_levels(mid_price, position_size)
             return none_levels
-    # Not warmed up yet — no fallback
+    # Not warmed up yet — do not open fresh inventory, but keep an exit quote
+    # for any inventory already received from the exchange.
+    if abs(position_size) >= EPSILON:
+        return _fallback_reduce_only_quote_levels(mid_price, position_size)
     return none_levels
 
 
@@ -4324,6 +4345,40 @@ def _apply_inventory_exit_bias(
     return adjusted
 
 
+def _fallback_reduce_only_quote_levels(mid_price: float, position_size: float):
+    """Return a single passive reducing quote when the model withholds quotes.
+
+    This keeps live inventory from becoming unprotected if the quote engine
+    refuses to quote at/above inventory limits.  It intentionally returns only
+    level 0 so the total reduce-only size cannot exceed one base clip.
+    """
+    none_levels = [(None, None)] * NUM_LEVELS
+    if abs(position_size) < EPSILON or mid_price <= 0:
+        return none_levels
+
+    tick = state.config.price_tick_float
+    min_depth = tick if tick > 0 else max(mid_price * 1e-6, 1e-9)
+    fallback_bps = max(CJ_MIN_HALF_SPREAD_BPS, VOL_OBI_MIN_HALF_SPREAD_BPS, 1.0)
+    depth = max(mid_price * fallback_bps / 10_000.0, min_depth)
+
+    levels = list(none_levels)
+    if position_size > 0:
+        ask = mid_price + depth
+        if tick > 0:
+            ask = math.ceil(ask / tick) * tick
+        if ask <= mid_price:
+            ask = mid_price + min_depth
+        levels[0] = (None, ask)
+    else:
+        bid = mid_price - depth
+        if tick > 0:
+            bid = math.floor(bid / tick) * tick
+        if bid >= mid_price:
+            bid = mid_price - min_depth
+        levels[0] = (bid, None)
+    return levels
+
+
 def _update_live_quality(mid_price: Optional[float], position_size: float, max_pos_usd: Optional[float]) -> QualityAdjustment:
     if _live_metrics is None or _dry_run_engine is not None:
         return QualityAdjustment(reason="unavailable")
@@ -4421,22 +4476,30 @@ async def market_making_loop(client):
             # Time-based warmup: collect data without trading
             elapsed = time.monotonic() - _loop_start_time
             if elapsed < WARMUP_SECONDS:
-                if not _warmup_logged:
-                    logger.info(
-                        "Warmup period: collecting data for %.0f seconds before trading...",
-                        WARMUP_SECONDS,
+                if abs(state.account.position_size) >= EPSILON:
+                    logger.warning(
+                        "Open inventory %.8f detected during warmup; bypassing warmup to quote reduce-only exit.",
+                        state.account.position_size,
                     )
-                    _warmup_logged = True
+                    _loop_start_time = time.monotonic() - WARMUP_SECONDS
+                    elapsed = WARMUP_SECONDS
                 else:
-                    current_min = int(elapsed) // 60
-                    if current_min > _last_warmup_log_min and _log_info:
+                    if not _warmup_logged:
                         logger.info(
-                            "Warmup: %d/%d seconds elapsed",
-                            int(elapsed), int(WARMUP_SECONDS),
+                            "Warmup period: collecting data for %.0f seconds before trading...",
+                            WARMUP_SECONDS,
                         )
-                        _last_warmup_log_min = current_min
-                await asyncio.sleep(MIN_LOOP_INTERVAL)
-                continue
+                        _warmup_logged = True
+                    else:
+                        current_min = int(elapsed) // 60
+                        if current_min > _last_warmup_log_min and _log_info:
+                            logger.info(
+                                "Warmup: %d/%d seconds elapsed",
+                                int(elapsed), int(WARMUP_SECONDS),
+                            )
+                            _last_warmup_log_min = current_min
+                    await asyncio.sleep(MIN_LOOP_INTERVAL)
+                    continue
 
             if not _warmup_complete_logged:
                 _warmup_complete_logged = True

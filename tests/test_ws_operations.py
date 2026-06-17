@@ -319,6 +319,22 @@ class TestSignAndSendBatch(unittest.IsolatedAsyncioTestCase):
         # sign_create_order was called
         self.assertEqual(len(client.sign_create_calls), 1)
 
+    async def test_create_op_passes_reduce_only_to_signer(self):
+        """Inventory-reducing creates must be signed as reduce-only."""
+        client = DummyClient()
+        op = _make_create_op(side="sell", price=101.0)
+        op.reduce_only = True
+
+        with temp_mm_attrs(
+            MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
+            _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=None,
+        ):
+            await mm.sign_and_send_batch(client, [op])
+
+        self.assertEqual(len(client.sign_create_calls), 1)
+        self.assertIs(client.sign_create_calls[0]["reduce_only"], True)
+
     async def test_batch_falls_back_to_rest(self):
         """_tx_ws disconnected -> REST client.send_tx_batch used."""
         client = DummyClient()
