@@ -14,6 +14,10 @@ import sys
 import zipfile
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Defaults — override via env vars or CLI args (no secrets in code)
 DEFAULT_HOST = os.environ.get("DEPLOY_HOST", "")
 DEFAULT_USER = os.environ.get("DEPLOY_USER", "ubuntu")

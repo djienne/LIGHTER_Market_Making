@@ -142,6 +142,31 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `min_order_value_usd` | `14.5` | Minimum order value in USD |
 | `maker_fee_rate` | `0.00004` | Maker fee for sims/accounting (0.004% premium tier; standard accounts are 0) |
 
+### `trading.live_quality`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `markout_horizons_sec` | `[5, 30, 60]` | Live fill markout horizons tracked in live mode |
+| `window_seconds` | `3600` | Rolling window for live quality metrics |
+| `adaptive_enabled` | `true` | Enable defensive quote adjustments from adverse markouts |
+| `adaptive_horizon_sec` | `30` | Markout horizon used for adaptive decisions |
+| `adverse_threshold_bps` | `2.0` | Adverse markout threshold before adjustments activate |
+| `spread_widen_per_adverse_bps` | `0.05` | Spread multiplier increase per adverse bp above threshold |
+| `max_spread_multiplier` | `1.5` | Maximum adaptive spread multiplier |
+| `size_reduce_per_adverse_bps` | `0.06` | Size multiplier reduction per adverse bp above threshold |
+| `min_size_multiplier` | `0.55` | Minimum adaptive size multiplier |
+| `metrics_flush_seconds` | `10` | Flush interval for `live_metrics_{SYMBOL}.json` |
+
+### `trading.inventory_exit_bias`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Bias live quotes toward flattening inventory |
+| `min_ratio` | `0.05` | Inventory/max-position ratio before the bias activates |
+| `exit_tighten_per_ratio` | `0.45` | Tighten factor for the side that reduces inventory |
+| `add_widen_per_ratio` | `0.75` | Widen factor for the side that adds inventory |
+| `max_exit_tighten` | `0.35` | Maximum reduce-side tightening |
+| `max_add_widen` | `0.65` | Maximum add-side widening |
+| `adverse_boost_per_bps` | `0.03` | Extra bias boost when live markouts are adverse |
+
 ### `trading.vol_obi`
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -163,6 +188,9 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `window_size` | `6000` | Rolling window for Binance OBI |
 | `min_samples` | `150` | Minimum samples before signal is active |
 | `looking_depth` | `0.025` | Binance book depth fraction for OBI |
+| `bbo_min_samples` | `10` | Binance `bookTicker` samples before BBO is considered warm |
+| `bbo_stale_seconds` | `5.0` | Max age before Binance BBO is considered stale |
+| `depth_snapshot_limit` | `1000` | Binance REST depth snapshot size for diff-depth sync |
 
 ### `performance`
 | Key | Default | Description |
@@ -186,7 +214,7 @@ The maximum position size is computed dynamically each loop iteration from live 
 |-----|---------|-------------|
 | `ping_interval` | `20` | WS ping interval (seconds) |
 | `recv_timeout` | `30.0` | WS receive timeout (seconds) |
-| `account_recv_timeout` | `300.0` | Account WS receive timeout (seconds) |
+| `account_recv_timeout` | `1800.0` | Account WS receive timeout (seconds) |
 | `reconnect_base_delay` | `5` | Base reconnect backoff (seconds) |
 | `reconnect_max_delay` | `60` | Max reconnect backoff (seconds) |
 
@@ -199,6 +227,8 @@ The maximum position size is computed dynamically each loop iteration from live 
 | `circuit_breaker_cooldown_sec` | `60.0` | Cooldown after circuit breaker trips |
 | `order_reconcile_timeout_sec` | `2.0` | Cancel confirmation timeout |
 | `max_live_orders_per_market` | `4` | Max open orders per market |
+| `panic_close_on_startup` | `false` | Emergency close any startup inventory before quoting |
+| `panic_close_on_shutdown` | `false` | Emergency close any shutdown inventory after cancelling orders |
 
 **Config precedence:** env var > `config.json` > hardcoded default.
 
