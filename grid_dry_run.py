@@ -285,7 +285,7 @@ class GridRunner:
 
         self._symbol = symbol.upper()
         self._capital = float(cfg.get("capital", 1000))
-        self._leverage = int(cfg.get("leverage", 1))
+        self._leverage = int(cfg.get("leverage", 2))
         self._warmup_seconds = float(cfg.get("warmup_seconds", 600))
         self._summary_interval = float(cfg.get("summary_interval_seconds", 60))
         self._sim_latency = float(cfg.get("sim_latency_s", 0.050))

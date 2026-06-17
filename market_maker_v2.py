@@ -22,24 +22,69 @@ import requests
 import sys as _sys
 import types as _types
 import csv
-try:
-    from _vol_obi_fast import CBookSide as _BookSide
-    _CYTHON_AVAILABLE = True
-except ImportError:
-    _CYTHON_AVAILABLE = False
+import subprocess
+
+
+def _build_cython_extension_if_missing() -> bool:
+    """Build the Cython fast path when the extension has not been compiled yet."""
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    setup_path = os.path.join(project_dir, "setup_cython.py")
+    if not os.path.exists(setup_path):
+        return False
+    try:
+        result = subprocess.run(
+            [_sys.executable, setup_path, "build_ext", "--inplace"],
+            cwd=project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Automatic Cython build failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.getLogger(__name__).warning(
+            "Automatic Cython build failed with exit code %s:\n%s",
+            result.returncode,
+            result.stdout,
+        )
+        return False
+    return True
+
+
+def _load_cython_extension() -> bool:
+    global _BookSide, _price_change_bps_c, _dynamic_max_position_c
+    try:
+        from _vol_obi_fast import CBookSide as _fast_book_side
+        from _vol_obi_fast import price_change_bps_fast as _fast_price_change_bps
+        from _vol_obi_fast import dynamic_max_position_fast as _fast_dynamic_max_position
+    except ImportError:
+        return False
+    _BookSide = _fast_book_side
+    _price_change_bps_c = _fast_price_change_bps
+    _dynamic_max_position_c = _fast_dynamic_max_position
+    return True
+
+
+_BookSide = None
+_price_change_bps_c = None
+_dynamic_max_position_c = None
+_CYTHON_AVAILABLE = _load_cython_extension()
+if not _CYTHON_AVAILABLE and _build_cython_extension_if_missing():
+    _CYTHON_AVAILABLE = _load_cython_extension()
+
+if not _CYTHON_AVAILABLE:
     _BookSide = None
-try:
-    from _vol_obi_fast import price_change_bps_fast as _price_change_bps_c
-    from _vol_obi_fast import dynamic_max_position_fast as _dynamic_max_position_c
-except ImportError:
     _price_change_bps_c = None
     _dynamic_max_position_c = None
 # Fail-fast if Cython not available (opt out with ALLOW_PYTHON_FALLBACK=1 for dev/test)
 ALLOW_PYTHON_FALLBACK = os.getenv("ALLOW_PYTHON_FALLBACK", "").lower() in ("1", "true", "yes")
 if not _CYTHON_AVAILABLE and not ALLOW_PYTHON_FALLBACK:
     raise ImportError(
-        "Cython extension _vol_obi_fast not available. "
-        "Build with: python setup_cython.py build_ext --inplace\n"
+        "Cython extension _vol_obi_fast not available after automatic build attempt. "
+        "Install a C compiler and Python development headers, then build with: "
+        "python setup_cython.py build_ext --inplace\n"
         "Set ALLOW_PYTHON_FALLBACK=1 for dev/test only."
     )
 if not _CYTHON_AVAILABLE:
@@ -115,13 +160,14 @@ WEBSOCKET_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 API_KEY_PRIVATE_KEY = os.getenv("API_KEY_PRIVATE_KEY")
 ACCOUNT_INDEX = int(os.getenv("ACCOUNT_INDEX", "0"))
 API_KEY_INDEX = int(os.getenv("API_KEY_INDEX", "0"))
+API_KEY_MAKER_ONLY: Optional[bool] = None
 
 MARKET_SYMBOL = os.getenv("MARKET_SYMBOL", "BTC")
 MARKET_ID = None
 PRICE_TICK_SIZE = None
 AMOUNT_TICK_SIZE = None
 
-LEVERAGE = int(os.getenv("LEVERAGE", _trading.get("leverage", 1)))
+LEVERAGE = int(os.getenv("LEVERAGE", _trading.get("leverage", 2)))
 MARGIN_MODE = os.getenv("MARGIN_MODE", _trading.get("margin_mode", "cross"))
 POSITION_VALUE_THRESHOLD_USD = float(os.getenv(
     "POSITION_VALUE_THRESHOLD_USD",
@@ -364,6 +410,96 @@ def build_signer_client(url: str, account_index: int, private_key: str, api_key_
         ) from exc
 
 
+def _is_maker_only_restriction(value) -> bool:
+    msg = str(value).lower()
+    return (
+        "maker-only api key" in msg
+        or "maker only api key" in msg
+        or "0ms delay transactions" in msg
+    )
+
+
+def _mark_api_key_maker_only(reason: str) -> None:
+    global API_KEY_MAKER_ONLY
+    if API_KEY_MAKER_ONLY is True:
+        return
+    API_KEY_MAKER_ONLY = True
+    logger.warning(
+        "API key %d marked maker-only (%s); restricted transactions will be skipped",
+        API_KEY_INDEX,
+        reason,
+    )
+
+
+async def _detect_maker_only_api_key(
+    client,
+    account_id: Optional[int] = None,
+    api_key_index: Optional[int] = None,
+    timeout: float = 10.0,
+) -> Optional[bool]:
+    """Return whether the configured key is maker-only, or None if detection failed."""
+    global API_KEY_MAKER_ONLY
+    if client is None or not hasattr(client, "create_auth_token_with_expiry"):
+        return None
+    account_id = account_id if account_id is not None else ACCOUNT_INDEX
+    api_key_index = api_key_index if api_key_index is not None else API_KEY_INDEX
+
+    try:
+        auth_token, err = client.create_auth_token_with_expiry()
+    except Exception as exc:
+        logger.warning("Maker-only API key detection failed while creating auth token: %s", exc)
+        return None
+    if err or not auth_token:
+        logger.warning("Maker-only API key detection auth token unavailable: %s", err)
+        return None
+
+    loop = asyncio.get_running_loop()
+
+    def _do_request() -> dict:
+        resp = requests.get(
+            f"{BASE_URL}/api/v1/getMakerOnlyApiKeys",
+            params={"account_index": account_id},
+            headers={"authorization": auth_token},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("getMakerOnlyApiKeys returned non-object JSON")
+        return data
+
+    try:
+        data = await asyncio.wait_for(loop.run_in_executor(None, _do_request), timeout=timeout)
+    except Exception as exc:
+        logger.warning("Maker-only API key detection failed: %s", exc)
+        return None
+
+    raw_indexes = (
+        data.get("api_key_indexes")
+        or data.get("maker_only_api_key_indexes")
+        or data.get("maker_only_indexes")
+        or []
+    )
+    if not isinstance(raw_indexes, list):
+        logger.warning("Maker-only API key detection returned unexpected indexes: %r", raw_indexes)
+        return None
+    try:
+        maker_only_indexes = {int(index) for index in raw_indexes}
+    except (TypeError, ValueError):
+        logger.warning("Maker-only API key detection returned non-integer indexes: %r", raw_indexes)
+        return None
+
+    API_KEY_MAKER_ONLY = int(api_key_index) in maker_only_indexes
+    if API_KEY_MAKER_ONLY:
+        logger.info(
+            "API key %d is maker-only; allowing post-only/modify/cancel/cancel-all only",
+            api_key_index,
+        )
+    else:
+        logger.info("API key %d is not maker-only", api_key_index)
+    return API_KEY_MAKER_ONLY
+
+
 async def _cancel_task_with_timeout(task: Optional[asyncio.Task], label: str, timeout: float = 3.0) -> None:
     """Cancel a background task without risking an unbounded await."""
     if task is None or task.done():
@@ -390,13 +526,13 @@ VOL_OBI_WINDOW_STEPS = int(os.getenv(
 VOL_OBI_STEP_NS = int(os.getenv(
     "VOL_OBI_STEP_NS", _vol_obi_cfg.get("step_ns", 100_000_000)))
 VOL_OBI_VOL_TO_HALF_SPREAD = float(os.getenv(
-    "VOL_OBI_VOL_TO_HALF_SPREAD", _vol_obi_cfg.get("vol_to_half_spread", 48.0)))
+    "VOL_OBI_VOL_TO_HALF_SPREAD", _vol_obi_cfg.get("vol_to_half_spread", 60.0)))
 VOL_OBI_MIN_HALF_SPREAD_BPS = float(os.getenv(
     "VOL_OBI_MIN_HALF_SPREAD_BPS", _vol_obi_cfg.get("min_half_spread_bps", 8.0)))
 VOL_OBI_C1_TICKS = float(os.getenv(
-    "VOL_OBI_C1_TICKS", _vol_obi_cfg.get("c1_ticks", 20.0)))
+    "VOL_OBI_C1_TICKS", _vol_obi_cfg.get("c1_ticks", 40.0)))
 VOL_OBI_SKEW = float(os.getenv(
-    "VOL_OBI_SKEW", _vol_obi_cfg.get("skew", 3.0)))
+    "VOL_OBI_SKEW", _vol_obi_cfg.get("skew", 0.1)))
 VOL_OBI_LOOKING_DEPTH = float(os.getenv(
     "VOL_OBI_LOOKING_DEPTH", _vol_obi_cfg.get("looking_depth", 0.025)))
 VOL_OBI_MIN_WARMUP_SAMPLES = int(os.getenv(
@@ -1336,6 +1472,14 @@ async def emergency_close_position(client, reason: str = "startup") -> bool:
     if abs(pos) < EPSILON:
         logger.info("emergency_close (%s): no open position — all clear.", reason)
         return True
+    if API_KEY_MAKER_ONLY is True:
+        logger.error(
+            "emergency_close (%s): skipped because API key %d is maker-only; "
+            "only post-only orders, modify, cancel, and cancel-all are allowed",
+            reason,
+            API_KEY_INDEX,
+        )
+        return False
 
     best_bid, best_ask = get_best_prices()
     if best_bid is None or best_ask is None or mid is None:
@@ -3452,6 +3596,9 @@ async def _attempt_quota_recovery(client) -> bool:
     Safeguards: max attempts, max cumulative loss, PnL monitoring, verify quota increases.
     """
     global _quota_recovery_in_progress, _quota_recovery_last_attempt
+    if API_KEY_MAKER_ONLY is True:
+        logger.info("QUOTA RECOVERY: disabled because API key %d is maker-only", API_KEY_INDEX)
+        return False
 
     # Guard: cooldown
     if time.monotonic() - _quota_recovery_last_attempt < _QR_COOLDOWN:
@@ -3541,6 +3688,8 @@ async def _attempt_quota_recovery(client) -> bool:
 
                 if err:
                     logger.warning("QUOTA RECOVERY: order error: %s", err)
+                    if _is_maker_only_restriction(err):
+                        _mark_api_key_maker_only("quota recovery market order rejected")
                     client.nonce_manager.hard_refresh_nonce(API_KEY_INDEX)
                     return False
 
@@ -3574,6 +3723,8 @@ async def _attempt_quota_recovery(client) -> bool:
 
             except Exception as e:
                 logger.warning("QUOTA RECOVERY: exception: %s", e, exc_info=True)
+                if _is_maker_only_restriction(e):
+                    _mark_api_key_maker_only("quota recovery market order exception")
                 return False
 
         logger.warning("QUOTA RECOVERY: max attempts reached (quota=%d)", _volume_quota_remaining)
@@ -4630,6 +4781,7 @@ async def market_making_loop(client):
             if not DRY_RUN:
                 # Quota recovery: launch as background task (non-blocking)
                 if (_QR_ENABLED
+                        and API_KEY_MAKER_ONLY is not True
                         and _volume_quota_remaining is not None
                         and _volume_quota_remaining < _QR_TRIGGER
                         and not _quota_recovery_in_progress
@@ -5082,6 +5234,7 @@ async def main():
             await client.close()
             return
         logger.info("✅ Client connected successfully")
+        await _detect_maker_only_api_key(client)
 
         # Clean slate: cancel all at startup — but skip if no open orders
         _startup_orders = await _fetch_account_active_orders(client)
@@ -5316,12 +5469,20 @@ async def main():
                             pos_value,
                         )
 
-            logger.info(f"⚙️ Attempting to set leverage to {LEVERAGE}x with {MARGIN_MODE} margin...")
-            _, _, err = await adjust_leverage(client, state.config.market_id, LEVERAGE, MARGIN_MODE, logger=logger)
-            if err:
-                logger.error(f"❌ Failed to adjust leverage: {err}. Continuing with default leverage.")
+            if API_KEY_MAKER_ONLY is True:
+                logger.info(
+                    "Skipping leverage update: API key %d is maker-only and cannot send this transaction type",
+                    API_KEY_INDEX,
+                )
             else:
-                logger.info(f"✅ Successfully set leverage to {LEVERAGE}x")
+                logger.info(f"⚙️ Attempting to set leverage to {LEVERAGE}x with {MARGIN_MODE} margin...")
+                _, _, err = await adjust_leverage(client, state.config.market_id, LEVERAGE, MARGIN_MODE, logger=logger)
+                if err:
+                    if _is_maker_only_restriction(err):
+                        _mark_api_key_maker_only("leverage update rejected")
+                    logger.error(f"❌ Failed to adjust leverage: {err}. Continuing with default leverage.")
+                else:
+                    logger.info(f"✅ Successfully set leverage to {LEVERAGE}x")
 
         balance_task = _supervise_task(
             asyncio.create_task(track_balance()), "balance_tracker")

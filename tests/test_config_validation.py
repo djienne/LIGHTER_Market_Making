@@ -53,7 +53,7 @@ class TestLoadConfigParams(unittest.TestCase):
             result = load_config_params()
 
         trading = result.get("trading", {})
-        self.assertEqual(trading.get("leverage", 1), 1)
+        self.assertEqual(trading.get("leverage", 2), 2)
         self.assertEqual(trading.get("base_amount", 0.047), 0.047)
 
         safety = result.get("safety", {})

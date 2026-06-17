@@ -43,7 +43,7 @@ async def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Adjust leverage for PAXG on Lighter API.")
-    parser.add_argument("--leverage", type=int, default=1, help="The desired leverage (default: 1).")
+    parser.add_argument("--leverage", type=int, default=2, help="The desired leverage (default: 2).")
     parser.add_argument("--margin-mode", type=str, default="cross", choices=["cross", "isolated"], help="The margin mode to use.")
     args = parser.parse_args()
 

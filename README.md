@@ -13,7 +13,7 @@ Affiliate link to support this project: [Trade on Lighter](https://app.lighter.x
   - macOS: `xcode-select --install`
   - Windows (MinGW — recommended): install [MinGW-w64](https://www.mingw-w64.org/) (or via [WinLibs](https://winlibs.com/)), add its `bin/` to `PATH`, then build with `python setup_cython.py build_ext --inplace --compiler=mingw32`
   - Windows (MSVC — alternative): install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload
-- Lighter API credentials (private key, public key, account index, API key index)
+- Lighter API credentials (private key, public key, account index, API key index). For live trading on a premium account, prefer Lighter's new [maker-only API key](https://apidocs.lighter.xyz/docs/api-keys) feature: maker-only keys are restricted to post-only orders, modify, cancel, and cancel-all, which matches the bot's normal quoting path and avoids accidental taker/administrative transactions.
 
 ### Installation
 ```bash
@@ -84,6 +84,7 @@ tests_live/              Integration tests against live public endpoints
 ### Spread Model (vol_obi)
 - **RollingStats** maintains a ring buffer of mid-price samples and computes rolling volatility in O(1) using Welford's online algorithm for numerical stability.
 - **VolObiCalculator** combines volatility with order-book imbalance (OBI) to produce skewed bid/ask half-spreads. Spreads widen with volatility and shift toward the heavier side of the book. A crossed-quote guard ensures bid < ask after tick rounding.
+- The OBI strategy is inspired by hftbacktest's [Market Making with Alpha - Order Book Imbalance](https://hftbacktest.readthedocs.io/en/latest/tutorials/Market%20Making%20with%20Alpha%20-%20Order%20Book%20Imbalance.html) tutorial, where an OBI market-making approach is demonstrated on a long Binance Futures historical backtest. The working hypothesis here is that Binance's deeper book can lead Lighter's smaller market, and Lighter's lower fees improve the economics, provided the key parameters (`vol_to_half_spread` / v2hs, `skew`, and `c1_ticks`) are well calibrated for the live venue.
 
 ### Alpha Signal (Binance)
 A background WebSocket streams Binance Futures depth data. The OBI signal biases quotes before they hit Lighter. Stale signals (>5s) are discarded.
@@ -101,6 +102,7 @@ This conserves quota when it's scarce by only requoting on larger price moves.
 
 ### Quota Recovery
 When quota drops below threshold, the bot can execute small IOC market orders via the free 15-second slot to generate fill volume and rebuild quota.
+This path is automatically disabled for maker-only API keys, since those keys are limited to post-only/modify/cancel/cancel-all transactions.
 
 ### Dynamic Position Limit
 The maximum position size is computed dynamically each loop iteration from live account data: `(available_capital * leverage - 2 * order_value) * 0.9`. When position value reaches this limit, the side that would increase exposure is suppressed (buy orders suppressed when long at limit, sell orders suppressed when short at limit) and any existing orders on that side are canceled. The vol_obi skew normalization stays in sync with this dynamic limit.
