@@ -183,10 +183,10 @@ The maximum position size is computed dynamically each loop iteration from live 
 |-----|---------|-------------|
 | `window_steps` | `6000` | Rolling window length |
 | `step_ns` | `100000000` | Step size in nanoseconds (100ms) |
-| `vol_to_half_spread` | `42.0` | Volatility to half-spread multiplier |
+| `vol_to_half_spread` | `60.0` | Volatility to half-spread multiplier |
 | `min_half_spread_bps` | `4.0` | Minimum half-spread (bps) |
-| `c1_ticks` | `120.0` | OBI skew coefficient in ticks |
-| `skew` | `1.5` | Global skew scaling factor |
+| `c1_ticks` | `40.0` | OBI skew coefficient in ticks |
+| `skew` | `0.1` | Global skew scaling factor |
 | `looking_depth` | `0.025` | Book depth fraction for OBI |
 | `min_warmup_samples` | `100` | Samples before live quoting |
 | `warmup_seconds` | `600` | Warmup period (10 minutes) |
@@ -207,16 +207,16 @@ The maximum position size is computed dynamically each loop iteration from live 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `min_loop_interval` | `0.1` | Min seconds between loop iterations |
-| `rate_limit_send_interval` | `0.1` | Min seconds between order sends |
+| `rate_limit_send_interval` | `0.15` | Min seconds between order sends |
 
 ### `performance.quota_recovery`
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Enable automatic quota recovery |
+| `enabled` | `false` | Enable automatic quota recovery |
 | `trigger_threshold` | `5` | Quota level that triggers recovery |
 | `target_quota` | `50` | Target quota to recover to |
-| `max_attempts` | `3` | Max recovery attempts per cooldown |
-| `max_loss_usd` | `2.0` | Max acceptable loss per recovery order |
+| `max_attempts` | `0` | Max recovery attempts per cooldown |
+| `max_loss_usd` | `0.0` | Max acceptable loss per recovery order |
 | `cooldown_seconds` | `120` | Cooldown between recovery cycles |
 | `post_warmup_grace_seconds` | `120` | Grace period after warmup before recovery |
 
