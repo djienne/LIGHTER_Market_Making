@@ -151,8 +151,14 @@ def fresh_gather_globals():
 
     Sets market_info[0] = 'ETH' so handle_orderbook_message works for market 0.
     Yields the module so tests can call its functions.
+
+    gather_lighter_data was archived to OLD/ — skip its tests until (unless)
+    it returns to the project root.
     """
-    import gather_lighter_data as gld
+    gld = pytest.importorskip(
+        "gather_lighter_data",
+        reason="gather_lighter_data was archived to OLD/",
+    )
 
     # Save originals
     orig_local_order_books = dict(gld.local_order_books)
