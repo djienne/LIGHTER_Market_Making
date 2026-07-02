@@ -6,6 +6,7 @@ any transactions to the exchange.  Activated via ``--dry-run`` CLI flag.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -570,7 +571,7 @@ class DryRunEngine:
             if now < sim.eligible_at and sim._pending_price is None:
                 # Pure create in-flight: not fillable yet
                 if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
-                    self._live_orders.pop(sim.client_order_id, None)
+                    self._drop_order(sim.client_order_id)
                     self._om._clear_live(sim.side, sim.level)
                 continue
 
@@ -584,7 +585,7 @@ class DryRunEngine:
                             "(book crossed during latency)",
                             sim.side.upper(), sim.level, sim.price,
                         )
-                        self._live_orders.pop(sim.client_order_id, None)
+                        self._drop_order(sim.client_order_id)
                         self._om._clear_live(sim.side, sim.level)
                         if self._rejection_cb is not None:
                             self._rejection_cb("dry_run:create_arrival_reject")
@@ -596,7 +597,7 @@ class DryRunEngine:
                             "(book crossed during latency)",
                             sim.side.upper(), sim.level, sim.price,
                         )
-                        self._live_orders.pop(sim.client_order_id, None)
+                        self._drop_order(sim.client_order_id)
                         self._om._clear_live(sim.side, sim.level)
                         if self._rejection_cb is not None:
                             self._rejection_cb("dry_run:create_arrival_reject")
@@ -614,8 +615,18 @@ class DryRunEngine:
 
             # THEN process matured cancel (after fill opportunity)
             if sim.pending_cancel_at > 0 and now >= sim.pending_cancel_at:
-                self._live_orders.pop(sim.client_order_id, None)
+                self._drop_order(sim.client_order_id)
                 self._om._clear_live(sim.side, sim.level)
+
+    def _drop_order(self, client_order_id: int) -> None:
+        """Remove a dead sim order AND its id mapping.
+
+        The id map has no other pruner in dry-run/grid mode (the live pruner
+        needs exchange account data), so entries must be removed here or the
+        dict grows by one per create for the lifetime of a multi-day run.
+        """
+        self._live_orders.pop(client_order_id, None)
+        self._id_map.pop(client_order_id, None)
 
     def _check_buy_fill(self, sim: SimulatedOrder, asks, consumed: float) -> tuple[float, float]:
         """Return (fillable_size, updated_consumed) for a buy limit order.
@@ -759,7 +770,7 @@ class DryRunEngine:
 
         # Update order state
         if fully_filled:
-            self._live_orders.pop(sim.client_order_id, None)
+            self._drop_order(sim.client_order_id)
             self._om._clear_live(sim.side, sim.level)
             label = "FILLED"
         else:
@@ -1021,7 +1032,17 @@ class DryRunEngine:
                 self._write_save_data(data)
                 if tl is not None:
                     tl.flush()
-            loop.run_in_executor(None, _write)
+            future = loop.run_in_executor(None, _write)
+            future.add_done_callback(self._log_flush_result)
         except RuntimeError:
             # No running loop (e.g. during tests) — flush synchronously
             self._flush_to_disk_sync()
+
+    def _log_flush_result(self, future) -> None:
+        """Surface background-flush failures instead of swallowing them."""
+        try:
+            exc = future.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            self._log.warning("DRY-RUN: background flush failed: %s", exc)

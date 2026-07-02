@@ -87,6 +87,13 @@ def load_config_params():
         with open(config_path, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
+        if env_path:
+            # An explicitly configured path that doesn't exist must be fatal:
+            # silently falling back to hardcoded defaults would run the live
+            # bot with the wrong sizes and risk limits.
+            raise SystemExit(
+                f"FATAL: LIGHTER_MM_CONFIG points to a missing file: {config_path}"
+            ) from None
         return {}
     except json.JSONDecodeError as e:
         raise SystemExit(f"FATAL: {config_path} has invalid JSON: {e}") from e

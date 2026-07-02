@@ -329,6 +329,23 @@ class VolObiCalculator:
         """Update the max position dollar limit at runtime."""
         self._max_position_dollar = max(0.0, value)
 
+    def sync_market_state_from(self, other: "VolObiCalculator") -> None:
+        """Copy derived market state (volatility/alpha/warmup) from a leader.
+
+        Grid mode: N slots share identical book-ingestion parameters and
+        differ only in quote parameters, so one leader calculator ingests the
+        book and followers copy the derived scalars instead of each
+        re-walking the book (O(N_slots x book_depth) per tick).
+        """
+        self._volatility = other._volatility
+        self._local_alpha = other._local_alpha
+        self._warmed_up = other._warmed_up
+        self._total_samples = other._total_samples
+        if self._alpha_override is not None:
+            self._alpha = self._alpha_override
+        else:
+            self._alpha = self._local_alpha
+
 
 # ---------------------------------------------------------------------------
 # Try to replace with Cython-accelerated versions

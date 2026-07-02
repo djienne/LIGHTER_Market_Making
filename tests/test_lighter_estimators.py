@@ -37,15 +37,21 @@ def test_lighter_cj_estimator_becomes_ready_after_trades_and_markouts():
 
 
 def test_lighter_cj_estimator_deduplicates_trade_ids():
-    estimator = LighterCJEstimator(min_trades_per_side=1, min_markouts_per_side=1)
+    estimator = LighterCJEstimator(
+        min_trades_per_side=1, min_markouts_per_side=1,
+        snapshot_min_interval=0.0,  # this test asserts back-to-back snapshots
+    )
 
     trade = {"trade_id": "abc", "type": "buy", "price": "100.1", "size": "1"}
     estimator.on_trade(trade, 100.0)
     estimator.on_trade(trade, 100.0)
 
+    # Duplicate trade id is recorded exactly once
     snapshot = estimator.snapshot()
-    assert snapshot.trade_count_plus == 0
+    assert snapshot.trade_count_plus == 1
 
+    # Still deduplicated after more data flows through
+    estimator.on_trade(trade, 100.0)
     estimator.on_book_update(100.2)
     snapshot = estimator.snapshot()
     assert snapshot.trade_count_plus == 1

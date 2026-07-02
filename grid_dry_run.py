@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import itertools
 import json
 import logging
@@ -19,7 +20,7 @@ import math
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -173,7 +174,20 @@ class GridParams:
 
 
 def _param_key(p: GridParams) -> str:
-    """Deterministic, human-readable key from parameter values."""
+    """Deterministic, human-readable key from parameter values.
+
+    The readable prefix covers the primary axes; the trailing ``x<digest>``
+    token covers EVERY field (except ``label``), so sweeping a parameter the
+    prefix omits can never collide two slots onto the same state/trade files
+    (which silently corrupted results before).  ``check_grid_results``'s
+    ``parse_param_key`` ignores the digest token.
+    """
+    payload = [
+        (f.name, getattr(p, f.name))
+        for f in dataclass_fields(p)
+        if f.name != "label"
+    ]
+    digest = hashlib.sha1(repr(payload).encode()).hexdigest()[:10]
     if p.quote_engine == "cartea_jaimungal":
         dyn = "_dyn" if p.cj_use_estimator else ""
         return (
@@ -184,12 +198,14 @@ def _param_key(p: GridParams) -> str:
             f"_a{p.cj_alpha}_ph{p.cj_phi}_sm{p.cj_spread_multiplier}_vs{p.cj_volatility_spread_multiplier}"
             f"_ls{p.cj_lambda_scale}_ks{p.cj_kappa_scale}_es{p.cj_epsilon_scale}_ss{p.cj_sigma2_scale}"
             f"_c{p.capital_usage_percent}_l{p.num_levels}"
+            f"_x{digest}"
         )
     return (
         f"v{p.vol_to_half_spread}_m{p.min_half_spread_bps}"
         f"_s{p.skew}_f{p.spread_factor_level1}"
         f"_c{p.capital_usage_percent}_l{p.num_levels}"
         f"_c1{p.c1_ticks}"
+        f"_x{digest}"
     )
 
 
@@ -306,6 +322,10 @@ class GridRunner:
         axis_values = [param_axes[k] for k in axis_names]
         if not axis_values:
             raise ValueError("Grid config 'parameters' must contain at least one axis")
+        for name, values in zip(axis_names, axis_values):
+            if not values:
+                # An empty axis silently yields zero combos and an idle runner.
+                raise ValueError(f"Grid axis {name!r} has no values")
 
         self._param_combos: list[GridParams] = []
         for i, combo in enumerate(itertools.product(*axis_values)):
@@ -332,6 +352,8 @@ class GridRunner:
         self._shared_alpha: Optional[SharedAlpha] = None
         self._shared_bbo: Optional[SharedBBO] = None
         self._slots: list[GridSlot] = []
+        self._shared_vol_calc = None       # leader calculator (vol_obi slots)
+        self._pending_fill_check = False   # call_soon coalescing flag
         self._book_seq = 0
         self._book_seq_event = asyncio.Event()
         self._ws_reconnect_event = asyncio.Event()
@@ -471,6 +493,25 @@ class GridRunner:
         tick = self._shared_config.price_tick_float
         amount_tick = self._shared_config.amount_tick_float
 
+        # One shared "leader" calculator ingests the book for all vol_obi
+        # slots; followers copy the derived vol/alpha scalars per message.
+        # Ingestion parameters (window_steps/step_ns/looking_depth) are
+        # module constants — identical for every slot — so per-slot
+        # ingestion was N redundant O(book_depth) walks per WS message.
+        if any(p.quote_engine == "vol_obi" for p in self._param_combos):
+            self._shared_vol_calc = VolObiCalculator(
+                tick_size=tick,
+                window_steps=VOL_OBI_WINDOW_STEPS,
+                step_ns=VOL_OBI_STEP_NS,
+                vol_to_half_spread=1.0,   # quote params unused on the leader
+                min_half_spread_bps=0.0,
+                c1_ticks=1.0,
+                skew=0.0,
+                looking_depth=VOL_OBI_LOOKING_DEPTH,
+                min_warmup_samples=VOL_OBI_MIN_WARMUP_SAMPLES,
+                max_position_dollar=500.0,
+            )
+
         # Quiet logger for per-slot engines: only WARNING+ to avoid
         # 128 slots x 4 orders x every tick flooding the log.
         # Fills and summaries are tracked via GridRunner's own logger + trade CSVs.
@@ -480,8 +521,16 @@ class GridRunner:
             engine_logger.addHandler(logging.NullHandler())
         engine_logger.propagate = False
 
+        seen_keys: dict[str, str] = {}
         for i, params in enumerate(self._param_combos):
             pk = _param_key(params)
+            if pk in seen_keys:
+                raise ValueError(
+                    f"Duplicate grid combo: slot {params.label} has the same "
+                    f"parameters as slot {seen_keys[pk]} (key {pk}). "
+                    "Remove duplicate values from the grid axes."
+                )
+            seen_keys[pk] = params.label
 
             # Per-slot order state
             n_levels = params.num_levels
@@ -594,47 +643,97 @@ class GridRunner:
             return
 
         ob = self._shared_market.local_order_book
-        bids_in = payload.get("bids", [])
-        asks_in = payload.get("asks", [])
+        try:
+            bids_in = payload.get("bids", [])
+            asks_in = payload.get("asks", [])
+            is_snapshot_hint = (msg_type == "subscribed/order_book")
 
-        is_snapshot = apply_orderbook_update(
-            ob["bids"], ob["asks"], ob["initialized"], bids_in, asks_in,
-            is_snapshot_hint=(msg_type == "subscribed/order_book"),
-        )
-        if is_snapshot:
-            ob["initialized"] = True
+            # Offset sanity (mirrors the live handler): a non-advancing
+            # offset on a delta is a stale/out-of-order replay — skip it
+            # rather than corrupt the shared book all N sims fill against.
+            offset = payload.get("offset")
+            if offset is None:
+                offset = data.get("offset")
+            last_offset = ob.get("last_offset")
+            if (offset is not None and last_offset is not None
+                    and not is_snapshot_hint and ob["initialized"]
+                    and offset <= last_offset):
+                logger.warning(
+                    "Grid orderbook stale/out-of-order delta: offset %s <= last %s; skipping",
+                    offset, last_offset,
+                )
+                return
+            if offset is not None:
+                ob["last_offset"] = offset
 
-        self._shared_market.ws_connection_healthy = True
-        self._shared_market.last_order_book_update = time.monotonic()
+            is_snapshot = apply_orderbook_update(
+                ob["bids"], ob["asks"], ob["initialized"], bids_in, asks_in,
+                is_snapshot_hint=is_snapshot_hint,
+            )
+            if is_snapshot:
+                ob["initialized"] = True
 
-        if not ob["bids"] or not ob["asks"]:
-            self._shared_market.mid_price = None
-            return
+            self._shared_market.ws_connection_healthy = True
+            self._shared_market.last_order_book_update = time.monotonic()
 
-        best_bid = ob["bids"].peekitem(-1)[0]
-        best_ask = ob["asks"].peekitem(0)[0]
-        mid = (best_bid + best_ask) / 2
-        self._shared_market.mid_price = mid
-        if self._cj_estimator is not None:
-            self._cj_estimator.on_book_update(mid)
+            if not ob["bids"] or not ob["asks"]:
+                self._shared_market.mid_price = None
+                return
 
-        # Fan-out: feed all slot calculators + check fills
-        ba = self._shared_alpha
-        alpha_override = None
-        if ba is not None and ba.warmed_up and not ba.is_stale(BINANCE_STALE_SECONDS):
-            alpha_override = ba.alpha
+            best_bid = ob["bids"].peekitem(-1)[0]
+            best_ask = ob["asks"].peekitem(0)[0]
+            mid = (best_bid + best_ask) / 2
+            self._shared_market.mid_price = mid
+            if self._cj_estimator is not None:
+                self._cj_estimator.on_book_update(mid)
 
-        for slot in self._slots:
-            calc = slot.slot_state.vol_obi_state.calculator
-            if calc is not None:
+            ba = self._shared_alpha
+            alpha_override = None
+            if ba is not None and ba.warmed_up and not ba.is_stale(BINANCE_STALE_SECONDS):
+                alpha_override = ba.alpha
+
+            # Ingest the book ONCE on the shared leader calculator; vol_obi
+            # followers copy the derived scalars (avoids N redundant
+            # O(book_depth) walks per message).  CJ calculators only count
+            # warmup samples — cheap to call directly.
+            if self._shared_vol_calc is not None:
+                self._shared_vol_calc.on_book_update(mid, ob["bids"], ob["asks"])
+            for slot in self._slots:
+                calc = slot.slot_state.vol_obi_state.calculator
+                if calc is None:
+                    continue
                 calc.set_alpha_override(alpha_override)
-                calc.on_book_update(mid, ob["bids"], ob["asks"])
+                if slot.params.quote_engine == "vol_obi":
+                    calc.sync_market_state_from(self._shared_vol_calc)
+                else:
+                    calc.on_book_update(mid, ob["bids"], ob["asks"])
 
-            # Check fills
+            # Defer per-slot fill checks out of the WS callback so a burst of
+            # deltas coalesces into one pass (same pattern as the live
+            # engine's _deferred_check_fills).
+            if not self._pending_fill_check:
+                self._pending_fill_check = True
+                asyncio.get_running_loop().call_soon(self._deferred_check_fills)
+
+            self._book_seq += 1
+            self._book_seq_event.set()
+        except (KeyError, IndexError, ValueError, TypeError, ZeroDivisionError) as e:
+            logger.error("Error in grid book callback: %s", e, exc_info=True)
+            self._shared_market.ws_connection_healthy = False
+            self._shared_market.mid_price = None
+            ob["initialized"] = False
+            ob["last_offset"] = None
+            ob["bids"].clear()
+            ob["asks"].clear()
+
+    def _deferred_check_fills(self) -> None:
+        """Run per-slot fill simulation deferred from the WS callback."""
+        self._pending_fill_check = False
+        ob = self._shared_market.local_order_book
+        if not ob["bids"] or not ob["asks"]:
+            return
+        for slot in self._slots:
             slot.dry_engine.check_fills(ob["bids"], ob["asks"])
-
-        self._book_seq += 1
-        self._book_seq_event.set()
 
     def _on_ticker_message(self, data):
         """WS message callback for ticker channel."""
@@ -675,6 +774,7 @@ class GridRunner:
         self._shared_market.mid_price = None
         ob = self._shared_market.local_order_book
         ob["initialized"] = False
+        ob["last_offset"] = None
         ob["bids"].clear()
         ob["asks"].clear()
         for slot in self._slots:
@@ -982,10 +1082,13 @@ class GridRunner:
         with open(summary_path, "a") as f:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}]\n{summary_text}\n\n")
 
-        # Flush state + trade logs for all slots (async to executor)
-        loop = asyncio.get_event_loop()
+        # Flush state + trade logs for all slots.  _flush_to_disk_async
+        # snapshots on the loop thread first (atomic w.r.t. fills) and only
+        # dispatches the file write to the executor — running
+        # _flush_to_disk_sync directly on a worker thread raced with
+        # _process_fill and could write torn state files.
         for slot in self._slots:
-            loop.run_in_executor(None, slot.dry_engine._flush_to_disk_sync)
+            slot.dry_engine._flush_to_disk_async()
 
     def _log_final_summary(self):
         """Write final CSV with all slot results."""
@@ -1166,7 +1269,8 @@ class GridRunner:
             logger.warning("Could not fetch min order sizes: %s", exc)
 
         self._shared_market = MarketState(
-            local_order_book={"bids": _BookSide(), "asks": _BookSide(), "initialized": False},
+            local_order_book={"bids": _BookSide(), "asks": _BookSide(), "initialized": False,
+                              "last_offset": None},
         )
 
         logger.info(

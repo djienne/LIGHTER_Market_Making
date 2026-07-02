@@ -22,7 +22,9 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 
 COPY . .
 
-RUN python setup_cython.py build_ext --inplace \
+# Portable baseline ISA: -march=native would bake the build host's CPU
+# features into the image and SIGILL on hosts without them.
+RUN CYTHON_MARCH=x86-64-v3 python setup_cython.py build_ext --inplace \
     && python - <<'PY'
 from _vol_obi_fast import CBookSide, RollingStats, VolObiCalculator
 from _vol_obi_fast import dynamic_max_position_fast, price_change_bps_fast

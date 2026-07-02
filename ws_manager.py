@@ -31,7 +31,7 @@ async def _cancel_and_drain(task: asyncio.Task | None) -> None:
         task.cancel()
     try:
         await task
-    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosedOK):
+    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
         pass
 
 
@@ -98,76 +98,75 @@ async def ws_subscribe(
 
                 backoff = reconnect_base  # reset on successful connect
 
-                # Create reconnect-event watcher ONCE per connection
-                # (not per message — saves a create_task + cancel each iteration)
+                # Both the recv future and the reconnect-event watcher live
+                # ACROSS iterations: a normal message must not cancel and
+                # recreate the watcher (that would cost a create_task +
+                # cancel + extra asyncio.wait round-trip per message).
+                recv_task = None
                 event_task = None
-                if reconnect_event is not None:
-                    event_task = asyncio.create_task(reconnect_event.wait())
+                try:
+                    while True:
+                        if recv_task is None:
+                            recv_task = asyncio.create_task(ws.recv())
+                        if event_task is None and reconnect_event is not None:
+                            event_task = asyncio.create_task(reconnect_event.wait())
+                        wait_set = {recv_task}
+                        if event_task is not None:
+                            wait_set.add(event_task)
 
-                while True:
-                    recv_task = asyncio.create_task(ws.recv())
-                    wait_set = {recv_task}
-                    if event_task is not None:
-                        wait_set.add(event_task)
-
-                    try:
-                        done, pending = await asyncio.wait(
+                        done, _pending = await asyncio.wait(
                             wait_set,
                             timeout=recv_timeout,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                    except asyncio.CancelledError:
-                        await _cancel_and_drain(recv_task)
-                        await _cancel_and_drain(event_task)
-                        raise
-                    for task in pending:
-                        await _cancel_and_drain(task)
 
-                    if not done:
-                        logger.warning(
-                            f"{label} WebSocket watchdog triggered "
-                            f"(no data for {recv_timeout}s). Reconnecting..."
-                        )
-                        if on_disconnect:
-                            on_disconnect()
-                        break
-
-                    if event_task is not None and event_task in done:
-                        if reconnect_event.is_set():
-                            reconnect_event.clear()
-                            logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
-                            if not recv_task.done():
-                                await _cancel_and_drain(recv_task)
+                        if not done:
+                            logger.warning(
+                                f"{label} WebSocket watchdog triggered "
+                                f"(no data for {recv_timeout}s). Reconnecting..."
+                            )
                             if on_disconnect:
                                 on_disconnect()
                             break
-                        # Spurious wake (event cleared before we checked) — recreate watcher
-                        event_task = asyncio.create_task(reconnect_event.wait())
-                        if recv_task not in done:
+
+                        if event_task is not None and event_task in done:
+                            event_task = None  # consumed; recreated next iteration
+                            if reconnect_event.is_set():
+                                reconnect_event.clear()
+                                logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
+                                if on_disconnect:
+                                    on_disconnect()
+                                break
+                            # Spurious wake (event cleared before we checked)
+                            if recv_task not in done:
+                                continue
+
+                        done_recv, recv_task = recv_task, None
+                        message = done_recv.result()
+                        try:
+                            data = _loads(message)
+                            msg_type = data.get("type")
+                        except (ValueError, TypeError, AttributeError):
+                            logger.warning(f"Failed to decode JSON from {label}: {message!r}")
                             continue
 
-                    message = recv_task.result()
-                    try:
-                        data = _loads(message)
-                        msg_type = data.get("type")
-                    except (ValueError, TypeError, AttributeError):
-                        logger.warning(f"Failed to decode JSON from {label}: {message!r}")
-                        continue
-
-                    if msg_type == "ping":
-                        await ws.send(_PONG_MSG)
-                    elif msg_type == "subscribed":
-                        logger.info(f"Subscribed to channel: {data.get('channel')}")
-                    else:
-                        # A buggy callback must not tear down the connection —
-                        # log and keep consuming the stream.
-                        try:
-                            on_message(data)
-                        except Exception:
-                            logger.error(
-                                f"Error in {label} on_message callback; continuing",
-                                exc_info=True,
-                            )
+                        if msg_type == "ping":
+                            await ws.send(_PONG_MSG)
+                        elif msg_type == "subscribed":
+                            logger.info(f"Subscribed to channel: {data.get('channel')}")
+                        else:
+                            # A buggy callback must not tear down the connection —
+                            # log and keep consuming the stream.
+                            try:
+                                on_message(data)
+                            except Exception:
+                                logger.error(
+                                    f"Error in {label} on_message callback; continuing",
+                                    exc_info=True,
+                                )
+                finally:
+                    await _cancel_and_drain(recv_task)
+                    await _cancel_and_drain(event_task)
 
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
             logger.info(f"{label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")
@@ -206,8 +205,11 @@ async def ws_subscribe_fast(
     """Low-overhead WebSocket subscription loop for latency-sensitive feeds.
 
     Drop-in replacement for ``ws_subscribe()`` that eliminates per-message
-    ``create_task``/``asyncio.wait``/``cancel`` overhead by using a tight
-    ``asyncio.wait_for(ws.recv(), timeout)`` loop instead.
+    task/timeout allocation: the loop awaits ``ws.recv(decode=False)``
+    directly (bytes skip the UTF-8 str decode; orjson parses bytes), and a
+    sibling watchdog task closes the socket when the peer goes silent for
+    ``recv_timeout`` — ``recv()`` then raises ``ConnectionClosed`` and the
+    loop reconnects immediately.
 
     Use for hot-path market data (orderbook, ticker).  Cold-path channels
     (account, positions) can keep using ``ws_subscribe()``.
@@ -239,50 +241,94 @@ async def ws_subscribe_fast(
 
                 backoff = reconnect_base  # reset on successful connect
 
-                # Tight recv loop — no per-message task creation
-                while True:
-                    # Non-blocking reconnect-event check (replaces event_task racing)
-                    if reconnect_event is not None and reconnect_event.is_set():
-                        reconnect_event.clear()
-                        logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
-                        if on_disconnect:
-                            on_disconnect()
-                        break
+                # Silence watchdog: recv() below runs without its own timeout
+                # (asyncio.wait_for would allocate a Task per message on
+                # Python <= 3.11), so a sibling task closes the socket when
+                # the feed goes quiet — recv() then raises ConnectionClosed.
+                last_msg = time.monotonic()
+                watchdog_fired = False
 
-                    try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            f"{label} WebSocket watchdog triggered "
-                            f"(no data for {recv_timeout}s). Reconnecting..."
-                        )
-                        if on_disconnect:
-                            on_disconnect()
-                        break
+                async def _watchdog():
+                    nonlocal watchdog_fired
+                    check_every = max(recv_timeout / 4.0, 0.25)
+                    while True:
+                        await asyncio.sleep(check_every)
+                        if time.monotonic() - last_msg > recv_timeout:
+                            watchdog_fired = True
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
+                            return
 
-                    try:
-                        data = _loads(message)
-                        msg_type = data.get("type")
-                    except (ValueError, TypeError, AttributeError):
-                        logger.warning(f"Failed to decode JSON from {label}: {message!r}")
-                        continue
+                watchdog_task = asyncio.create_task(_watchdog())
+                # recv(decode=False) skips the per-frame UTF-8 str decode
+                # (orjson parses bytes directly), but the kwarg only exists
+                # on websockets >= 14's protocol — fall back for older libs.
+                use_decode_kwarg = True
+                try:
+                    # Tight recv loop — no per-message task creation
+                    while True:
+                        # Non-blocking reconnect-event check between messages
+                        if reconnect_event is not None and reconnect_event.is_set():
+                            reconnect_event.clear()
+                            logger.info(f"{label} reconnect requested via event; dropping connection for fresh snapshot...")
+                            if on_disconnect:
+                                on_disconnect()
+                            break
 
-                    if msg_type == "ping":
-                        await ws.send(_PONG_MSG)
-                    elif msg_type == "subscribed":
-                        logger.info(f"Subscribed to channel: {data.get('channel')}")
-                    else:
-                        # A buggy callback must not tear down the connection —
-                        # a reconnect here clears the book and resets the
-                        # volatility state (quoting downtime).  Log and keep
-                        # consuming the stream instead.
                         try:
-                            on_message(data)
-                        except Exception:
-                            logger.error(
-                                f"Error in {label} on_message callback; continuing",
-                                exc_info=True,
-                            )
+                            if use_decode_kwarg:
+                                try:
+                                    message = await ws.recv(decode=False)
+                                except TypeError:
+                                    use_decode_kwarg = False
+                                    message = await ws.recv()
+                            else:
+                                message = await ws.recv()
+                        except websockets.exceptions.ConnectionClosed:
+                            if watchdog_fired:
+                                # Stale-feed reconnect: skip the error backoff
+                                # (matches old wait_for-timeout semantics).
+                                logger.warning(
+                                    f"{label} WebSocket watchdog triggered "
+                                    f"(no data for {recv_timeout}s). Reconnecting..."
+                                )
+                                if on_disconnect:
+                                    on_disconnect()
+                                break
+                            raise
+
+                        last_msg = time.monotonic()
+                        try:
+                            data = _loads(message)
+                            msg_type = data.get("type")
+                        except (ValueError, TypeError, AttributeError):
+                            logger.warning(f"Failed to decode JSON from {label}: {message!r}")
+                            continue
+
+                        if msg_type == "ping":
+                            await ws.send(_PONG_MSG)
+                        elif msg_type == "subscribed":
+                            logger.info(f"Subscribed to channel: {data.get('channel')}")
+                        else:
+                            # A buggy callback must not tear down the connection —
+                            # a reconnect here clears the book and resets the
+                            # volatility state (quoting downtime).  Log and keep
+                            # consuming the stream instead.
+                            try:
+                                on_message(data)
+                            except Exception:
+                                logger.error(
+                                    f"Error in {label} on_message callback; continuing",
+                                    exc_info=True,
+                                )
+                finally:
+                    watchdog_task.cancel()
+                    try:
+                        await watchdog_task
+                    except asyncio.CancelledError:
+                        pass
 
         except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError) as e:
             logger.info(f"{label} WebSocket disconnected ({e}), reconnecting in {backoff:.0f}s...")

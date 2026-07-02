@@ -171,26 +171,26 @@ LEVERAGE = int(os.getenv("LEVERAGE", _trading.get("leverage", 2)))
 MARGIN_MODE = os.getenv("MARGIN_MODE", _trading.get("margin_mode", "cross"))
 POSITION_VALUE_THRESHOLD_USD = float(os.getenv(
     "POSITION_VALUE_THRESHOLD_USD",
-    _trading.get("position_value_threshold_usd", 15.0)))
+    _trading.get("position_value_threshold_usd", 11.0)))
 MIN_ORDER_VALUE_USD = float(_trading.get("min_order_value_usd", 14.5))
-# Maker fee rate (0.00004 = 0.004%, Lighter premium tier; standard accounts are 0)
+# Maker fee rate (0 for standard accounts; premium tiers pay e.g. 0.00004 = 0.004%)
 MAKER_FEE_RATE = float(os.getenv(
     "MAKER_FEE_RATE",
-    _trading.get("maker_fee_rate", 0.00004)))
+    _trading.get("maker_fee_rate", 0.0)))
 
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Trading config
+# Trading config (hardcoded fallbacks mirror canonical config.json values)
 BASE_AMOUNT = float(os.getenv(
     "BASE_AMOUNT",
-    _trading.get("base_amount", 0.047)))
+    _trading.get("base_amount", 0.0002)))
 CAPITAL_USAGE_PERCENT = float(os.getenv(
     "CAPITAL_USAGE_PERCENT",
-    _trading.get("capital_usage_percent", 0.12)))
+    _trading.get("capital_usage_percent", 0.15)))
 ORDER_TIMEOUT = float(os.getenv(
     "ORDER_TIMEOUT",
-    _trading.get("order_timeout_seconds", 5.0)))
+    _trading.get("order_timeout_seconds", 30.0)))
 DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS = float(os.getenv(
     "DEFAULT_QUOTE_UPDATE_THRESHOLD_BPS",
     _trading.get("default_quote_update_threshold_bps", 8.0)))
@@ -286,13 +286,13 @@ INVENTORY_ADVERSE_BOOST_PER_BPS = float(os.getenv(
     "INVENTORY_ADVERSE_BOOST_PER_BPS",
     _inventory_bias_cfg.get("adverse_boost_per_bps", 0.03)))
 
-# Quota recovery config
+# Quota recovery config (fallbacks mirror canonical config.json: disabled)
 _quota_recovery_cfg = _perf.get("quota_recovery", {})
-_QR_ENABLED = bool(_quota_recovery_cfg.get("enabled", True))
+_QR_ENABLED = bool(_quota_recovery_cfg.get("enabled", False))
 _QR_TRIGGER = int(_quota_recovery_cfg.get("trigger_threshold", 5))
 _QR_TARGET = int(_quota_recovery_cfg.get("target_quota", 50))
-_QR_MAX_ATTEMPTS = int(_quota_recovery_cfg.get("max_attempts", 3))
-_QR_MAX_LOSS = float(_quota_recovery_cfg.get("max_loss_usd", 2.0))
+_QR_MAX_ATTEMPTS = int(_quota_recovery_cfg.get("max_attempts", 0))
+_QR_MAX_LOSS = float(_quota_recovery_cfg.get("max_loss_usd", 0.0))
 _QR_COOLDOWN = float(_quota_recovery_cfg.get("cooldown_seconds", 120))
 
 # WebSocket tuning
@@ -542,7 +542,7 @@ VOL_OBI_STEP_NS = int(os.getenv(
 VOL_OBI_VOL_TO_HALF_SPREAD = float(os.getenv(
     "VOL_OBI_VOL_TO_HALF_SPREAD", _vol_obi_cfg.get("vol_to_half_spread", 60.0)))
 VOL_OBI_MIN_HALF_SPREAD_BPS = float(os.getenv(
-    "VOL_OBI_MIN_HALF_SPREAD_BPS", _vol_obi_cfg.get("min_half_spread_bps", 8.0)))
+    "VOL_OBI_MIN_HALF_SPREAD_BPS", _vol_obi_cfg.get("min_half_spread_bps", 4.0)))
 VOL_OBI_C1_TICKS = float(os.getenv(
     "VOL_OBI_C1_TICKS", _vol_obi_cfg.get("c1_ticks", 40.0)))
 VOL_OBI_SKEW = float(os.getenv(
@@ -1018,13 +1018,14 @@ def _refresh_cj_params_if_needed(force: bool = False) -> None:
     if QUOTE_ENGINE != "cartea_jaimungal":
         return
 
+    # Cheap interval check first — this runs on every hot-loop pass.
+    now = time.monotonic()
+    if not force and now - _last_cj_refresh < max(CJ_REFRESH_SECONDS, 1.0):
+        return
+
     calc = state.vol_obi_state.calculator
     update_params = getattr(calc, "update_params", None)
     if calc is None or not callable(update_params):
-        return
-
-    now = time.monotonic()
-    if not force and now - _last_cj_refresh < max(CJ_REFRESH_SECONDS, 1.0):
         return
 
     snapshot = _cj_estimator.snapshot() if (CJ_USE_ESTIMATOR and _cj_estimator is not None) else None
@@ -1425,6 +1426,26 @@ def _dynamic_max_position_dollar(mid_price: float, capital: float = None, base_a
     return max(0.0, raw * 0.9)  # 10% safety margin
 
 
+# Bound-method cache for the calculator's optional setters — resolved once
+# per calculator instance instead of getattr()+callable() on every hot tick.
+_calc_setter_cache: tuple = (None, None, None)  # (calc, set_max_position, set_inventory_unit)
+
+
+def _calc_setters(calc):
+    global _calc_setter_cache
+    cached = _calc_setter_cache
+    if cached[0] is calc:
+        return cached[1], cached[2]
+    set_max_position = getattr(calc, "set_max_position_dollar", None)
+    if not callable(set_max_position):
+        set_max_position = None
+    set_inventory_unit = getattr(calc, "set_inventory_unit_base", None)
+    if not callable(set_inventory_unit):
+        set_inventory_unit = None
+    _calc_setter_cache = (calc, set_max_position, set_inventory_unit)
+    return set_max_position, set_inventory_unit
+
+
 def _recompute_derived_params(mid_price: Optional[float] = None) -> None:
     """Recompute base_amount and max_position from current capital/mid.
 
@@ -1442,11 +1463,10 @@ def _recompute_derived_params(mid_price: Optional[float] = None) -> None:
     # Push to vol_obi calculator if max_pos changed
     calc = state.vol_obi_state.calculator
     if calc is not None and max_pos > 0:
-        set_max_position = getattr(calc, "set_max_position_dollar", None)
-        if callable(set_max_position):
+        set_max_position, set_inventory_unit = _calc_setters(calc)
+        if set_max_position is not None:
             set_max_position(max_pos)
-        set_inventory_unit = getattr(calc, "set_inventory_unit_base", None)
-        if callable(set_inventory_unit) and base_amount is not None and base_amount > 0:
+        if set_inventory_unit is not None and base_amount is not None and base_amount > 0:
             set_inventory_unit(base_amount)
 
 
@@ -1540,12 +1560,15 @@ async def emergency_close_position(client, reason: str = "startup") -> bool:
         return False
 
     close_size = abs(pos)
-    # Place aggressive limit order well through the book to guarantee fill
-    slippage = max(mid * 0.003, 10.0)  # 0.3% or $10, whichever is larger
+    # Place aggressive limit order well through the book to guarantee fill.
+    # Slippage is proportional to price (an absolute dollar floor would go
+    # negative on cheap markets), with a minimum of a few ticks.
+    slippage = max(mid * 0.003, tick * 5)
     if pos > 0:
         # Long -> sell at best_bid - slippage
         close_price = best_bid - slippage
         close_price = math.floor(close_price / tick) * tick
+        close_price = max(close_price, tick)
         is_ask = True
         side_label = "SELL"
     else:
@@ -1643,7 +1666,7 @@ def _is_transient_error(exc: Exception) -> bool:
 # limit may be higher.  Verify with exchange support before increasing.
 _RL_OPS_PER_WINDOW = 40
 _RL_WINDOW_SECONDS = 60.0
-_RL_MIN_SEND_INTERVAL = float(_perf.get("rate_limit_send_interval", 0.1))  # floor between any two sends (seconds)
+_RL_MIN_SEND_INTERVAL = float(_perf.get("rate_limit_send_interval", 0.15))  # floor between any two sends (seconds)
 _RL_CANCEL_MIN_INTERVAL = 0.5    # cancels get a shorter floor
 
 # Volume-quota adaptive thresholds
@@ -1870,11 +1893,30 @@ def _live_state_payload() -> dict:
     }
 
 
+_live_state_dirty = False
+
+
 def _persist_live_state() -> None:
+    """Mark live state for the next cold-path flush.
+
+    Called from fill/user_stats WS handlers (hot-adjacent paths), so it must
+    not touch the disk — the actual write happens in live_metrics_flush_loop
+    (executor) and _flush_live_state_sync (shutdown).
+    """
+    global _live_state_dirty
+    if _live_state_store is None:
+        return
+    _live_state_dirty = True
+
+
+def _flush_live_state_sync() -> None:
+    """Write live state to disk immediately.  Shutdown/cold path only."""
+    global _live_state_dirty
     if _live_state_store is None:
         return
     try:
         _live_state_store.save(_live_state_payload())
+        _live_state_dirty = False
     except OSError as exc:
         logger.warning("Could not persist live state: %s", exc)
 
@@ -2556,8 +2598,10 @@ def on_order_book_update(market_id, payload, is_snapshot_hint=None):
                 prev_mid = state.market.mid_price
                 state.market.mid_price = mid
 
-                # Recompute derived params when mid changes materially (~$10 move)
-                if prev_mid is None or round(mid, -1) != round(prev_mid, -1):
+                # Recompute derived params when mid changes materially (>=1bp
+                # move; relative so it works at any price scale — an absolute
+                # threshold would never fire on sub-$10 symbols)
+                if prev_mid is None or abs(mid - prev_mid) >= prev_mid * 1e-4:
                     _recompute_derived_params(mid)
 
                 if _cj_estimator is not None:
@@ -4225,9 +4269,13 @@ async def sign_and_send_batch(client, ops: list):
     # order_state_reconcile_loop so the send lane does not process cold state.
     order_manager.drain_hot_events()
 
-    # Safety: drop create ops whose slot got filled since collect_order_operations
-    # ran (e.g. by WS account_orders update or reconciler rebind).  This avoids
-    # orphaning the order that now occupies the slot.
+    # Safety: drop ops whose slot changed since collect_order_operations ran
+    # (e.g. by WS account_orders update or reconciler rebind).
+    # - creates: the slot got filled — sending would orphan its occupant.
+    # - modifies: the target order died (filled/cancelled) — sending would
+    #   get rejected and feed the circuit breaker.
+    # Cancels are NOT slot-checked: the reconciler's orphan-cancel path uses
+    # exchange ids with placeholder side/level.
     orders = state.orders
     safe_ops = []
     for op in ops:
@@ -4238,6 +4286,15 @@ async def sign_and_send_batch(client, ops: list):
                 logger.info(
                     "Dropping stale create %s[%d]: slot already has order %d",
                     op.side, op.level, slot_id,
+                )
+                continue
+        elif op.action == "modify":
+            slot_id = (orders.bid_order_ids[op.level] if op.side == "buy"
+                       else orders.ask_order_ids[op.level])
+            if slot_id != op.order_id:
+                logger.info(
+                    "Dropping stale modify %s[%d]: slot order changed (%s -> %s)",
+                    op.side, op.level, op.order_id, slot_id,
                 )
                 continue
         safe_ops.append(op)
@@ -4420,11 +4477,10 @@ def calculate_order_prices(mid_price, position_size=0.0, capital=None, base_amou
         try:
             if max_pos_usd is None:
                 max_pos_usd = _dynamic_max_position_dollar(mid_price, capital, base_amount)
-            set_max_position = getattr(calc, "set_max_position_dollar", None)
-            if callable(set_max_position) and max_pos_usd is not None and max_pos_usd > 0:
+            set_max_position, set_inventory_unit = _calc_setters(calc)
+            if set_max_position is not None and max_pos_usd is not None and max_pos_usd > 0:
                 set_max_position(max_pos_usd)
-            set_inventory_unit = getattr(calc, "set_inventory_unit_base", None)
-            if callable(set_inventory_unit) and base_amount is not None and base_amount > 0:
+            if set_inventory_unit is not None and base_amount is not None and base_amount > 0:
                 set_inventory_unit(base_amount)
 
             buy_0, sell_0 = calc.quote(mid_price, position_size)
@@ -4850,7 +4906,8 @@ async def market_making_loop(client):
                     continue
 
             _refresh_cj_params_if_needed()
-            _refresh_external_alpha_override()
+            # (external alpha override is refreshed by the book callback and
+            # on every Binance alpha update — no per-loop refresh needed)
 
             level_prices = calculate_order_prices(
                 snap_mid, position_size=snap_position,
@@ -4965,6 +5022,48 @@ async def track_balance():
 def _append_line(path, line):
     with open(path, "a") as f:
         f.write(line)
+
+
+async def live_metrics_flush_loop(interval=None) -> None:
+    """Cold-path task: flush live metrics + live state to disk.
+
+    The payload/row snapshot is taken on the event-loop thread (consistent
+    with WS-handler mutations); the actual file writes run in an executor so
+    a slow or contended disk never stalls the event loop.  Write failures
+    are logged and re-buffered inside write_flush — they never bubble up.
+    """
+    global _live_state_dirty
+    if interval is None:
+        interval = LIVE_QUALITY_METRICS_FLUSH_SECONDS
+    loop = asyncio.get_running_loop()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if _live_state_dirty and _live_state_store is not None:
+                payload = _live_state_payload()
+                _live_state_dirty = False
+                try:
+                    await loop.run_in_executor(None, _live_state_store.save, payload)
+                except OSError as exc:
+                    _live_state_dirty = True  # retry next tick
+                    logger.warning("Could not persist live state: %s", exc)
+
+            if _live_metrics is not None:
+                rows, metrics_payload = _live_metrics.prepare_flush(
+                    mid_price=state.market.mid_price,
+                    position_size=state.account.position_size,
+                    max_pos_usd=state.account.precomputed_max_pos_usd,
+                    realized_pnl_cumulative=_live_fill_realized_pnl,
+                    portfolio_value=state.account.portfolio_value,
+                    available_capital=state.account.available_capital,
+                )
+                await loop.run_in_executor(
+                    None, _live_metrics.write_flush, rows, metrics_payload,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Live metrics flush task failed: %s", exc, exc_info=True)
 
 
 async def quote_telemetry_loop(
@@ -5598,6 +5697,10 @@ async def main():
             asyncio.create_task(order_lifecycle_watchdog_loop()), "lifecycle_watchdog")
         quote_telemetry_task = _supervise_task(
             asyncio.create_task(quote_telemetry_loop()), "quote_telemetry")
+        metrics_flush_task = None
+        if not DRY_RUN:
+            metrics_flush_task = _supervise_task(
+                asyncio.create_task(live_metrics_flush_loop()), "live_metrics_flush")
 
         # Test mode: auto-exit after configured duration
         if TEST_MODE_DURATION is not None:
@@ -5642,6 +5745,8 @@ async def main():
             tasks_to_cancel.append(lifecycle_watchdog_task)
         if 'quote_telemetry_task' in locals():
             tasks_to_cancel.append(quote_telemetry_task)
+        if 'metrics_flush_task' in locals() and metrics_flush_task is not None:
+            tasks_to_cancel.append(metrics_flush_task)
         if order_state_task is not None:
             tasks_to_cancel.append(order_state_task)
         if 'ticker_task' in locals():
@@ -5762,7 +5867,16 @@ async def main():
                             logger.error("Timeout during shutdown emergency position close!")
                         except Exception as e:
                             logger.error("Error during shutdown emergency position close: %s", e)
-            _persist_live_state()
+            _flush_live_state_sync()
+            if _live_metrics is not None:
+                _live_metrics.flush_metrics(
+                    mid_price=state.market.mid_price,
+                    position_size=state.account.position_size,
+                    max_pos_usd=state.account.precomputed_max_pos_usd,
+                    realized_pnl_cumulative=_live_fill_realized_pnl,
+                    portfolio_value=state.account.portfolio_value,
+                    available_capital=state.account.available_capital,
+                )
 
             # Verify no orders remain live after shutdown cancel
             try:

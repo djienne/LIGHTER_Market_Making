@@ -89,11 +89,14 @@ cdef class CBookSide:
     cdef inline bint _valid_size(self, double size):
         return isfinite(size) and size >= 0.0
 
-    cdef void _validate_level(self, double price, double size):
+    cdef int _validate_level(self, double price, double size) except -1:
+        # ``except -1`` gives callers a real error-return slot so Cython does
+        # not scan PyErr_Occurred() after every call (unlike ``cdef void``).
         if not self._valid_price(price):
             raise ValueError(f"invalid order book price: {price}")
         if not self._valid_size(size):
             raise ValueError(f"invalid order book size: {size}")
+        return 0
 
     cdef void _ensure_capacity(self):
         """Double capacity if full."""
@@ -288,15 +291,20 @@ cdef class CBookSide:
         """Apply a delta update from wire data.
 
         Each item in *levels* is a dict with ``'price'`` and ``'size'``
-        string keys.  Calls the C-level ``_c_insert`` / ``_c_remove``
+        string keys.  All levels are parsed and validated **before** any
+        mutation, so one malformed level cannot leave the book
+        half-updated.  Calls the C-level ``_c_insert`` / ``_c_remove``
         directly, avoiding per-level Python ``__setitem__`` / ``pop``
         overhead.
         """
         cdef double price, size
+        cdef list parsed = []
         for item in levels:
             price = <double>float(item['price'])
             size = <double>float(item['size'])
             self._validate_level(price, size)
+            parsed.append((price, size))
+        for price, size in parsed:
             if size == 0.0:
                 self._c_remove(price)
             else:
@@ -350,13 +358,17 @@ cdef class CBookSide:
     def apply_delta_from_binance(self, list levels):
         """Apply delta from Binance format ``[[price_str, qty_str], ...]``.
 
-        Zero-qty entries remove the price level.
+        Zero-qty entries remove the price level.  All levels are parsed
+        and validated before any mutation (atomic on bad input).
         """
         cdef double price, size
+        cdef list parsed = []
         for item in levels:
             price = <double>float(item[0])
             size = <double>float(item[1])
             self._validate_level(price, size)
+            parsed.append((price, size))
+        for price, size in parsed:
             if size == 0.0:
                 self._c_remove(price)
             else:
@@ -546,7 +558,9 @@ cdef class VolObiCalculator:
     cdef double _alpha_override
     cdef bint _has_alpha_override
     cdef bint _warmed_up
-    cdef int _total_samples
+    # long long: at ~100 samples/s a 32-bit counter would overflow (signed
+    # UB) after ~250 days of uptime and silently un-warm the calculator.
+    cdef long long _total_samples
 
     # config
     cdef double _tick_size
@@ -637,6 +651,23 @@ cdef class VolObiCalculator:
                 self._alpha = self._alpha_override
             else:
                 self._alpha = self._local_alpha
+
+    def sync_market_state_from(self, VolObiCalculator other):
+        """Copy derived market state (volatility/alpha/warmup) from a leader.
+
+        Grid mode: N slots share identical book-ingestion parameters and
+        differ only in quote parameters, so one leader calculator ingests the
+        book and followers copy the derived scalars instead of each
+        re-walking the book (O(N_slots x book_depth) per tick).
+        """
+        self._volatility = other._volatility
+        self._local_alpha = other._local_alpha
+        self._warmed_up = other._warmed_up
+        self._total_samples = other._total_samples
+        if self._has_alpha_override:
+            self._alpha = self._alpha_override
+        else:
+            self._alpha = other._local_alpha
 
     cdef double _compute_imbalance(self, double mid_price, object bids, object asks):
         """Dispatch to C-fast or Python-slow path based on book type."""

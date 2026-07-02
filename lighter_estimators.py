@@ -93,6 +93,7 @@ class LighterCJEstimator:
         default_kappa: float = 0.035,
         default_epsilon: float = 4.0,
         default_sigma2: float = 0.0,
+        snapshot_min_interval: float = 1.0,
     ) -> None:
         self.window_seconds = max(float(window_seconds), 1.0)
         self.markout_seconds = max(float(markout_seconds), 0.1)
@@ -108,14 +109,22 @@ class LighterCJEstimator:
         self.default_kappa = min(max(float(default_kappa), self.kappa_min), self.kappa_max)
         self.default_epsilon = min(max(float(default_epsilon), self.epsilon_floor), self.epsilon_cap)
         self.default_sigma2 = max(float(default_sigma2), 0.0)
+        self.snapshot_min_interval = max(float(snapshot_min_interval), 0.0)
 
         self._trades: deque[_TradeEvent] = deque()
         self._pending_markouts: deque[_TradeEvent] = deque()
         self._markouts_plus: deque[tuple[float, float]] = deque()
         self._markouts_minus: deque[tuple[float, float]] = deque()
         self._mid_samples: deque[tuple[float, float]] = deque()
-        self._seen_trade_ids: set[str] = set()
+        # dict used as an insertion-ordered set so eviction drops the
+        # *oldest* ids (a plain set has arbitrary order and would evict
+        # recent ids, letting duplicate trades back in).
+        self._seen_trade_ids: dict[str, None] = {}
         self._last_snapshot = self._fallback_snapshot(updated_at=0.0)
+        # Snapshot recompute is O(window) Python work; it must never run in
+        # the order-book WS callback.  It is computed lazily in snapshot()
+        # (cold path) at most once per _SNAPSHOT_MIN_INTERVAL seconds.
+        self._snapshot_computed_at: float = -math.inf
 
     def _fallback_snapshot(self, *, updated_at: float | None = None) -> CJSnapshot:
         return CJSnapshot(
@@ -180,9 +189,12 @@ class LighterCJEstimator:
         if trade_id is not None:
             if trade_id in self._seen_trade_ids:
                 return
-            self._seen_trade_ids.add(trade_id)
+            self._seen_trade_ids[trade_id] = None
             if len(self._seen_trade_ids) > 50_000:
-                self._seen_trade_ids = set(list(self._seen_trade_ids)[-25_000:])
+                # Evict the oldest half (dicts preserve insertion order).
+                self._seen_trade_ids = dict.fromkeys(
+                    list(self._seen_trade_ids)[-25_000:]
+                )
 
         price = self._float(trade.get("price"))
         size = self._float(trade.get("size"))
@@ -231,7 +243,9 @@ class LighterCJEstimator:
                 self._markouts_minus.append((now, adverse))
 
         self._prune(now)
-        self._last_snapshot = self._compute_snapshot(now)
+        # NOTE: the snapshot is deliberately NOT recomputed here — this
+        # method runs in the order-book WS callback (hot path) and the
+        # snapshot is only consumed on the cold path via snapshot().
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.window_seconds
@@ -331,7 +345,10 @@ class LighterCJEstimator:
         increments = []
         prev_t, prev_mid = self._mid_samples[0]
         for ts, mid in list(self._mid_samples)[1:]:
-            dt = max(ts - prev_t, 1e-6)
+            # 1ms floor: two mid updates arriving microseconds apart with a
+            # one-tick move would otherwise contribute a diff^2/dt increment
+            # ~10^6x a normal one and spike the sigma2 estimate.
+            dt = max(ts - prev_t, 1e-3)
             diff = mid - prev_mid
             increments.append((diff * diff) / dt)
             prev_t, prev_mid = ts, mid
@@ -375,6 +392,17 @@ class LighterCJEstimator:
         )
 
     def snapshot(self) -> CJSnapshot:
+        """Return the current estimate, recomputing lazily (cold path only).
+
+        The recompute is O(window) Python work, so it is rate-limited to
+        once per ``snapshot_min_interval`` and must never be called from
+        the market-data hot path.
+        """
+        now = time.monotonic()
+        if now - self._snapshot_computed_at >= self.snapshot_min_interval:
+            self._prune(now)
+            self._last_snapshot = self._compute_snapshot(now)
+            self._snapshot_computed_at = now
         return self._last_snapshot
 
 

@@ -12,7 +12,7 @@ def _make_mock_ws(messages):
 
     _iter = iter(messages)
 
-    async def _recv():
+    async def _recv(*args, **kwargs):  # accepts decode=False like the real recv
         try:
             return next(_iter)
         except StopIteration:

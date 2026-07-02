@@ -12,15 +12,19 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import os
 import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from statistics import mean
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -145,6 +149,14 @@ class LiveMetricsTracker:
         self._inventory_samples: deque[tuple[float, float, float]] = deque(maxlen=20_000)
         self._last_metrics_flush = 0.0
         self._last_adjustment = QualityAdjustment()
+        # Markout CSV rows are buffered here and written by flush_metrics()
+        # (cold path) — update() runs on the quote lane and must not touch
+        # the disk.  The lock lets write_flush() re-buffer safely from an
+        # executor thread on write failure.
+        self._markout_rows: list[list] = []
+        self._rows_lock = threading.Lock()
+        self._adjustment_dirty = True
+        self._last_adjustment_computed = 0.0
         self._ensure_markout_header()
 
     def _ensure_markout_header(self) -> None:
@@ -169,10 +181,13 @@ class LiveMetricsTracker:
             "client_order_index",
             "exchange_order_index",
         ]
-        if os.path.exists(self.markout_path) and os.path.getsize(self.markout_path) > 0:
-            return
-        with open(self.markout_path, "w", newline="") as f:
-            csv.writer(f).writerow(header)
+        try:
+            if os.path.exists(self.markout_path) and os.path.getsize(self.markout_path) > 0:
+                return
+            with open(self.markout_path, "w", newline="") as f:
+                csv.writer(f).writerow(header)
+        except OSError as exc:
+            logger.warning("Could not write markout CSV header: %s", exc)
 
     def record_fill(
         self,
@@ -227,6 +242,8 @@ class LiveMetricsTracker:
         portfolio_value: Optional[float],
         available_capital: Optional[float],
     ) -> QualityAdjustment:
+        # Hot path (quote lane): pure in-memory computation only — disk
+        # writes happen in flush_metrics(), driven by a cold background task.
         now = time.monotonic()
         mid = _finite(mid_price)
         if mid is not None and mid > 0:
@@ -236,16 +253,13 @@ class LiveMetricsTracker:
             self._inventory_samples.append((now, pos_value, max(0.0, boundary_ratio)))
             self._settle_markouts(now, mid)
         self._prune(now)
-        self._last_adjustment = self._compute_adjustment()
-        if now - self._last_metrics_flush >= self.metrics_flush_seconds:
-            self.flush_metrics(
-                mid_price=mid,
-                position_size=position_size,
-                max_pos_usd=max_pos_usd,
-                realized_pnl_cumulative=realized_pnl_cumulative,
-                portfolio_value=portfolio_value,
-                available_capital=available_capital,
-            )
+        # Recompute the adjustment only when new markouts settled (dirty) or
+        # periodically as old samples age out of the window — the mean over
+        # up-to-10k-tuple deques is too heavy to run on every book tick.
+        if self._adjustment_dirty or now - self._last_adjustment_computed >= 5.0:
+            self._last_adjustment = self._compute_adjustment()
+            self._adjustment_dirty = False
+            self._last_adjustment_computed = now
         return self._last_adjustment
 
     def _settle_markouts(self, now: float, mid: float) -> None:
@@ -288,8 +302,16 @@ class LiveMetricsTracker:
                 keep.append(obs)
         self._pending = keep
         if rows:
-            with open(self.markout_path, "a", newline="") as f:
-                csv.writer(f).writerows(rows)
+            with self._rows_lock:
+                self._markout_rows.extend(rows)
+                overflow = len(self._markout_rows) - 50_000
+                if overflow > 0:
+                    del self._markout_rows[:overflow]
+                    logger.warning(
+                        "Markout row buffer overflow — dropped %d oldest rows "
+                        "(flush failing?)", overflow,
+                    )
+            self._adjustment_dirty = True
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.window_seconds
@@ -430,6 +452,58 @@ class LiveMetricsTracker:
             },
         }
 
+    def prepare_flush(
+        self,
+        *,
+        mid_price: Optional[float],
+        position_size: float,
+        max_pos_usd: Optional[float],
+        realized_pnl_cumulative: Optional[float],
+        portfolio_value: Optional[float],
+        available_capital: Optional[float],
+    ) -> tuple[list[list], dict[str, Any]]:
+        """Take buffered markout rows and build the metrics payload.
+
+        Must run on the event-loop thread so the snapshot is consistent
+        with the deques mutated by record_fill()/update().  The returned
+        pair can then be written off-loop via write_flush().
+        """
+        self._last_metrics_flush = time.monotonic()
+        with self._rows_lock:
+            rows, self._markout_rows = self._markout_rows, []
+        payload = self.snapshot(
+            mid_price=mid_price,
+            position_size=position_size,
+            max_pos_usd=max_pos_usd,
+            realized_pnl_cumulative=realized_pnl_cumulative,
+            portfolio_value=portfolio_value,
+            available_capital=available_capital,
+        )
+        return rows, payload
+
+    def write_flush(self, rows: list[list], payload: dict[str, Any]) -> None:
+        """Write prepared rows + payload to disk.  Guarded and thread-safe.
+
+        A failed write logs and re-buffers the rows; it must never raise
+        into the caller — a cold-path artifact failure (e.g. the CSV open
+        in Excel on Windows) must not stop quoting.
+        """
+        if rows:
+            try:
+                with open(self.markout_path, "a", newline="") as f:
+                    csv.writer(f).writerows(rows)
+            except OSError as exc:
+                with self._rows_lock:
+                    self._markout_rows[:0] = rows
+                logger.warning(
+                    "Could not write markout rows (%d re-buffered): %s",
+                    len(rows), exc,
+                )
+        try:
+            _atomic_json_write(self.metrics_path, payload)
+        except OSError as exc:
+            logger.warning("Could not write live metrics JSON: %s", exc)
+
     def flush_metrics(
         self,
         *,
@@ -440,8 +514,8 @@ class LiveMetricsTracker:
         portfolio_value: Optional[float],
         available_capital: Optional[float],
     ) -> None:
-        self._last_metrics_flush = time.monotonic()
-        payload = self.snapshot(
+        """Synchronous flush of markout rows + metrics JSON (cold path)."""
+        rows, payload = self.prepare_flush(
             mid_price=mid_price,
             position_size=position_size,
             max_pos_usd=max_pos_usd,
@@ -449,4 +523,4 @@ class LiveMetricsTracker:
             portfolio_value=portfolio_value,
             available_capital=available_capital,
         )
-        _atomic_json_write(self.metrics_path, payload)
+        self.write_flush(rows, payload)

@@ -35,6 +35,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class _ResyncNeeded(Exception):
+    """Internal: the depth stream must be torn down and re-synced.
+
+    Raised on snapshot failures and sequence gaps.  Always caught inside
+    ``BinanceDiffDepthClient.run()`` so the feed reconnects with backoff
+    instead of terminating (a dead feed would pause trading via the task
+    supervisor).
+    """
+
+
 def _finite_positive(value: float) -> bool:
     return math.isfinite(value) and value > 0.0
 
@@ -325,6 +335,9 @@ class BinanceDiffDepthClient:
         self._snapshot_limit = snapshot_limit
         self._snapshot_timeout = snapshot_timeout
         self._on_alpha_update = on_alpha_update
+        # Reused across resyncs to avoid a fresh TCP+TLS handshake per snapshot.
+        # Only touched from _fetch_snapshot, which runs serially in an executor.
+        self._http = _requests.Session()
 
         # Local book
         self._bids = _BookSide()
@@ -383,17 +396,12 @@ class BinanceDiffDepthClient:
                             None, self._fetch_snapshot
                         )
                     except Exception as e:
-                        logger.warning("Binance depth snapshot failed: %s", e)
                         buffer_task.cancel()
                         try:
                             await buffer_task
                         except asyncio.CancelledError:
                             pass
-                        break  # reconnect
-                    finally:
-                        # Stop buffering — set sentinel so buffer_task exits
-                        # (snapshot_data is now set, so the while loop exits)
-                        pass
+                        raise _ResyncNeeded(f"snapshot fetch failed: {e}") from e
 
                     # Give buffer task a moment to catch remaining messages
                     await asyncio.sleep(0.1)
@@ -410,28 +418,32 @@ class BinanceDiffDepthClient:
                         self._last_update_id, len(self._bids), len(self._asks),
                     )
 
-                    # Phase 3: Drain buffer with sequence alignment
+                    # Phase 3: Drain buffer with sequence alignment.
+                    # Events fully covered by the snapshot (u <= lastUpdateId)
+                    # are stale and dropped; the first usable event must
+                    # bracket the snapshot (U <= lastUpdateId + 1 <= u) and
+                    # subsequent buffered events must chain via pu == prev u.
+                    # If nothing usable was buffered (e.g. thin symbol), the
+                    # first *live* event is validated the same way in Phase 4.
                     first_valid = False
                     for event in buffer:
                         u = event['u']
                         U = event['U']
-                        # Drop stale events
                         if u <= self._last_update_id:
                             continue
-                        # First valid event check
                         if not first_valid:
-                            if U <= self._last_update_id + 1 and u >= self._last_update_id + 1:
-                                first_valid = True
-                            else:
-                                continue
+                            if U > self._last_update_id + 1:
+                                raise _ResyncNeeded(
+                                    f"gap between snapshot and buffer: U={U} > "
+                                    f"lastUpdateId+1={self._last_update_id + 1}"
+                                )
+                            first_valid = True
+                        elif event.get('pu', 0) != self._prev_u:
+                            raise _ResyncNeeded(
+                                f"buffered event sequence gap: pu={event.get('pu', 0)} "
+                                f"!= expected {self._prev_u}"
+                            )
                         self._apply_diff(event)
-
-                    if not first_valid and buffer:
-                        logger.warning(
-                            "Binance depth: no valid event in buffer (lastUpdateId=%d, buffer=%d events). Re-snapshotting...",
-                            self._last_update_id, len(buffer),
-                        )
-                        continue  # outer while → reconnect
 
                     self._synced = True
                     logger.info("Binance depth synced, entering live stream")
@@ -454,18 +466,32 @@ class BinanceDiffDepthClient:
 
                         # Sequence check
                         pu = event.get('pu', 0)
-                        if self._prev_u != 0 and pu != self._prev_u:
-                            logger.warning(
-                                "Binance depth sequence gap: pu=%d expected=%d. Re-syncing...",
-                                pu, self._prev_u,
-                            )
-                            break  # reconnect with re-snapshot
+                        if self._prev_u != 0:
+                            if pu != self._prev_u:
+                                logger.warning(
+                                    "Binance depth sequence gap: pu=%d expected=%d. Re-syncing...",
+                                    pu, self._prev_u,
+                                )
+                                break  # reconnect with re-snapshot
+                        else:
+                            # First event after the snapshot (nothing usable
+                            # was buffered) — align against the snapshot
+                            # directly instead of applying it unvalidated.
+                            if event['u'] <= self._last_update_id:
+                                continue  # stale: snapshot is ahead of stream
+                            if event['U'] > self._last_update_id + 1:
+                                raise _ResyncNeeded(
+                                    f"gap between snapshot and live stream: U={event['U']} "
+                                    f"> lastUpdateId+1={self._last_update_id + 1}"
+                                )
 
                         self._apply_diff(event)
                         self._update_alpha()
 
             except asyncio.CancelledError:
                 raise
+            except _ResyncNeeded as e:
+                logger.warning("Binance depth resync needed: %s — reconnecting in %.0fs", e, backoff)
             except Exception as e:
                 logger.warning("Binance depth error: %s — reconnecting in %.0fs", e, backoff)
 
@@ -476,7 +502,7 @@ class BinanceDiffDepthClient:
     def _fetch_snapshot(self) -> dict:
         """Blocking REST call — run via executor."""
         url = f"{BINANCE_FUTURES_REST}/fapi/v1/depth"
-        resp = _requests.get(
+        resp = self._http.get(
             url,
             params={"symbol": self._symbol.upper(), "limit": self._snapshot_limit},
             timeout=self._snapshot_timeout,

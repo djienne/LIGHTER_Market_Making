@@ -34,7 +34,8 @@ def setup_logging(name, log_dir="logs", log_filename="debug.log", *,
     silence_third_party : bool
         If True, sets noisy third-party loggers to WARNING/ERROR.
     clear_file : bool
-        If True, deletes the existing log file on startup.
+        If True, deletes the existing log file (and its rotated backups)
+        on startup; if False the existing file is appended to.
     """
     os.makedirs(log_dir, exist_ok=True)
 
@@ -47,13 +48,19 @@ def setup_logging(name, log_dir="logs", log_filename="debug.log", *,
 
     log_path = os.path.join(log_dir, log_filename)
     if clear_file:
-        try:
-            if os.path.exists(log_path):
-                os.remove(log_path)
-        except Exception:
-            pass
+        for path in (log_path, *(f"{log_path}.{i}" for i in range(1, 4))):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
-    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    # Rotating handler: DEBUG-level output grows without bound on multi-day
+    # runs (per-trade / per-stats INFO lines) — cap at 50MB x 3 backups.
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, mode='a', encoding='utf-8',
+        maxBytes=50 * 1024 * 1024, backupCount=3,
+    )
     file_handler.setLevel(file_level)
     file_handler.setFormatter(
         logging.Formatter('%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')

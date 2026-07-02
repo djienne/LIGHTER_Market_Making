@@ -812,6 +812,7 @@ class TestSignAndSendBatchErrors(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=42,  # slot must still hold the modify target
         ):
             await mm.sign_and_send_batch(client, [op])
 
@@ -831,6 +832,7 @@ class TestSignAndSendBatchErrors(unittest.IsolatedAsyncioTestCase):
         with temp_mm_attrs(
             MARKET_ID=1, _PRICE_TICK_FLOAT=0.01, _AMOUNT_TICK_FLOAT=0.001,
             _tx_ws=None, _global_backoff_until=0.0, _last_send_time=0.0,
+            current_bid_order_id=42,  # slot must still hold the modify target
         ):
             with patch.object(mm, "_record_order_rejection") as mock_reject:
                 await mm.sign_and_send_batch(client, [op])
@@ -2210,6 +2212,12 @@ class TestQuotaRecoveryAsync(unittest.IsolatedAsyncioTestCase):
             _AMOUNT_TICK_FLOAT=0.001,
             MARKET_ID=1,
             portfolio_value=1000.0,
+            # Pin recovery params — config.json disables recovery
+            # (max_attempts=0/max_loss=0), which would skip the loop.
+            _QR_MAX_ATTEMPTS=3,
+            _QR_MAX_LOSS=2.0,
+            _QR_TARGET=50,
+            _QR_TRIGGER=5,
         ):
             from sortedcontainers import SortedDict
             mm.state.market.local_order_book = {

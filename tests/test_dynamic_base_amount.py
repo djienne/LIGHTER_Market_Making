@@ -6,7 +6,10 @@ from _helpers import temp_mm_attrs
 
 class TestCalculateDynamicBaseAmount(unittest.TestCase):
     def test_calculate_dynamic_base_amount(self):
-        with temp_mm_attrs(available_capital=1000.0, _AMOUNT_TICK_FLOAT=0.01):
+        # Pin the sizing inputs explicitly — the module-level values come
+        # from config.json and would silently change the expectation.
+        with temp_mm_attrs(available_capital=1000.0, _AMOUNT_TICK_FLOAT=0.01,
+                           CAPITAL_USAGE_PERCENT=0.12, LEVERAGE=2):
             result = mm.calculate_dynamic_base_amount(200.0)
             # 1000 * 0.12 * 2 (leverage) / 200 = 1.2
             self.assertAlmostEqual(float(result), 1.2, places=8)
